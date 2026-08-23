@@ -3,12 +3,14 @@ package storage
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
 // Resolver returns the backend profile selected for a tenant app version.
 type Resolver interface {
+	// ResolveBackend returns a validated, caller-owned backend profile for tc.
 	ResolveBackend(ctx context.Context, tc tenant.RuntimeContext) (tenant.BackendProfile, error)
 }
 
@@ -22,5 +24,8 @@ func (r StaticResolver) ResolveBackend(_ context.Context, tc tenant.RuntimeConte
 	if err := tc.Validate(); err != nil {
 		return tenant.BackendProfile{}, err
 	}
-	return r.Backend, nil
+	if err := r.Backend.Validate(); err != nil {
+		return tenant.BackendProfile{}, fmt.Errorf("backend profile: %w", err)
+	}
+	return r.Backend.Clone(), nil
 }

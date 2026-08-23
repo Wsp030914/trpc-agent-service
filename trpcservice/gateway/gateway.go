@@ -8,24 +8,60 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
+// TenantSource identifies the trusted boundary that supplied tenant routing.
+type TenantSource string
+
+const (
+	// TenantSourceAuthenticatedClaims means tenant routing came from authenticated claims.
+	TenantSourceAuthenticatedClaims TenantSource = "authenticated_claims"
+	// TenantSourceVerifiedChannelBinding means tenant routing came from a verified channel binding.
+	TenantSourceVerifiedChannelBinding TenantSource = "verified_channel_binding"
+)
+
 // Message is the normalized user input passed from gateway to workers.
 type Message struct {
 	Text         string
 	ArtifactRefs []string
 }
 
-// Request is a trusted gateway input after authentication or channel binding.
+// TenantResolver supplies tenant routing from an authentication or verification boundary.
+// Implementations must not derive tenant identity from unverified external payload fields.
+type TenantResolver interface {
+	ResolveTenant(ctx context.Context) (tenant.RuntimeContext, TenantSource, error)
+}
+
+// Request is a gateway input whose tenant routing is supplied by a trusted resolver.
 type Request struct {
 	RequestID string
-	Tenant    tenant.RuntimeContext
+	Tenant    TenantResolver
 	Message   Message
 }
 
 // Job is the tenant-scoped work item consumed by workers.
 type Job struct {
-	RequestID string
-	Tenant    tenant.RuntimeContext
-	Message   Message
+	RequestID    string
+	TenantSource TenantSource
+	Tenant       tenant.RuntimeContext
+	Message      Message
+}
+
+// Validate checks the trusted routing fields required by workers.
+func (j Job) Validate() error {
+	if j.RequestID == "" {
+		return errors.New("request_id is required")
+	}
+	if !validTenantSource(j.TenantSource) {
+		return errors.New("tenant source is invalid")
+	}
+	if j.TenantSource == TenantSourceVerifiedChannelBinding {
+		if j.Tenant.Channel == "" {
+			return errors.New("channel is required for verified channel binding")
+		}
+		if j.Tenant.BindingID == "" {
+			return errors.New("binding_id is required for verified channel binding")
+		}
+	}
+	return j.Tenant.Validate()
 }
 
 // PartitionKey returns the key used to serialize work for one session.
@@ -45,29 +81,57 @@ type Gateway struct {
 
 // Handle validates a request, creates a job, and optionally enqueues it.
 func (g Gateway) Handle(ctx context.Context, req Request) (Job, error) {
-	job, err := NewJob(req)
+	job, err := NewJob(ctx, req)
 	if err != nil {
 		return Job{}, err
 	}
 	if g.Jobs != nil {
-		if err := g.Jobs.Enqueue(ctx, job); err != nil {
+		if err := g.Jobs.Enqueue(ctx, job.clone()); err != nil {
 			return Job{}, err
 		}
 	}
 	return job, nil
 }
 
-// NewJob creates a worker job from one trusted gateway request.
-func NewJob(req Request) (Job, error) {
-	if req.RequestID == "" {
-		return Job{}, errors.New("request_id is required")
+// NewJob resolves trusted tenant routing and creates a worker job.
+func NewJob(ctx context.Context, req Request) (Job, error) {
+	if req.Tenant == nil {
+		return Job{}, errors.New("tenant resolver is required")
 	}
-	if err := req.Tenant.Validate(); err != nil {
+	tc, source, err := req.Tenant.ResolveTenant(ctx)
+	if err != nil {
 		return Job{}, err
 	}
-	return Job{
-		RequestID: req.RequestID,
-		Tenant:    req.Tenant,
-		Message:   req.Message,
-	}, nil
+	job := Job{
+		RequestID:    req.RequestID,
+		TenantSource: source,
+		Tenant:       tc,
+		Message: Message{
+			Text:         req.Message.Text,
+			ArtifactRefs: cloneStrings(req.Message.ArtifactRefs),
+		},
+	}
+	if err := job.Validate(); err != nil {
+		return Job{}, err
+	}
+	return job, nil
+}
+
+func validTenantSource(source TenantSource) bool {
+	return source == TenantSourceAuthenticatedClaims || source == TenantSourceVerifiedChannelBinding
+}
+
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func (j Job) clone() Job {
+	cloned := j
+	cloned.Message.ArtifactRefs = cloneStrings(j.Message.ArtifactRefs)
+	return cloned
 }
