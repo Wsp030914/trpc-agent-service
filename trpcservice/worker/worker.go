@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
@@ -48,6 +49,30 @@ type RunResult struct {
 	RunnerCompleted bool
 }
 
+// Option configures a Worker.
+type Option func(*Worker)
+
+// WithRunner sets the runner resolver used by Run.
+func WithRunner(resolver RunnerResolver) Option {
+	return func(w *Worker) {
+		w.Runner = resolver
+	}
+}
+
+// WithEventSink sets the sink that receives runner events.
+func WithEventSink(sink EventSink) Option {
+	return func(w *Worker) {
+		w.Events = sink
+	}
+}
+
+// WithEventSinkTimeout sets the maximum time allowed for one event sink call.
+func WithEventSinkTimeout(timeout time.Duration) Option {
+	return func(w *Worker) {
+		w.EventSinkTimeout = timeout
+	}
+}
+
 // Worker prepares jobs for execution without owning session state locally.
 type Worker struct {
 	Config           config.Resolver
@@ -55,6 +80,18 @@ type Worker struct {
 	Runner           RunnerResolver
 	Events           EventSink
 	EventSinkTimeout time.Duration
+}
+
+// New creates a Worker with the required config and storage resolvers.
+func New(configResolver config.Resolver, storageResolver storage.Resolver, opts ...Option) *Worker {
+	w := &Worker{
+		Config:  configResolver,
+		Storage: storageResolver,
+	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	return w
 }
 
 // Prepare validates a job and resolves the tenant backend_config.
@@ -104,7 +141,7 @@ func (w Worker) Prepare(ctx context.Context, job gateway.Job) (Execution, error)
 		Storage:      stores,
 		Message: gateway.Message{
 			Text:         job.Message.Text,
-			ArtifactRefs: cloneStrings(job.Message.ArtifactRefs),
+			ArtifactRefs: slices.Clone(job.Message.ArtifactRefs),
 		},
 		PartitionKey: partitionKey,
 	}, nil
@@ -241,13 +278,4 @@ func runnerRuntimeState(exec Execution) map[string]any {
 		state["binding_id"] = exec.Tenant.BindingID
 	}
 	return state
-}
-
-func cloneStrings(values []string) []string {
-	if values == nil {
-		return nil
-	}
-	cloned := make([]string, len(values))
-	copy(cloned, values)
-	return cloned
 }

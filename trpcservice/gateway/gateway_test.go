@@ -41,7 +41,7 @@ func (q *captureRoutedQueue) EnqueueRouted(_ context.Context, job gateway.Routed
 
 func TestGatewayCreatesTenantScopedJob(t *testing.T) {
 	queue := &captureQueue{}
-	gw := gateway.Gateway{Jobs: queue}
+	gw := gateway.New(gateway.WithEnqueuer(queue))
 	artifactRefs := []string{"artifact-1"}
 
 	req := gateway.Request{
@@ -134,7 +134,7 @@ func TestNewJobAcceptsOnlyTrustedTenantSources(t *testing.T) {
 
 func TestGatewayEnqueuesRoutedJobWithPartitionKey(t *testing.T) {
 	queue := &captureRoutedQueue{}
-	gw := gateway.Gateway{RoutedJobs: queue}
+	gw := gateway.New(gateway.WithRoutedEnqueuer(queue))
 	req := testRequest("request-1", "tenant-a", "support", "session-1")
 
 	job, err := gw.Handle(context.Background(), req)

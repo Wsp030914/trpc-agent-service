@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 )
 
@@ -93,7 +94,7 @@ func (c AppConfig) Clone() AppConfig {
 	cloned.Tools = c.Tools.Clone()
 	cloned.BackendConfig = c.BackendConfig.Clone()
 	cloned.SecretRefs = cloneSecretRefs(c.SecretRefs)
-	cloned.ChannelBinding = cloneStrings(c.ChannelBinding)
+	cloned.ChannelBinding = slices.Clone(c.ChannelBinding)
 	return cloned
 }
 
@@ -173,8 +174,8 @@ type ToolPolicy struct {
 // Clone returns a deep copy of the tool policy.
 func (p ToolPolicy) Clone() ToolPolicy {
 	return ToolPolicy{
-		VisibleTools:    cloneStrings(p.VisibleTools),
-		ExecutableTools: cloneStrings(p.ExecutableTools),
+		VisibleTools:    slices.Clone(p.VisibleTools),
+		ExecutableTools: slices.Clone(p.ExecutableTools),
 	}
 }
 
@@ -229,6 +230,11 @@ func (r BackendRef) Clone() BackendRef {
 	cloned := r
 	cloned.Options = cloneStringMap(r.Options)
 	return cloned
+}
+
+// IsZero reports whether the backend reference is not configured.
+func (r BackendRef) IsZero() bool {
+	return r.Kind == "" && r.Name == "" && r.DSNRef == "" && len(r.Options) == 0
 }
 
 // Validate checks that the backend reference can be resolved later.
@@ -427,17 +433,13 @@ func validBackendKind(kind BackendKind) bool {
 }
 
 func validateOptionalBackendRef(label string, ref BackendRef) error {
-	if ref.isZero() {
+	if ref.IsZero() {
 		return nil
 	}
 	if err := ref.Validate(); err != nil {
 		return fmt.Errorf("%s: %w", label, err)
 	}
 	return nil
-}
-
-func (r BackendRef) isZero() bool {
-	return r.Kind == "" && r.Name == "" && r.DSNRef == "" && len(r.Options) == 0
 }
 
 func validateUniqueStrings(values []string, label string) error {
@@ -471,15 +473,6 @@ func cloneStringMap(values map[string]string) map[string]string {
 	for k, v := range values {
 		cloned[k] = v
 	}
-	return cloned
-}
-
-func cloneStrings(values []string) []string {
-	if values == nil {
-		return nil
-	}
-	cloned := make([]string, len(values))
-	copy(cloned, values)
 	return cloned
 }
 

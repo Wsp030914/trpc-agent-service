@@ -47,13 +47,13 @@ func (h Handle) Key(parts ...string) (string, error) {
 
 // IsZero reports whether the handle is not configured.
 func (h Handle) IsZero() bool {
-	return h.Scope == tenant.Scope{} && h.Capability == "" && isZeroRef(h.Ref)
+	return h.Scope == tenant.Scope{} && h.Capability == "" && h.Ref.IsZero()
 }
 
 // Validate checks that the handle matches the expected tenant scope, capability,
 // and backend reference.
 func (h Handle) Validate(scope tenant.Scope, capability Capability, ref tenant.BackendRef) error {
-	if isZeroRef(ref) {
+	if ref.IsZero() {
 		if !h.IsZero() {
 			return fmt.Errorf("%s backend is not configured but handle is present", capability)
 		}
@@ -187,7 +187,7 @@ func (r StaticResolver) resolveOptionalHandle(
 	capability Capability,
 	ref tenant.BackendRef,
 ) (Handle, error) {
-	if isZeroRef(ref) {
+	if ref.IsZero() {
 		return Handle{}, nil
 	}
 	return r.resolveHandle(scope, capability, ref)
@@ -209,10 +209,6 @@ func (r StaticResolver) resolveHandle(
 		Capability: capability,
 		Ref:        ref.Clone(),
 	}, nil
-}
-
-func isZeroRef(ref tenant.BackendRef) bool {
-	return ref.Kind == "" && ref.Name == "" && ref.DSNRef == "" && len(ref.Options) == 0
 }
 
 func sameBackendRef(a, b tenant.BackendRef) bool {

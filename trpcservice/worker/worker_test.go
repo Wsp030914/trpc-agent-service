@@ -209,6 +209,38 @@ func TestWorkerRunCallsRunnerAndDrainsEvents(t *testing.T) {
 	}
 }
 
+func TestNewWorkerAppliesRuntimeOptions(t *testing.T) {
+	configs, err := config.NewStaticResolver(testAppConfig("tenant-a", sharedBackendConfig()))
+	if err != nil {
+		t.Fatalf("new config resolver: %v", err)
+	}
+	runner := &recordingRunner{
+		events: []*event.Event{runnerCompletionEvent()},
+	}
+	sink := &recordingEventSink{}
+	w := worker.New(
+		configs,
+		storage.StaticResolver{},
+		worker.WithRunner(staticRunnerResolver{runner: runner}),
+		worker.WithEventSink(sink),
+		worker.WithEventSinkTimeout(time.Millisecond),
+	)
+
+	result, err := w.Run(context.Background(), testJob("request-1", "tenant-a", "session-1"))
+	if err != nil {
+		t.Fatalf("run job: %v", err)
+	}
+	if !result.RunnerCompleted {
+		t.Fatal("runner completion was not observed")
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("sink event count = %d, want 1", len(sink.events))
+	}
+	if w.EventSinkTimeout != time.Millisecond {
+		t.Fatalf("event sink timeout = %s, want %s", w.EventSinkTimeout, time.Millisecond)
+	}
+}
+
 func TestWorkerRunDrainsEventsAfterSinkError(t *testing.T) {
 	wantErr := errors.New("sink failed")
 	runner := &recordingRunner{
@@ -384,10 +416,7 @@ func testWorker(t *testing.T, backend tenant.BackendConfig) worker.Worker {
 	if err != nil {
 		t.Fatalf("new config resolver: %v", err)
 	}
-	return worker.Worker{
-		Config:  configs,
-		Storage: storage.StaticResolver{},
-	}
+	return *worker.New(configs, storage.StaticResolver{})
 }
 
 func testAppConfig(tenantID string, backend tenant.BackendConfig) tenant.AppConfig {

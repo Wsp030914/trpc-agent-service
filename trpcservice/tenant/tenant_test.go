@@ -183,6 +183,22 @@ func TestBackendConfigValidateRejectsMissingSessionBackend(t *testing.T) {
 	}
 }
 
+func TestBackendRefIsZeroChecksWholeRef(t *testing.T) {
+	if !(tenant.BackendRef{}).IsZero() {
+		t.Fatal("empty backend ref is not zero")
+	}
+	for _, ref := range []tenant.BackendRef{
+		{Kind: tenant.BackendSQL},
+		{Name: "session-sql"},
+		{DSNRef: "secret-ref"},
+		{Options: map[string]string{"schema": "agent"}},
+	} {
+		if ref.IsZero() {
+			t.Fatalf("backend ref %#v is zero", ref)
+		}
+	}
+}
+
 func validAppConfig() tenant.AppConfig {
 	return tenant.AppConfig{
 		TenantID: "tenant-a",

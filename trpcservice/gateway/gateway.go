@@ -4,6 +4,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -115,10 +116,36 @@ type RoutedEnqueuer interface {
 	EnqueueRouted(ctx context.Context, job RoutedJob) error
 }
 
+// Option configures a Gateway.
+type Option func(*Gateway)
+
+// WithEnqueuer sets the queue used for tenant-scoped jobs.
+func WithEnqueuer(enqueuer Enqueuer) Option {
+	return func(g *Gateway) {
+		g.Jobs = enqueuer
+	}
+}
+
+// WithRoutedEnqueuer sets the queue used for partitioned tenant-scoped jobs.
+func WithRoutedEnqueuer(enqueuer RoutedEnqueuer) Option {
+	return func(g *Gateway) {
+		g.RoutedJobs = enqueuer
+	}
+}
+
 // Gateway converts trusted requests into tenant-scoped jobs.
 type Gateway struct {
 	Jobs       Enqueuer
 	RoutedJobs RoutedEnqueuer
+}
+
+// New creates a Gateway with the provided options.
+func New(opts ...Option) *Gateway {
+	g := &Gateway{}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g
 }
 
 // Handle validates a request, creates a job, and optionally enqueues it.
@@ -158,7 +185,7 @@ func NewJob(ctx context.Context, req Request) (Job, error) {
 		Tenant:       tc,
 		Message: Message{
 			Text:         req.Message.Text,
-			ArtifactRefs: cloneStrings(req.Message.ArtifactRefs),
+			ArtifactRefs: slices.Clone(req.Message.ArtifactRefs),
 		},
 	}
 	if err := job.Validate(); err != nil {
@@ -171,17 +198,8 @@ func validTenantSource(source TenantSource) bool {
 	return source == TenantSourceAuthenticatedClaims || source == TenantSourceVerifiedChannelBinding
 }
 
-func cloneStrings(values []string) []string {
-	if values == nil {
-		return nil
-	}
-	cloned := make([]string, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
 func (j Job) clone() Job {
 	cloned := j
-	cloned.Message.ArtifactRefs = cloneStrings(j.Message.ArtifactRefs)
+	cloned.Message.ArtifactRefs = slices.Clone(j.Message.ArtifactRefs)
 	return cloned
 }
