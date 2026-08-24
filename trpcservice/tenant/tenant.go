@@ -80,7 +80,7 @@ type AppConfig struct {
 	Version        string
 	Model          ModelConfig
 	Tools          ToolPolicy
-	Backend        BackendProfile
+	BackendConfig  BackendConfig
 	Audit          AuditPolicy
 	SecretRefs     []SecretRef
 	ChannelBinding []string
@@ -91,7 +91,7 @@ func (c AppConfig) Clone() AppConfig {
 	cloned := c
 	cloned.Model = c.Model.Clone()
 	cloned.Tools = c.Tools.Clone()
-	cloned.Backend = c.Backend.Clone()
+	cloned.BackendConfig = c.BackendConfig.Clone()
 	cloned.SecretRefs = cloneSecretRefs(c.SecretRefs)
 	cloned.ChannelBinding = cloneStrings(c.ChannelBinding)
 	return cloned
@@ -117,8 +117,8 @@ func (c AppConfig) Validate() error {
 	if err := c.Tools.Validate(); err != nil {
 		return fmt.Errorf("tool policy: %w", err)
 	}
-	if err := c.Backend.Validate(); err != nil {
-		return fmt.Errorf("backend profile: %w", err)
+	if err := c.BackendConfig.Validate(); err != nil {
+		return fmt.Errorf("backend_config: %w", err)
 	}
 	if err := c.Audit.Validate(); err != nil {
 		return fmt.Errorf("audit policy: %w", err)
@@ -190,6 +190,16 @@ func (p ToolPolicy) Validate() error {
 	return nil
 }
 
+// CanView reports whether a tool declaration may be exposed to the tenant app.
+func (p ToolPolicy) CanView(name string) bool {
+	return containsString(p.VisibleTools, name)
+}
+
+// CanExecute reports whether the tenant app may execute a tool.
+func (p ToolPolicy) CanExecute(name string) bool {
+	return containsString(p.ExecutableTools, name)
+}
+
 // BackendKind identifies a storage backend family.
 type BackendKind string
 
@@ -236,8 +246,8 @@ func (r BackendRef) Validate() error {
 	return nil
 }
 
-// BackendProfile groups the backends used by one app config version.
-type BackendProfile struct {
+// BackendConfig groups the backends used by one app config version.
+type BackendConfig struct {
 	Name      string
 	Session   BackendRef
 	Memory    BackendRef
@@ -246,37 +256,37 @@ type BackendProfile struct {
 	Audit     BackendRef
 }
 
-// Clone returns a deep copy of backend references in the profile.
-func (p BackendProfile) Clone() BackendProfile {
-	return BackendProfile{
-		Name:      p.Name,
-		Session:   p.Session.Clone(),
-		Memory:    p.Memory.Clone(),
-		Knowledge: p.Knowledge.Clone(),
-		Artifact:  p.Artifact.Clone(),
-		Audit:     p.Audit.Clone(),
+// Clone returns a deep copy of backend references in the config.
+func (c BackendConfig) Clone() BackendConfig {
+	return BackendConfig{
+		Name:      c.Name,
+		Session:   c.Session.Clone(),
+		Memory:    c.Memory.Clone(),
+		Knowledge: c.Knowledge.Clone(),
+		Artifact:  c.Artifact.Clone(),
+		Audit:     c.Audit.Clone(),
 	}
 }
 
 // Validate checks the required session backend and any optional backend refs.
 // The zero value is invalid because a stateless worker needs a session backend.
-func (p BackendProfile) Validate() error {
-	if p.Name == "" {
-		return errors.New("backend profile name is required")
+func (c BackendConfig) Validate() error {
+	if c.Name == "" {
+		return errors.New("backend_config name is required")
 	}
-	if err := p.Session.Validate(); err != nil {
+	if err := c.Session.Validate(); err != nil {
 		return fmt.Errorf("session backend: %w", err)
 	}
-	if err := validateOptionalBackendRef("memory backend", p.Memory); err != nil {
+	if err := validateOptionalBackendRef("memory backend", c.Memory); err != nil {
 		return err
 	}
-	if err := validateOptionalBackendRef("knowledge backend", p.Knowledge); err != nil {
+	if err := validateOptionalBackendRef("knowledge backend", c.Knowledge); err != nil {
 		return err
 	}
-	if err := validateOptionalBackendRef("artifact backend", p.Artifact); err != nil {
+	if err := validateOptionalBackendRef("artifact backend", c.Artifact); err != nil {
 		return err
 	}
-	if err := validateOptionalBackendRef("audit backend", p.Audit); err != nil {
+	if err := validateOptionalBackendRef("audit backend", c.Audit); err != nil {
 		return err
 	}
 	return nil
@@ -321,7 +331,7 @@ type RuntimeContext struct {
 	BindingID          string
 	SessionID          string
 	SessionPrincipalID string
-	ActorUserID        string
+	UserID             string
 	TraceID            string
 }
 
@@ -480,4 +490,16 @@ func cloneSecretRefs(values []SecretRef) []SecretRef {
 	cloned := make([]SecretRef, len(values))
 	copy(cloned, values)
 	return cloned
+}
+
+func containsString(values []string, target string) bool {
+	if target == "" {
+		return false
+	}
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

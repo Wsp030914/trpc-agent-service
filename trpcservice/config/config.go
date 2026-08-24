@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -16,10 +17,23 @@ type Resolver interface {
 	ResolveAppConfig(ctx context.Context, tenantID, appID, version string) (tenant.AppConfig, error)
 }
 
+// BindingResolver resolves channel bindings in tenant application scope.
+type BindingResolver interface {
+	// ResolveBinding returns a validated binding for an exact tenant, application,
+	// and binding ID match.
+	ResolveBinding(ctx context.Context, tenantID, appID, bindingID string) (channels.Binding, error)
+}
+
 // StaticResolver stores immutable application configs for tests and local wiring.
 // Its zero value is an empty resolver. Constructed resolvers are safe for concurrent reads.
 type StaticResolver struct {
 	configs map[configKey]tenant.AppConfig
+}
+
+// StaticBindingResolver stores immutable channel bindings for tests and local wiring.
+// Its zero value is an empty resolver. Constructed resolvers are safe for concurrent reads.
+type StaticBindingResolver struct {
+	bindings map[bindingKey]channels.Binding
 }
 
 type configKey struct {
@@ -28,13 +42,39 @@ type configKey struct {
 	version  string
 }
 
+type bindingKey struct {
+	tenantID  string
+	appID     string
+	bindingID string
+}
+
 // NewStaticResolver validates and copies application configs. It rejects duplicate scopes.
 func NewStaticResolver(configs ...tenant.AppConfig) (*StaticResolver, error) {
+	return newStaticResolver(nil, configs...)
+}
+
+// NewStaticResolverWithBindings validates application configs against channel
+// bindings and rejects duplicate scopes.
+func NewStaticResolverWithBindings(
+	bindings []channels.Binding,
+	configs ...tenant.AppConfig,
+) (*StaticResolver, error) {
+	bindingResolver, err := NewStaticBindingResolver(bindings...)
+	if err != nil {
+		return nil, err
+	}
+	return newStaticResolver(bindingResolver, configs...)
+}
+
+func newStaticResolver(bindingResolver BindingResolver, configs ...tenant.AppConfig) (*StaticResolver, error) {
 	resolver := &StaticResolver{
 		configs: make(map[configKey]tenant.AppConfig, len(configs)),
 	}
 	for i, cfg := range configs {
 		if err := cfg.Validate(); err != nil {
+			return nil, fmt.Errorf("app config %d: %w", i, err)
+		}
+		if err := ValidateAppConfigBindings(context.Background(), cfg, bindingResolver); err != nil {
 			return nil, fmt.Errorf("app config %d: %w", i, err)
 		}
 		key := configKey{
@@ -51,6 +91,34 @@ func NewStaticResolver(configs ...tenant.AppConfig) (*StaticResolver, error) {
 			)
 		}
 		resolver.configs[key] = cfg.Clone()
+	}
+	return resolver, nil
+}
+
+// NewStaticBindingResolver validates and copies channel bindings. It rejects
+// duplicate tenant application binding IDs.
+func NewStaticBindingResolver(bindings ...channels.Binding) (*StaticBindingResolver, error) {
+	resolver := &StaticBindingResolver{
+		bindings: make(map[bindingKey]channels.Binding, len(bindings)),
+	}
+	for i, binding := range bindings {
+		if err := binding.Validate(); err != nil {
+			return nil, fmt.Errorf("channel binding %d: %w", i, err)
+		}
+		key := bindingKey{
+			tenantID:  binding.TenantID,
+			appID:     binding.AppID,
+			bindingID: binding.BindingID,
+		}
+		if _, exists := resolver.bindings[key]; exists {
+			return nil, fmt.Errorf(
+				"channel binding for tenant_id %q app_id %q binding_id %q is duplicated",
+				key.tenantID,
+				key.appID,
+				key.bindingID,
+			)
+		}
+		resolver.bindings[key] = binding
 	}
 	return resolver, nil
 }
@@ -83,4 +151,62 @@ func (r *StaticResolver) ResolveAppConfig(
 		)
 	}
 	return cfg.Clone(), nil
+}
+
+// ResolveBinding returns a copy of one exact channel binding.
+func (r *StaticBindingResolver) ResolveBinding(
+	_ context.Context,
+	tenantID,
+	appID,
+	bindingID string,
+) (channels.Binding, error) {
+	if tenantID == "" {
+		return channels.Binding{}, errors.New("tenant_id is required")
+	}
+	if appID == "" {
+		return channels.Binding{}, errors.New("app_id is required")
+	}
+	if bindingID == "" {
+		return channels.Binding{}, errors.New("binding_id is required")
+	}
+
+	key := bindingKey{tenantID: tenantID, appID: appID, bindingID: bindingID}
+	binding, ok := r.bindings[key]
+	if !ok {
+		return channels.Binding{}, fmt.Errorf(
+			"channel binding not found for tenant_id %q app_id %q binding_id %q",
+			tenantID,
+			appID,
+			bindingID,
+		)
+	}
+	return binding, nil
+}
+
+// ValidateAppConfigBindings verifies that each binding referenced by cfg exists
+// and belongs to the same tenant application.
+func ValidateAppConfigBindings(
+	ctx context.Context,
+	cfg tenant.AppConfig,
+	bindings BindingResolver,
+) error {
+	if len(cfg.ChannelBinding) == 0 {
+		return nil
+	}
+	if bindings == nil {
+		return errors.New("channel binding resolver is required")
+	}
+	for _, bindingID := range cfg.ChannelBinding {
+		binding, err := bindings.ResolveBinding(ctx, cfg.TenantID, cfg.AppID, bindingID)
+		if err != nil {
+			return err
+		}
+		if err := binding.Validate(); err != nil {
+			return fmt.Errorf("channel binding %q: %w", bindingID, err)
+		}
+		if binding.TenantID != cfg.TenantID || binding.AppID != cfg.AppID || binding.BindingID != bindingID {
+			return fmt.Errorf("channel binding %q does not match app config scope", bindingID)
+		}
+	}
+	return nil
 }

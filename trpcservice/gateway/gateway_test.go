@@ -12,6 +12,10 @@ type captureQueue struct {
 	job gateway.Job
 }
 
+type captureRoutedQueue struct {
+	job gateway.RoutedJob
+}
+
 type staticTenantResolver struct {
 	tenant tenant.RuntimeContext
 	source gateway.TenantSource
@@ -26,6 +30,11 @@ func (r staticTenantResolver) ResolveTenant(_ context.Context) (
 }
 
 func (q *captureQueue) Enqueue(_ context.Context, job gateway.Job) error {
+	q.job = job
+	return nil
+}
+
+func (q *captureRoutedQueue) EnqueueRouted(_ context.Context, job gateway.RoutedJob) error {
 	q.job = job
 	return nil
 }
@@ -45,7 +54,7 @@ func TestGatewayCreatesTenantScopedJob(t *testing.T) {
 				ConfigVersion:      "v1",
 				SessionID:          "session-1",
 				SessionPrincipalID: "principal-1",
-				ActorUserID:        "actor-1",
+				UserID:             "user-1",
 			},
 		},
 		Message: gateway.Message{Text: "hello", ArtifactRefs: artifactRefs},
@@ -120,6 +129,45 @@ func TestNewJobAcceptsOnlyTrustedTenantSources(t *testing.T) {
 	req.Tenant = resolver
 	if _, err := gateway.NewJob(context.Background(), req); err == nil {
 		t.Fatal("new job succeeded with unverified channel binding metadata")
+	}
+}
+
+func TestGatewayEnqueuesRoutedJobWithPartitionKey(t *testing.T) {
+	queue := &captureRoutedQueue{}
+	gw := gateway.Gateway{RoutedJobs: queue}
+	req := testRequest("request-1", "tenant-a", "support", "session-1")
+
+	job, err := gw.Handle(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handle request: %v", err)
+	}
+	if err := queue.job.Validate(); err != nil {
+		t.Fatalf("validate routed job: %v", err)
+	}
+	const want = "tenant:tenant-a:app:support:session:session-1"
+	if queue.job.PartitionKey != want {
+		t.Fatalf("routed partition key = %q, want %q", queue.job.PartitionKey, want)
+	}
+	if queue.job.Job.RequestID != job.RequestID {
+		t.Fatalf("routed request ID = %q, want %q", queue.job.Job.RequestID, job.RequestID)
+	}
+}
+
+func TestRoutedJobRejectsMismatchedPartitionKey(t *testing.T) {
+	job, err := gateway.NewJob(
+		context.Background(),
+		testRequest("request-1", "tenant-a", "support", "session-1"),
+	)
+	if err != nil {
+		t.Fatalf("new job: %v", err)
+	}
+	routed := gateway.RoutedJob{
+		Job:          job,
+		PartitionKey: "tenant:tenant-b:app:support:session:session-1",
+	}
+
+	if err := routed.Validate(); err == nil {
+		t.Fatal("validate routed job succeeded with mismatched partition key")
 	}
 }
 

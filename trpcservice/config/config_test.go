@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -17,7 +18,7 @@ func TestStaticResolverReturnsExactConfigAndCopiesMutableData(t *testing.T) {
 
 	cfg.Model.Parameters["temperature"] = "1"
 	cfg.Tools.VisibleTools[0] = "mutated"
-	cfg.Backend.Session.Options["schema"] = "mutated"
+	cfg.BackendConfig.Session.Options["schema"] = "mutated"
 
 	resolved, err := resolver.ResolveAppConfig(context.Background(), "tenant-a", "support", "v1")
 	if err != nil {
@@ -29,7 +30,7 @@ func TestStaticResolverReturnsExactConfigAndCopiesMutableData(t *testing.T) {
 	if got := resolved.Tools.VisibleTools[0]; got != "search" {
 		t.Fatalf("visible tool = %q, want search", got)
 	}
-	if got := resolved.Backend.Session.Options["schema"]; got != "agent" {
+	if got := resolved.BackendConfig.Session.Options["schema"]; got != "agent" {
 		t.Fatalf("session schema = %q, want agent", got)
 	}
 
@@ -134,6 +135,52 @@ func TestStaticResolverRejectsIncompleteOrUnknownScope(t *testing.T) {
 	}
 }
 
+func TestStaticResolverWithBindingsValidatesConfigReferences(t *testing.T) {
+	cfg := testAppConfig("tenant-a", "support", "v1")
+	cfg.ChannelBinding = []string{"binding-1"}
+	binding := testBinding("tenant-a", "support", "binding-1")
+
+	resolver, err := config.NewStaticResolverWithBindings([]channels.Binding{binding}, cfg)
+	if err != nil {
+		t.Fatalf("new static resolver with bindings: %v", err)
+	}
+	resolved, err := resolver.ResolveAppConfig(context.Background(), "tenant-a", "support", "v1")
+	if err != nil {
+		t.Fatalf("resolve app config: %v", err)
+	}
+	if got := resolved.ChannelBinding[0]; got != "binding-1" {
+		t.Fatalf("channel binding = %q, want binding-1", got)
+	}
+}
+
+func TestStaticResolverRejectsMissingBindingResolver(t *testing.T) {
+	cfg := testAppConfig("tenant-a", "support", "v1")
+	cfg.ChannelBinding = []string{"binding-1"}
+
+	if _, err := config.NewStaticResolver(cfg); err == nil {
+		t.Fatal("new static resolver succeeded with unresolved channel binding")
+	}
+}
+
+func TestValidateAppConfigBindingsRejectsWrongBindingScope(t *testing.T) {
+	cfg := testAppConfig("tenant-a", "support", "v1")
+	cfg.ChannelBinding = []string{"binding-1"}
+	bindings := wrongScopeBindingResolver{
+		binding: testBinding("tenant-b", "support", "binding-1"),
+	}
+
+	if err := config.ValidateAppConfigBindings(context.Background(), cfg, bindings); err == nil {
+		t.Fatal("validate app config bindings succeeded with mismatched binding scope")
+	}
+}
+
+func TestStaticBindingResolverRejectsDuplicateBinding(t *testing.T) {
+	binding := testBinding("tenant-a", "support", "binding-1")
+	if _, err := config.NewStaticBindingResolver(binding, binding); err == nil {
+		t.Fatal("new static binding resolver succeeded with duplicate binding")
+	}
+}
+
 func testAppConfig(tenantID, appID, version string) tenant.AppConfig {
 	return tenant.AppConfig{
 		TenantID: tenantID,
@@ -148,7 +195,7 @@ func testAppConfig(tenantID, appID, version string) tenant.AppConfig {
 			VisibleTools:    []string{"search"},
 			ExecutableTools: []string{"search"},
 		},
-		Backend: tenant.BackendProfile{
+		BackendConfig: tenant.BackendConfig{
 			Name: "shared",
 			Session: tenant.BackendRef{
 				Kind:    tenant.BackendSQL,
@@ -156,5 +203,38 @@ func testAppConfig(tenantID, appID, version string) tenant.AppConfig {
 				Options: map[string]string{"schema": "agent"},
 			},
 		},
+	}
+}
+
+type wrongScopeBindingResolver struct {
+	binding channels.Binding
+}
+
+func (r wrongScopeBindingResolver) ResolveBinding(
+	_ context.Context,
+	_,
+	_,
+	_ string,
+) (channels.Binding, error) {
+	return r.binding, nil
+}
+
+func testBinding(tenantID, appID, bindingID string) channels.Binding {
+	return channels.Binding{
+		TenantID:        tenantID,
+		AppID:           appID,
+		BindingID:       bindingID,
+		Channel:         channels.ChannelWeCom,
+		ExternalAccount: "corp-agent-1",
+		WebhookURL:      "https://example.com/im/wecom/binding-1",
+		TokenRef: tenant.SecretRef{
+			Name:    "wecom-token",
+			Version: "v1",
+		},
+		SigningSecretRef: tenant.SecretRef{
+			Name:    "wecom-signing-secret",
+			Version: "v1",
+		},
+		Status: channels.BindingActive,
 	}
 }

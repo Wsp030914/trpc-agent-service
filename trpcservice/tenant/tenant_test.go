@@ -13,7 +13,7 @@ func TestRuntimeContextValidateAndScopedKey(t *testing.T) {
 		ConfigVersion:      "v1",
 		SessionID:          "group/thread-1",
 		SessionPrincipalID: "group-1",
-		ActorUserID:        "user-1",
+		UserID:             "user-1",
 		TraceID:            "trace-1",
 	}
 	if err := tc.Validate(); err != nil {
@@ -85,7 +85,7 @@ func TestAppConfigValidateAndCloneCopiesNestedData(t *testing.T) {
 	cfg.Model.Parameters["temperature"] = "1"
 	cfg.Tools.VisibleTools[0] = "mutated-visible"
 	cfg.Tools.ExecutableTools[0] = "mutated-executable"
-	cfg.Backend.Session.Options["schema"] = "mutated"
+	cfg.BackendConfig.Session.Options["schema"] = "mutated"
 	cfg.SecretRefs[0].Name = "mutated-secret"
 	cfg.ChannelBinding[0] = "mutated-binding"
 
@@ -98,8 +98,8 @@ func TestAppConfigValidateAndCloneCopiesNestedData(t *testing.T) {
 	if cloned.Tools.ExecutableTools[0] != "search" {
 		t.Fatalf("cloned executable tool = %q, want search", cloned.Tools.ExecutableTools[0])
 	}
-	if cloned.Backend.Session.Options["schema"] != "agent" {
-		t.Fatalf("cloned backend option = %q, want agent", cloned.Backend.Session.Options["schema"])
+	if cloned.BackendConfig.Session.Options["schema"] != "agent" {
+		t.Fatalf("cloned backend option = %q, want agent", cloned.BackendConfig.Session.Options["schema"])
 	}
 	if cloned.SecretRefs[0].Name != "model-api-key" {
 		t.Fatalf("cloned secret name = %q, want model-api-key", cloned.SecretRefs[0].Name)
@@ -118,7 +118,7 @@ func TestAppConfigValidateAllowsNilOptionalCollections(t *testing.T) {
 			Provider: "openai",
 			Model:    "gpt-4.1-mini",
 		},
-		Backend: tenant.BackendProfile{
+		BackendConfig: tenant.BackendConfig{
 			Name: "default",
 			Session: tenant.BackendRef{
 				Kind: tenant.BackendSQL,
@@ -151,12 +151,35 @@ func TestAppConfigValidateRejectsDuplicateTool(t *testing.T) {
 	}
 }
 
-func TestBackendProfileValidateRejectsMissingSessionBackend(t *testing.T) {
-	profile := validBackendProfile()
-	profile.Session = tenant.BackendRef{}
+func TestToolPolicyDefaultsToDeny(t *testing.T) {
+	policy := tenant.ToolPolicy{
+		VisibleTools:    []string{"search", "read"},
+		ExecutableTools: []string{"search"},
+	}
 
-	if err := profile.Validate(); err == nil {
-		t.Fatal("validate backend profile succeeded with missing session backend")
+	if !policy.CanView("read") {
+		t.Fatal("read tool is not visible")
+	}
+	if policy.CanExecute("read") {
+		t.Fatal("read tool is executable without permission")
+	}
+	if !policy.CanExecute("search") {
+		t.Fatal("search tool is not executable")
+	}
+	if policy.CanView("write") || policy.CanExecute("write") {
+		t.Fatal("unknown tool is permitted")
+	}
+	if (tenant.ToolPolicy{}).CanView("") || (tenant.ToolPolicy{}).CanExecute("") {
+		t.Fatal("zero policy permits an empty tool name")
+	}
+}
+
+func TestBackendConfigValidateRejectsMissingSessionBackend(t *testing.T) {
+	backend := validBackendConfig()
+	backend.Session = tenant.BackendRef{}
+
+	if err := backend.Validate(); err == nil {
+		t.Fatal("validate backend_config succeeded with missing session backend")
 	}
 }
 
@@ -174,7 +197,7 @@ func validAppConfig() tenant.AppConfig {
 			VisibleTools:    []string{"search"},
 			ExecutableTools: []string{"search"},
 		},
-		Backend: validBackendProfile(),
+		BackendConfig: validBackendConfig(),
 		Audit: tenant.AuditPolicy{
 			Enabled:       true,
 			RetentionDays: 30,
@@ -187,8 +210,8 @@ func validAppConfig() tenant.AppConfig {
 	}
 }
 
-func validBackendProfile() tenant.BackendProfile {
-	return tenant.BackendProfile{
+func validBackendConfig() tenant.BackendConfig {
+	return tenant.BackendConfig{
 		Name: "default",
 		Session: tenant.BackendRef{
 			Kind:    tenant.BackendSQL,

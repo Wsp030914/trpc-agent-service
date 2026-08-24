@@ -45,6 +45,12 @@ type Job struct {
 	Message      Message
 }
 
+// RoutedJob is a job plus the queue partition used for session ordering.
+type RoutedJob struct {
+	Job          Job
+	PartitionKey string
+}
+
 // Validate checks the trusted routing fields required by workers.
 func (j Job) Validate() error {
 	if j.RequestID == "" {
@@ -69,14 +75,50 @@ func (j Job) PartitionKey() (string, error) {
 	return j.Tenant.Scope().Key("session", j.Tenant.SessionID)
 }
 
+// NewRoutedJob creates a job envelope with a stable session partition key.
+func NewRoutedJob(job Job) (RoutedJob, error) {
+	if err := job.Validate(); err != nil {
+		return RoutedJob{}, err
+	}
+	partitionKey, err := job.PartitionKey()
+	if err != nil {
+		return RoutedJob{}, err
+	}
+	return RoutedJob{Job: job.clone(), PartitionKey: partitionKey}, nil
+}
+
+// Validate checks the job and its partition key.
+func (j RoutedJob) Validate() error {
+	if err := j.Job.Validate(); err != nil {
+		return err
+	}
+	if j.PartitionKey == "" {
+		return errors.New("partition_key is required")
+	}
+	partitionKey, err := j.Job.PartitionKey()
+	if err != nil {
+		return err
+	}
+	if j.PartitionKey != partitionKey {
+		return errors.New("partition_key does not match job scope")
+	}
+	return nil
+}
+
 // Enqueuer accepts tenant-scoped jobs for later worker consumption.
 type Enqueuer interface {
 	Enqueue(ctx context.Context, job Job) error
 }
 
+// RoutedEnqueuer accepts tenant-scoped jobs with an explicit partition key.
+type RoutedEnqueuer interface {
+	EnqueueRouted(ctx context.Context, job RoutedJob) error
+}
+
 // Gateway converts trusted requests into tenant-scoped jobs.
 type Gateway struct {
-	Jobs Enqueuer
+	Jobs       Enqueuer
+	RoutedJobs RoutedEnqueuer
 }
 
 // Handle validates a request, creates a job, and optionally enqueues it.
@@ -85,7 +127,15 @@ func (g Gateway) Handle(ctx context.Context, req Request) (Job, error) {
 	if err != nil {
 		return Job{}, err
 	}
-	if g.Jobs != nil {
+	if g.RoutedJobs != nil {
+		routed, err := NewRoutedJob(job)
+		if err != nil {
+			return Job{}, err
+		}
+		if err := g.RoutedJobs.EnqueueRouted(ctx, routed); err != nil {
+			return Job{}, err
+		}
+	} else if g.Jobs != nil {
 		if err := g.Jobs.Enqueue(ctx, job.clone()); err != nil {
 			return Job{}, err
 		}

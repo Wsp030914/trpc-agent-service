@@ -5,12 +5,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
 )
+
+const defaultEventSinkTimeout = 5 * time.Second
 
 // Execution is the prepared context for running one tenant-scoped job.
 type Execution struct {
@@ -18,17 +25,39 @@ type Execution struct {
 	TenantSource gateway.TenantSource
 	Tenant       tenant.RuntimeContext
 	Config       tenant.AppConfig
-	Backend      tenant.BackendProfile
+	Storage      storage.Handles
+	Message      gateway.Message
 	PartitionKey string
+}
+
+// RunnerResolver resolves the framework runner used for one prepared execution.
+// The resolver owns runner construction, caching, and lifecycle.
+type RunnerResolver interface {
+	ResolveRunner(ctx context.Context, exec Execution) (runner.Runner, error)
+}
+
+// EventSink receives runner events after the worker has started execution.
+type EventSink interface {
+	HandleRunnerEvent(ctx context.Context, exec Execution, evt *event.Event) error
+}
+
+// RunResult summarizes one worker-owned runner execution.
+type RunResult struct {
+	Execution       Execution
+	EventCount      int
+	RunnerCompleted bool
 }
 
 // Worker prepares jobs for execution without owning session state locally.
 type Worker struct {
-	Config  config.Resolver
-	Storage storage.Resolver
+	Config           config.Resolver
+	Storage          storage.Resolver
+	Runner           RunnerResolver
+	Events           EventSink
+	EventSinkTimeout time.Duration
 }
 
-// Prepare validates a job and resolves the tenant backend profile.
+// Prepare validates a job and resolves the tenant backend_config.
 func (w Worker) Prepare(ctx context.Context, job gateway.Job) (Execution, error) {
 	if err := job.Validate(); err != nil {
 		return Execution{}, err
@@ -39,6 +68,9 @@ func (w Worker) Prepare(ctx context.Context, job gateway.Job) (Execution, error)
 	}
 	if w.Config == nil {
 		return Execution{}, errors.New("config resolver is required")
+	}
+	if w.Storage == nil {
+		return Execution{}, errors.New("storage resolver is required")
 	}
 	cfg, err := w.Config.ResolveAppConfig(
 		ctx,
@@ -57,54 +89,165 @@ func (w Worker) Prepare(ctx context.Context, job gateway.Job) (Execution, error)
 		cfg.Version != job.Tenant.ConfigVersion {
 		return Execution{}, errors.New("resolved app config does not match job scope")
 	}
-	if w.Storage == nil {
-		return Execution{}, errors.New("storage resolver is required")
-	}
-	backend, err := w.Storage.ResolveBackend(ctx, job.Tenant)
+	stores, err := w.Storage.Resolve(ctx, job.Tenant, cfg.BackendConfig)
 	if err != nil {
 		return Execution{}, err
 	}
-	if err := backend.Validate(); err != nil {
-		return Execution{}, fmt.Errorf("backend profile: %w", err)
-	}
-	if !sameBackendProfile(cfg.Backend, backend) {
-		return Execution{}, errors.New("resolved backend profile does not match app config")
+	if err := stores.Validate(job.Tenant, cfg.BackendConfig); err != nil {
+		return Execution{}, err
 	}
 	return Execution{
 		RequestID:    job.RequestID,
 		TenantSource: job.TenantSource,
 		Tenant:       job.Tenant,
 		Config:       cfg,
-		Backend:      backend,
+		Storage:      stores,
+		Message: gateway.Message{
+			Text:         job.Message.Text,
+			ArtifactRefs: cloneStrings(job.Message.ArtifactRefs),
+		},
 		PartitionKey: partitionKey,
 	}, nil
 }
 
-func sameBackendProfile(a, b tenant.BackendProfile) bool {
-	return a.Name == b.Name &&
-		sameBackendRef(a.Session, b.Session) &&
-		sameBackendRef(a.Memory, b.Memory) &&
-		sameBackendRef(a.Knowledge, b.Knowledge) &&
-		sameBackendRef(a.Artifact, b.Artifact) &&
-		sameBackendRef(a.Audit, b.Audit)
-}
-
-func sameBackendRef(a, b tenant.BackendRef) bool {
-	if a.Kind != b.Kind || a.Name != b.Name || a.DSNRef != b.DSNRef {
-		return false
+// Run prepares a job, calls runner.Runner, and drains the returned event channel.
+func (w Worker) Run(ctx context.Context, job gateway.Job) (RunResult, error) {
+	exec, err := w.Prepare(ctx, job)
+	if err != nil {
+		return RunResult{}, err
 	}
-	return sameStringMap(a.Options, b.Options)
-}
-
-func sameStringMap(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
+	result := RunResult{Execution: exec}
+	if w.Runner == nil {
+		return result, errors.New("runner resolver is required")
 	}
-	for key, value := range a {
-		other, ok := b[key]
-		if !ok || other != value {
-			return false
+	if err := validateRunExecution(exec); err != nil {
+		return result, err
+	}
+	r, err := w.Runner.ResolveRunner(ctx, exec)
+	if err != nil {
+		return result, err
+	}
+	if r == nil {
+		return result, errors.New("runner is required")
+	}
+	message, err := runnerMessage(exec.Message)
+	if err != nil {
+		return result, err
+	}
+	events, err := r.Run(
+		ctx,
+		exec.Tenant.UserID,
+		exec.Tenant.SessionID,
+		message,
+		agent.WithRequestID(exec.RequestID),
+		agent.WithAppName(runnerAppName(exec.Tenant)),
+		agent.MergeRuntimeState(runnerRuntimeState(exec)),
+	)
+	if err != nil {
+		return result, err
+	}
+	if events == nil {
+		return result, errors.New("runner event channel is nil")
+	}
+	var sinkErr error
+	sinkTimedOut := false
+	for evt := range events {
+		if evt == nil {
+			continue
+		}
+		result.EventCount++
+		if evt.IsRunnerCompletion() {
+			result.RunnerCompleted = true
+		}
+		if w.Events == nil || sinkTimedOut {
+			continue
+		}
+		if err := w.handleRunnerEvent(ctx, exec, evt); err != nil {
+			if sinkErr == nil {
+				sinkErr = err
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				sinkTimedOut = true
+			}
 		}
 	}
-	return true
+	if sinkErr != nil {
+		return result, sinkErr
+	}
+	return result, nil
+}
+
+func validateRunExecution(exec Execution) error {
+	if exec.Tenant.UserID == "" {
+		return errors.New("user_id is required for runner")
+	}
+	return nil
+}
+
+func (w Worker) handleRunnerEvent(ctx context.Context, exec Execution, evt *event.Event) error {
+	sinkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.eventSinkTimeout())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.Events.HandleRunnerEvent(sinkCtx, exec, evt)
+	}()
+	select {
+	case err := <-errCh:
+		return err
+	case <-sinkCtx.Done():
+		return fmt.Errorf("event sink timeout: %w", sinkCtx.Err())
+	}
+}
+
+func (w Worker) eventSinkTimeout() time.Duration {
+	if w.EventSinkTimeout > 0 {
+		return w.EventSinkTimeout
+	}
+	return defaultEventSinkTimeout
+}
+
+func runnerMessage(message gateway.Message) (model.Message, error) {
+	if len(message.ArtifactRefs) > 0 {
+		return model.Message{}, errors.New("artifact refs are not supported by runner boundary")
+	}
+	if message.Text == "" {
+		return model.Message{}, errors.New("message text is required")
+	}
+	return model.NewUserMessage(message.Text), nil
+}
+
+func runnerAppName(tc tenant.RuntimeContext) string {
+	return tc.TenantID + "/" + tc.AppID
+}
+
+func runnerRuntimeState(exec Execution) map[string]any {
+	state := map[string]any{
+		"tenant_id":            exec.Tenant.TenantID,
+		"app_id":               exec.Tenant.AppID,
+		"config_version":       exec.Tenant.ConfigVersion,
+		"request_id":           exec.RequestID,
+		"session_id":           exec.Tenant.SessionID,
+		"session_principal_id": exec.Tenant.SessionPrincipalID,
+		"user_id":              exec.Tenant.UserID,
+	}
+	if exec.Tenant.TraceID != "" {
+		state["trace_id"] = exec.Tenant.TraceID
+	}
+	if exec.Tenant.Channel != "" {
+		state["channel"] = exec.Tenant.Channel
+	}
+	if exec.Tenant.BindingID != "" {
+		state["binding_id"] = exec.Tenant.BindingID
+	}
+	return state
+}
+
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
 }
