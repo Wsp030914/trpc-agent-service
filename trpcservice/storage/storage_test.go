@@ -40,11 +40,11 @@ func TestStaticResolverReturnsScopedHandlesAndCopiesBackendConfig(t *testing.T) 
 	if !again.Knowledge.IsZero() {
 		t.Fatalf("knowledge handle = %#v, want zero", again.Knowledge)
 	}
-	key, err := again.Session.Key(tc.SessionID)
+	key, err := again.Session.Key(tc.SessionPrincipalID, tc.SessionID)
 	if err != nil {
 		t.Fatalf("session key: %v", err)
 	}
-	const want = "tenant:tenant-a:app:support:session:session-1"
+	const want = "tenant:tenant-a:app:support:session:principal-1:session-1"
 	if key != want {
 		t.Fatalf("session key = %q, want %q", key, want)
 	}
@@ -152,5 +152,7 @@ func testRuntimeContext() tenant.RuntimeContext {
 		ConfigVersion:      "v1",
 		SessionID:          "session-1",
 		SessionPrincipalID: "principal-1",
+		UserID:             "user-1",
+		TraceID:            "trace-1",
 	}
 }

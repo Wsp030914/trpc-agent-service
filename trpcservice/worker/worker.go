@@ -38,6 +38,7 @@ type RunnerResolver interface {
 }
 
 // EventSink receives runner events after the worker has started execution.
+// Implementations must stop work and return when ctx is done.
 type EventSink interface {
 	HandleRunnerEvent(ctx context.Context, exec Execution, evt *event.Event) error
 }
@@ -148,6 +149,9 @@ func (w Worker) Prepare(ctx context.Context, job gateway.Job) (Execution, error)
 }
 
 // Run prepares a job, calls runner.Runner, and drains the returned event channel.
+// After draining, it returns the first sink error or terminal runner error.
+// It uses SessionPrincipalID as the runner user ID so group and thread messages
+// share a session, while UserID remains available in runtime state as the sender.
 func (w Worker) Run(ctx context.Context, job gateway.Job) (RunResult, error) {
 	exec, err := w.Prepare(ctx, job)
 	if err != nil {
@@ -171,13 +175,17 @@ func (w Worker) Run(ctx context.Context, job gateway.Job) (RunResult, error) {
 	if err != nil {
 		return result, err
 	}
+	appName, err := runnerAppName(exec.Tenant)
+	if err != nil {
+		return result, err
+	}
 	events, err := r.Run(
 		ctx,
-		exec.Tenant.UserID,
+		exec.Tenant.SessionPrincipalID,
 		exec.Tenant.SessionID,
 		message,
 		agent.WithRequestID(exec.RequestID),
-		agent.WithAppName(runnerAppName(exec.Tenant)),
+		agent.WithAppName(appName),
 		agent.MergeRuntimeState(runnerRuntimeState(exec)),
 	)
 	if err != nil {
@@ -187,6 +195,7 @@ func (w Worker) Run(ctx context.Context, job gateway.Job) (RunResult, error) {
 		return result, errors.New("runner event channel is nil")
 	}
 	var sinkErr error
+	var runnerErr error
 	sinkTimedOut := false
 	for evt := range events {
 		if evt == nil {
@@ -195,6 +204,9 @@ func (w Worker) Run(ctx context.Context, job gateway.Job) (RunResult, error) {
 		result.EventCount++
 		if evt.IsRunnerCompletion() {
 			result.RunnerCompleted = true
+		}
+		if runnerErr == nil && evt.IsTerminalError() {
+			runnerErr = fmt.Errorf("runner event: %w", evt.Error)
 		}
 		if w.Events == nil || sinkTimedOut {
 			continue
@@ -211,6 +223,9 @@ func (w Worker) Run(ctx context.Context, job gateway.Job) (RunResult, error) {
 	if sinkErr != nil {
 		return result, sinkErr
 	}
+	if runnerErr != nil {
+		return result, runnerErr
+	}
 	return result, nil
 }
 
@@ -225,16 +240,11 @@ func (w Worker) handleRunnerEvent(ctx context.Context, exec Execution, evt *even
 	sinkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.eventSinkTimeout())
 	defer cancel()
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- w.Events.HandleRunnerEvent(sinkCtx, exec, evt)
-	}()
-	select {
-	case err := <-errCh:
-		return err
-	case <-sinkCtx.Done():
+	err := w.Events.HandleRunnerEvent(sinkCtx, exec, evt)
+	if sinkCtx.Err() != nil {
 		return fmt.Errorf("event sink timeout: %w", sinkCtx.Err())
 	}
+	return err
 }
 
 func (w Worker) eventSinkTimeout() time.Duration {
@@ -254,8 +264,8 @@ func runnerMessage(message gateway.Message) (model.Message, error) {
 	return model.NewUserMessage(message.Text), nil
 }
 
-func runnerAppName(tc tenant.RuntimeContext) string {
-	return tc.TenantID + "/" + tc.AppID
+func runnerAppName(tc tenant.RuntimeContext) (string, error) {
+	return tc.Scope().Key("runner")
 }
 
 func runnerRuntimeState(exec Execution) map[string]any {

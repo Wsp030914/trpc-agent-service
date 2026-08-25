@@ -330,15 +330,20 @@ func (r SecretRef) Validate() error {
 
 // RuntimeContext carries trusted tenant routing metadata through one request.
 type RuntimeContext struct {
-	TenantID           string
-	AppID              string
-	ConfigVersion      string
-	Channel            string
-	BindingID          string
-	SessionID          string
+	TenantID      string
+	AppID         string
+	ConfigVersion string
+	Channel       string
+	BindingID     string
+	SessionID     string
+	// SessionPrincipalID identifies the owner of the conversation session. It
+	// equals UserID for a private conversation and identifies the group or
+	// thread for a shared conversation.
 	SessionPrincipalID string
-	UserID             string
-	TraceID            string
+	// UserID identifies the user who sent the current message.
+	UserID string
+	// TraceID identifies the end-to-end trace for this request.
+	TraceID string
 }
 
 // Scope returns the tenant and application scope for persistence keys.
@@ -346,7 +351,7 @@ func (c RuntimeContext) Scope() Scope {
 	return Scope{TenantID: c.TenantID, AppID: c.AppID}
 }
 
-// Validate checks the minimum routing fields required for stateless workers.
+// Validate checks the routing, sender, and tracing fields required for stateless workers.
 func (c RuntimeContext) Validate() error {
 	if c.TenantID == "" {
 		return errors.New("tenant_id is required")
@@ -362,6 +367,12 @@ func (c RuntimeContext) Validate() error {
 	}
 	if c.SessionPrincipalID == "" {
 		return errors.New("session_principal_id is required")
+	}
+	if c.UserID == "" {
+		return errors.New("user_id is required")
+	}
+	if c.TraceID == "" {
+		return errors.New("trace_id is required")
 	}
 	return nil
 }

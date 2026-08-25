@@ -20,13 +20,28 @@ func TestRuntimeContextValidateAndScopedKey(t *testing.T) {
 		t.Fatalf("validate runtime context: %v", err)
 	}
 
-	key, err := tc.Scope().Key("session", tc.SessionID)
+	key, err := tc.Scope().Key("session", tc.SessionPrincipalID, tc.SessionID)
 	if err != nil {
 		t.Fatalf("build scoped key: %v", err)
 	}
-	const want = "tenant:tenant-a:app:support:session:group%2Fthread-1"
+	const want = "tenant:tenant-a:app:support:session:group-1:group%2Fthread-1"
 	if key != want {
 		t.Fatalf("scoped key = %q, want %q", key, want)
+	}
+}
+
+func TestScopeKeyEscapesTenantAndAppSegments(t *testing.T) {
+	scope, err := tenant.NewScope("tenant/a", "support:b")
+	if err != nil {
+		t.Fatalf("new scope: %v", err)
+	}
+	key, err := scope.Key("runner")
+	if err != nil {
+		t.Fatalf("build runner key: %v", err)
+	}
+	const want = "tenant:tenant%2Fa:app:support%3Ab:runner"
+	if key != want {
+		t.Fatalf("runner key = %q, want %q", key, want)
 	}
 }
 
@@ -39,6 +54,42 @@ func TestRuntimeContextValidateRejectsMissingTenant(t *testing.T) {
 	}
 	if err := tc.Validate(); err == nil {
 		t.Fatal("validate runtime context succeeded with missing tenant_id")
+	}
+}
+
+func TestRuntimeContextValidateRejectsMissingSenderOrTrace(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*tenant.RuntimeContext)
+		want string
+	}{
+		{
+			name: "user id",
+			edit: func(tc *tenant.RuntimeContext) { tc.UserID = "" },
+			want: "user_id is required",
+		},
+		{
+			name: "trace id",
+			edit: func(tc *tenant.RuntimeContext) { tc.TraceID = "" },
+			want: "trace_id is required",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := tenant.RuntimeContext{
+				TenantID:           "tenant-a",
+				AppID:              "support",
+				ConfigVersion:      "v1",
+				SessionID:          "session-1",
+				SessionPrincipalID: "user-1",
+				UserID:             "user-1",
+				TraceID:            "trace-1",
+			}
+			tt.edit(&tc)
+			if err := tc.Validate(); err == nil || err.Error() != tt.want {
+				t.Fatalf("validate runtime context error = %v, want %q", err, tt.want)
+			}
+		})
 	}
 }
 

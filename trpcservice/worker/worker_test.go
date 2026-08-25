@@ -17,6 +17,9 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
+	"trpc.group/trpc-go/trpc-agent-go/session"
+	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 func TestWorkerPrepareResolvesBackendWithoutStickySession(t *testing.T) {
@@ -35,7 +38,7 @@ func TestWorkerPrepareResolvesBackendWithoutStickySession(t *testing.T) {
 	if exec.TenantSource != gateway.TenantSourceAuthenticatedClaims {
 		t.Fatalf("tenant source = %q, want authenticated claims", exec.TenantSource)
 	}
-	const want = "tenant:tenant-a:app:support:session:session-1"
+	const want = "tenant:tenant-a:app:support:session:principal-1:session-1"
 	if exec.PartitionKey != want {
 		t.Fatalf("partition key = %q, want %q", exec.PartitionKey, want)
 	}
@@ -45,7 +48,10 @@ func TestWorkerPrepareResolvesBackendWithoutStickySession(t *testing.T) {
 	if exec.Storage.Memory.Ref.Name != "memory-redis" {
 		t.Fatalf("memory backend name = %q, want memory-redis", exec.Storage.Memory.Ref.Name)
 	}
-	storageKey, err := exec.Storage.Session.Key(exec.Tenant.SessionID)
+	storageKey, err := exec.Storage.Session.Key(
+		exec.Tenant.SessionPrincipalID,
+		exec.Tenant.SessionID,
+	)
 	if err != nil {
 		t.Fatalf("storage key: %v", err)
 	}
@@ -180,8 +186,8 @@ func TestWorkerRunCallsRunnerAndDrainsEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run job: %v", err)
 	}
-	if runner.userID != "user-1" {
-		t.Fatalf("runner user id = %q, want user-1", runner.userID)
+	if runner.userID != "principal-1" {
+		t.Fatalf("runner user id = %q, want principal-1", runner.userID)
 	}
 	if runner.sessionID != "session-1" {
 		t.Fatalf("runner session id = %q, want session-1", runner.sessionID)
@@ -192,11 +198,20 @@ func TestWorkerRunCallsRunnerAndDrainsEvents(t *testing.T) {
 	if runner.options.RequestID != "request-1" {
 		t.Fatalf("runner request id = %q, want request-1", runner.options.RequestID)
 	}
-	if runner.options.AppName != "tenant-a/support" {
-		t.Fatalf("runner app name = %q, want tenant-a/support", runner.options.AppName)
+	if runner.options.AppName != "tenant:tenant-a:app:support:runner" {
+		t.Fatalf(
+			"runner app name = %q, want tenant:tenant-a:app:support:runner",
+			runner.options.AppName,
+		)
 	}
 	if got := runner.options.RuntimeState["tenant_id"]; got != "tenant-a" {
 		t.Fatalf("runtime tenant_id = %v, want tenant-a", got)
+	}
+	if got := runner.options.RuntimeState["user_id"]; got != "user-1" {
+		t.Fatalf("runtime user_id = %v, want user-1", got)
+	}
+	if got := runner.options.RuntimeState["session_principal_id"]; got != "principal-1" {
+		t.Fatalf("runtime session_principal_id = %v, want principal-1", got)
 	}
 	if result.EventCount != 2 {
 		t.Fatalf("event count = %d, want 2", result.EventCount)
@@ -206,6 +221,117 @@ func TestWorkerRunCallsRunnerAndDrainsEvents(t *testing.T) {
 	}
 	if len(sink.events) != 2 {
 		t.Fatalf("sink event count = %d, want 2", len(sink.events))
+	}
+}
+
+func TestWorkerRunKeepsPrivateSessionsSeparate(t *testing.T) {
+	w, sessions := sessionContractWorker(t)
+	const sessionID = "private-session"
+
+	first := testJob("request-1", "tenant-a", sessionID)
+	first.Tenant.UserID = "user-1"
+	first.Tenant.SessionPrincipalID = "user-1"
+	first.Message.Text = "from user 1"
+	if _, err := w.Run(context.Background(), first); err != nil {
+		t.Fatalf("run first private message: %v", err)
+	}
+
+	firstKey := session.Key{
+		AppName:   "tenant:tenant-a:app:support:runner",
+		UserID:    "user-1",
+		SessionID: sessionID,
+	}
+	firstSession, err := sessions.GetSession(context.Background(), firstKey)
+	if err != nil {
+		t.Fatalf("get first private session: %v", err)
+	}
+	if firstSession == nil {
+		t.Fatal("first private session was not created")
+	}
+	firstEventCount := len(firstSession.GetEvents())
+
+	second := testJob("request-2", "tenant-a", sessionID)
+	second.Tenant.UserID = "user-2"
+	second.Tenant.SessionPrincipalID = "user-2"
+	second.Message.Text = "from user 2"
+	if _, err := w.Run(context.Background(), second); err != nil {
+		t.Fatalf("run second private message: %v", err)
+	}
+
+	firstSession, err = sessions.GetSession(context.Background(), firstKey)
+	if err != nil {
+		t.Fatalf("get first private session again: %v", err)
+	}
+	if got := len(firstSession.GetEvents()); got != firstEventCount {
+		t.Fatalf("first private session event count = %d, want %d", got, firstEventCount)
+	}
+	secondSession, err := sessions.GetSession(context.Background(), session.Key{
+		AppName:   "tenant:tenant-a:app:support:runner",
+		UserID:    "user-2",
+		SessionID: sessionID,
+	})
+	if err != nil {
+		t.Fatalf("get second private session: %v", err)
+	}
+	if secondSession == nil {
+		t.Fatal("second private session was not created")
+	}
+}
+
+func TestWorkerRunSharesGroupSessionAcrossUsers(t *testing.T) {
+	w, sessions := sessionContractWorker(t)
+	const (
+		principalID = "group-1"
+		sessionID   = "group-session"
+	)
+
+	first := testJob("request-1", "tenant-a", sessionID)
+	first.Tenant.UserID = "user-1"
+	first.Tenant.SessionPrincipalID = principalID
+	first.Message.Text = "from user 1"
+	if _, err := w.Run(context.Background(), first); err != nil {
+		t.Fatalf("run first group message: %v", err)
+	}
+
+	groupKey := session.Key{
+		AppName:   "tenant:tenant-a:app:support:runner",
+		UserID:    principalID,
+		SessionID: sessionID,
+	}
+	groupSession, err := sessions.GetSession(context.Background(), groupKey)
+	if err != nil {
+		t.Fatalf("get group session: %v", err)
+	}
+	if groupSession == nil {
+		t.Fatal("group session was not created")
+	}
+	firstEventCount := len(groupSession.GetEvents())
+
+	second := testJob("request-2", "tenant-a", sessionID)
+	second.Tenant.UserID = "user-2"
+	second.Tenant.SessionPrincipalID = principalID
+	second.Message.Text = "from user 2"
+	if _, err := w.Run(context.Background(), second); err != nil {
+		t.Fatalf("run second group message: %v", err)
+	}
+
+	groupSession, err = sessions.GetSession(context.Background(), groupKey)
+	if err != nil {
+		t.Fatalf("get shared group session: %v", err)
+	}
+	if got := len(groupSession.GetEvents()); got <= firstEventCount {
+		t.Fatalf("group session event count = %d, want more than %d", got, firstEventCount)
+	}
+	userSession, err := sessions.GetSession(context.Background(), session.Key{
+		AppName:   "tenant:tenant-a:app:support:runner",
+		UserID:    "user-2",
+		SessionID: sessionID,
+	})
+	if err != nil {
+		t.Fatalf("get real-user session: %v", err)
+	}
+	if userSession != nil {
+		t.Fatal("group message created a session scoped to the real user")
 	}
 }
 
@@ -266,6 +392,35 @@ func TestWorkerRunDrainsEventsAfterSinkError(t *testing.T) {
 	}
 }
 
+func TestWorkerRunReturnsRunnerCompletionError(t *testing.T) {
+	wantErr := &model.ResponseError{
+		Type:    model.ErrorTypeRunError,
+		Message: "runner failed",
+	}
+	runner := &recordingRunner{
+		events: []*event.Event{{
+			Response: &model.Response{
+				Object: model.ObjectTypeRunnerCompletion,
+				Done:   true,
+				Error:  wantErr,
+			},
+		}},
+	}
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = staticRunnerResolver{runner: runner}
+
+	result, err := w.Run(context.Background(), testJob("request-1", "tenant-a", "session-1"))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("run error = %v, want runner error", err)
+	}
+	if !result.RunnerCompleted {
+		t.Fatal("runner completion was not observed")
+	}
+	if result.EventCount != 1 {
+		t.Fatalf("event count = %d, want 1", result.EventCount)
+	}
+}
+
 func TestWorkerRunSkipsNilRunnerEvents(t *testing.T) {
 	runner := &recordingRunner{
 		events: []*event.Event{
@@ -297,8 +452,7 @@ func TestWorkerRunDrainsEventsAfterSinkTimeout(t *testing.T) {
 			runnerCompletionEvent(),
 		},
 	}
-	sink := &blockingEventSink{block: make(chan struct{})}
-	defer close(sink.block)
+	sink := &blockingEventSink{}
 
 	w := testWorker(t, sharedBackendConfig())
 	w.Runner = staticRunnerResolver{runner: runner}
@@ -419,6 +573,24 @@ func testWorker(t *testing.T, backend tenant.BackendConfig) worker.Worker {
 	return *worker.New(configs, storage.StaticResolver{})
 }
 
+func sessionContractWorker(t *testing.T) (worker.Worker, *sessioninmemory.SessionService) {
+	t.Helper()
+	sessions := sessioninmemory.NewSessionService()
+	r := runner.NewRunner(
+		"worker-session-contract",
+		&sessionContractAgent{name: "assistant"},
+		runner.WithSessionService(sessions),
+	)
+	t.Cleanup(func() {
+		if err := r.Close(); err != nil {
+			t.Errorf("close runner: %v", err)
+		}
+	})
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = staticRunnerResolver{runner: r}
+	return w, sessions
+}
+
 func testAppConfig(tenantID string, backend tenant.BackendConfig) tenant.AppConfig {
 	return tenant.AppConfig{
 		TenantID: tenantID,
@@ -450,6 +622,46 @@ type recordingRunner struct {
 	options   agent.RunOptions
 	events    []*event.Event
 	err       error
+}
+
+type sessionContractAgent struct {
+	name string
+}
+
+func (a *sessionContractAgent) Run(
+	_ context.Context,
+	invocation *agent.Invocation,
+) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event, 1)
+	ch <- event.NewResponseEvent(
+		invocation.InvocationID,
+		a.name,
+		&model.Response{
+			Done: true,
+			Choices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage("ok"),
+			}},
+		},
+	)
+	close(ch)
+	return ch, nil
+}
+
+func (a *sessionContractAgent) Tools() []frameworktool.Tool {
+	return nil
+}
+
+func (a *sessionContractAgent) Info() agent.Info {
+	return agent.Info{Name: a.name}
+}
+
+func (*sessionContractAgent) SubAgents() []agent.Agent {
+	return nil
+}
+
+func (*sessionContractAgent) FindSubAgent(string) agent.Agent {
+	return nil
 }
 
 func (r *recordingRunner) Run(
@@ -494,17 +706,16 @@ func (s *recordingEventSink) HandleRunnerEvent(
 
 type blockingEventSink struct {
 	calls atomic.Int32
-	block chan struct{}
 }
 
 func (s *blockingEventSink) HandleRunnerEvent(
-	_ context.Context,
+	ctx context.Context,
 	_ worker.Execution,
 	_ *event.Event,
 ) error {
 	s.calls.Add(1)
-	<-s.block
-	return nil
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func runnerCompletionEvent() *event.Event {

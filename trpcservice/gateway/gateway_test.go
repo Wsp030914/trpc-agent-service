@@ -8,10 +8,6 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
-type captureQueue struct {
-	job gateway.Job
-}
-
 type captureRoutedQueue struct {
 	job gateway.RoutedJob
 }
@@ -29,19 +25,14 @@ func (r staticTenantResolver) ResolveTenant(_ context.Context) (
 	return r.tenant, r.source, nil
 }
 
-func (q *captureQueue) Enqueue(_ context.Context, job gateway.Job) error {
-	q.job = job
-	return nil
-}
-
 func (q *captureRoutedQueue) EnqueueRouted(_ context.Context, job gateway.RoutedJob) error {
 	q.job = job
 	return nil
 }
 
 func TestGatewayCreatesTenantScopedJob(t *testing.T) {
-	queue := &captureQueue{}
-	gw := gateway.New(gateway.WithEnqueuer(queue))
+	queue := &captureRoutedQueue{}
+	gw := gateway.New(gateway.WithRoutedEnqueuer(queue))
 	artifactRefs := []string{"artifact-1"}
 
 	req := gateway.Request{
@@ -55,6 +46,7 @@ func TestGatewayCreatesTenantScopedJob(t *testing.T) {
 				SessionID:          "session-1",
 				SessionPrincipalID: "principal-1",
 				UserID:             "user-1",
+				TraceID:            "trace-1",
 			},
 		},
 		Message: gateway.Message{Text: "hello", ArtifactRefs: artifactRefs},
@@ -64,8 +56,8 @@ func TestGatewayCreatesTenantScopedJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handle request: %v", err)
 	}
-	if queue.job.RequestID != req.RequestID {
-		t.Fatalf("queued request ID = %q, want %q", queue.job.RequestID, req.RequestID)
+	if queue.job.Job.RequestID != req.RequestID {
+		t.Fatalf("queued request ID = %q, want %q", queue.job.Job.RequestID, req.RequestID)
 	}
 	if job.Tenant.TenantID != "tenant-a" {
 		t.Fatalf("job tenant ID = %q, want tenant-a", job.Tenant.TenantID)
@@ -78,14 +70,14 @@ func TestGatewayCreatesTenantScopedJob(t *testing.T) {
 		t.Fatalf("job artifact ref = %q, want artifact-1", got)
 	}
 	job.Message.ArtifactRefs[0] = "returned-job-mutation"
-	if got := queue.job.Message.ArtifactRefs[0]; got != "artifact-1" {
+	if got := queue.job.Job.Message.ArtifactRefs[0]; got != "artifact-1" {
 		t.Fatalf("queued artifact ref = %q, want artifact-1", got)
 	}
 	key, err := job.PartitionKey()
 	if err != nil {
 		t.Fatalf("partition key: %v", err)
 	}
-	const want = "tenant:tenant-a:app:support:session:session-1"
+	const want = "tenant:tenant-a:app:support:session:principal-1:session-1"
 	if key != want {
 		t.Fatalf("partition key = %q, want %q", key, want)
 	}
@@ -132,6 +124,39 @@ func TestNewJobAcceptsOnlyTrustedTenantSources(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsMissingSenderOrTraceBeforeEnqueue(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*tenant.RuntimeContext)
+	}{
+		{
+			name: "user id",
+			edit: func(tc *tenant.RuntimeContext) { tc.UserID = "" },
+		},
+		{
+			name: "trace id",
+			edit: func(tc *tenant.RuntimeContext) { tc.TraceID = "" },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			queue := &captureRoutedQueue{}
+			gw := gateway.New(gateway.WithRoutedEnqueuer(queue))
+			req := testRequest("request-1", "tenant-a", "support", "session-1")
+			resolver := req.Tenant.(staticTenantResolver)
+			tt.edit(&resolver.tenant)
+			req.Tenant = resolver
+
+			if _, err := gw.Handle(context.Background(), req); err == nil {
+				t.Fatal("handle request succeeded with incomplete runtime identity")
+			}
+			if queue.job.Job.RequestID != "" {
+				t.Fatal("invalid request was enqueued")
+			}
+		})
+	}
+}
+
 func TestGatewayEnqueuesRoutedJobWithPartitionKey(t *testing.T) {
 	queue := &captureRoutedQueue{}
 	gw := gateway.New(gateway.WithRoutedEnqueuer(queue))
@@ -144,7 +169,7 @@ func TestGatewayEnqueuesRoutedJobWithPartitionKey(t *testing.T) {
 	if err := queue.job.Validate(); err != nil {
 		t.Fatalf("validate routed job: %v", err)
 	}
-	const want = "tenant:tenant-a:app:support:session:session-1"
+	const want = "tenant:tenant-a:app:support:session:principal-1:session-1"
 	if queue.job.PartitionKey != want {
 		t.Fatalf("routed partition key = %q, want %q", queue.job.PartitionKey, want)
 	}
@@ -163,7 +188,7 @@ func TestRoutedJobRejectsMismatchedPartitionKey(t *testing.T) {
 	}
 	routed := gateway.RoutedJob{
 		Job:          job,
-		PartitionKey: "tenant:tenant-b:app:support:session:session-1",
+		PartitionKey: "tenant:tenant-b:app:support:session:principal-1:session-1",
 	}
 
 	if err := routed.Validate(); err == nil {
@@ -171,7 +196,7 @@ func TestRoutedJobRejectsMismatchedPartitionKey(t *testing.T) {
 	}
 }
 
-func TestJobPartitionKeyIsolatesTenantAppAndSession(t *testing.T) {
+func TestJobPartitionKeyIsolatesTenantAppPrincipalAndSession(t *testing.T) {
 	base, err := gateway.NewJob(
 		context.Background(),
 		testRequest("request-1", "tenant-a", "support", "session-1"),
@@ -200,20 +225,50 @@ func TestJobPartitionKeyIsolatesTenantAppAndSession(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		tenantID string
-		appID    string
-		session  string
+		name        string
+		tenantID    string
+		appID       string
+		principalID string
+		session     string
 	}{
-		{name: "tenant", tenantID: "tenant-b", appID: "support", session: "session-1"},
-		{name: "app", tenantID: "tenant-a", appID: "sales", session: "session-1"},
-		{name: "session", tenantID: "tenant-a", appID: "support", session: "session-2"},
+		{
+			name:        "tenant",
+			tenantID:    "tenant-b",
+			appID:       "support",
+			principalID: "principal-1",
+			session:     "session-1",
+		},
+		{
+			name:        "app",
+			tenantID:    "tenant-a",
+			appID:       "sales",
+			principalID: "principal-1",
+			session:     "session-1",
+		},
+		{
+			name:        "principal",
+			tenantID:    "tenant-a",
+			appID:       "support",
+			principalID: "principal-2",
+			session:     "session-1",
+		},
+		{
+			name:        "session",
+			tenantID:    "tenant-a",
+			appID:       "support",
+			principalID: "principal-1",
+			session:     "session-2",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			req := testRequest("request-2", tt.tenantID, tt.appID, tt.session)
+			resolver := req.Tenant.(staticTenantResolver)
+			resolver.tenant.SessionPrincipalID = tt.principalID
+			req.Tenant = resolver
 			job, err := gateway.NewJob(
 				context.Background(),
-				testRequest("request-2", tt.tenantID, tt.appID, tt.session),
+				req,
 			)
 			if err != nil {
 				t.Fatalf("new job: %v", err)
@@ -240,6 +295,8 @@ func testRequest(requestID, tenantID, appID, sessionID string) gateway.Request {
 				ConfigVersion:      "v1",
 				SessionID:          sessionID,
 				SessionPrincipalID: "principal-1",
+				UserID:             "user-1",
+				TraceID:            "trace-1",
 			},
 		},
 		Message: gateway.Message{Text: "hello"},

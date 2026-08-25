@@ -73,7 +73,11 @@ func (j Job) Validate() error {
 
 // PartitionKey returns the key used to serialize work for one session.
 func (j Job) PartitionKey() (string, error) {
-	return j.Tenant.Scope().Key("session", j.Tenant.SessionID)
+	return j.Tenant.Scope().Key(
+		"session",
+		j.Tenant.SessionPrincipalID,
+		j.Tenant.SessionID,
+	)
 }
 
 // NewRoutedJob creates a job envelope with a stable session partition key.
@@ -106,11 +110,6 @@ func (j RoutedJob) Validate() error {
 	return nil
 }
 
-// Enqueuer accepts tenant-scoped jobs for later worker consumption.
-type Enqueuer interface {
-	Enqueue(ctx context.Context, job Job) error
-}
-
 // RoutedEnqueuer accepts tenant-scoped jobs with an explicit partition key.
 type RoutedEnqueuer interface {
 	EnqueueRouted(ctx context.Context, job RoutedJob) error
@@ -118,13 +117,6 @@ type RoutedEnqueuer interface {
 
 // Option configures a Gateway.
 type Option func(*Gateway)
-
-// WithEnqueuer sets the queue used for tenant-scoped jobs.
-func WithEnqueuer(enqueuer Enqueuer) Option {
-	return func(g *Gateway) {
-		g.Jobs = enqueuer
-	}
-}
 
 // WithRoutedEnqueuer sets the queue used for partitioned tenant-scoped jobs.
 func WithRoutedEnqueuer(enqueuer RoutedEnqueuer) Option {
@@ -135,7 +127,6 @@ func WithRoutedEnqueuer(enqueuer RoutedEnqueuer) Option {
 
 // Gateway converts trusted requests into tenant-scoped jobs.
 type Gateway struct {
-	Jobs       Enqueuer
 	RoutedJobs RoutedEnqueuer
 }
 
@@ -160,10 +151,6 @@ func (g Gateway) Handle(ctx context.Context, req Request) (Job, error) {
 			return Job{}, err
 		}
 		if err := g.RoutedJobs.EnqueueRouted(ctx, routed); err != nil {
-			return Job{}, err
-		}
-	} else if g.Jobs != nil {
-		if err := g.Jobs.Enqueue(ctx, job.clone()); err != nil {
 			return Job{}, err
 		}
 	}

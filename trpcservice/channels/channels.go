@@ -94,7 +94,6 @@ type Identity struct {
 	Channel             Channel
 	ExternalUserKeyHash string
 	UserID              string
-	PrincipalID         string
 	Status              string
 	KeyVersion          string
 }
