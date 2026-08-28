@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/liuzengh/trpc-agent-service/internal/execution"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformruntime "github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
@@ -101,8 +103,9 @@ func TestWorkerResolvesExactConfigVersion(t *testing.T) {
 		Config:  configs,
 		Storage: storage.StaticResolver{},
 	}
-	job := testJob("request-1", "tenant-a", "session-1")
-	job.Tenant.ConfigVersion = "v2"
+	job := testJobWith("request-1", "tenant-a", "session-1", func(tc *tenant.RuntimeContext, _ *gateway.Message) {
+		tc.ConfigVersion = "v2"
+	})
 
 	exec, err := w.Prepare(context.Background(), job)
 	if err != nil {
@@ -224,14 +227,45 @@ func TestWorkerRunCallsRunnerAndDrainsEvents(t *testing.T) {
 	}
 }
 
+func TestWorkerRunHoldsSessionLockUntilEventsAreDrained(t *testing.T) {
+	runner := &recordingRunner{events: []*event.Event{runnerCompletionEvent()}}
+	locker := &recordingSessionLocker{}
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = staticRunnerResolver{runner: runner}
+	w.SessionLocker = locker
+	w.Events = eventSinkFunc(func(_ context.Context, _ worker.Execution, _ *event.Event) error {
+		if locker.lock == nil {
+			t.Fatal("event sink ran before session lock was acquired")
+		}
+		if locker.lock.released.Load() {
+			t.Fatal("session lock was released before events were drained")
+		}
+		return nil
+	})
+
+	if _, err := w.Run(context.Background(), testJob("request-1", "tenant-a", "session-1")); err != nil {
+		t.Fatalf("run job: %v", err)
+	}
+	if locker.partitionKey != "tenant:tenant-a:app:support:session:principal-1:session-1" {
+		t.Fatalf("lock partition key = %q", locker.partitionKey)
+	}
+	if runner.ctx.Value(sessionLockTestContextKey{}) != "locked" {
+		t.Fatal("runner did not receive the session lock context")
+	}
+	if locker.lock == nil || !locker.lock.released.Load() {
+		t.Fatal("session lock was not released after the runner event channel closed")
+	}
+}
+
 func TestWorkerRunKeepsPrivateSessionsSeparate(t *testing.T) {
 	w, sessions := sessionContractWorker(t)
 	const sessionID = "private-session"
 
-	first := testJob("request-1", "tenant-a", sessionID)
-	first.Tenant.UserID = "user-1"
-	first.Tenant.SessionPrincipalID = "user-1"
-	first.Message.Text = "from user 1"
+	first := testJobWith("request-1", "tenant-a", sessionID, func(tc *tenant.RuntimeContext, message *gateway.Message) {
+		tc.UserID = "user-1"
+		tc.SessionPrincipalID = "user-1"
+		message.Text = "from user 1"
+	})
 	if _, err := w.Run(context.Background(), first); err != nil {
 		t.Fatalf("run first private message: %v", err)
 	}
@@ -250,10 +284,11 @@ func TestWorkerRunKeepsPrivateSessionsSeparate(t *testing.T) {
 	}
 	firstEventCount := len(firstSession.GetEvents())
 
-	second := testJob("request-2", "tenant-a", sessionID)
-	second.Tenant.UserID = "user-2"
-	second.Tenant.SessionPrincipalID = "user-2"
-	second.Message.Text = "from user 2"
+	second := testJobWith("request-2", "tenant-a", sessionID, func(tc *tenant.RuntimeContext, message *gateway.Message) {
+		tc.UserID = "user-2"
+		tc.SessionPrincipalID = "user-2"
+		message.Text = "from user 2"
+	})
 	if _, err := w.Run(context.Background(), second); err != nil {
 		t.Fatalf("run second private message: %v", err)
 	}
@@ -285,10 +320,11 @@ func TestWorkerRunSharesGroupSessionAcrossUsers(t *testing.T) {
 		sessionID   = "group-session"
 	)
 
-	first := testJob("request-1", "tenant-a", sessionID)
-	first.Tenant.UserID = "user-1"
-	first.Tenant.SessionPrincipalID = principalID
-	first.Message.Text = "from user 1"
+	first := testJobWith("request-1", "tenant-a", sessionID, func(tc *tenant.RuntimeContext, message *gateway.Message) {
+		tc.UserID = "user-1"
+		tc.SessionPrincipalID = principalID
+		message.Text = "from user 1"
+	})
 	if _, err := w.Run(context.Background(), first); err != nil {
 		t.Fatalf("run first group message: %v", err)
 	}
@@ -307,10 +343,11 @@ func TestWorkerRunSharesGroupSessionAcrossUsers(t *testing.T) {
 	}
 	firstEventCount := len(groupSession.GetEvents())
 
-	second := testJob("request-2", "tenant-a", sessionID)
-	second.Tenant.UserID = "user-2"
-	second.Tenant.SessionPrincipalID = principalID
-	second.Message.Text = "from user 2"
+	second := testJobWith("request-2", "tenant-a", sessionID, func(tc *tenant.RuntimeContext, message *gateway.Message) {
+		tc.UserID = "user-2"
+		tc.SessionPrincipalID = principalID
+		message.Text = "from user 2"
+	})
 	if _, err := w.Run(context.Background(), second); err != nil {
 		t.Fatalf("run second group message: %v", err)
 	}
@@ -348,6 +385,7 @@ func TestNewWorkerAppliesRuntimeOptions(t *testing.T) {
 		configs,
 		storage.StaticResolver{},
 		worker.WithRunner(staticRunnerResolver{runner: runner}),
+		worker.WithSessionLocker(testSessionLocker{}),
 		worker.WithEventSink(sink),
 		worker.WithEventSinkTimeout(time.Millisecond),
 	)
@@ -479,43 +517,243 @@ func TestWorkerRunRequiresRunnerResolver(t *testing.T) {
 	}
 }
 
-func TestWorkerRunRequiresUserID(t *testing.T) {
+func TestWorkerRunRequiresSessionLocker(t *testing.T) {
 	w := testWorker(t, sharedBackendConfig())
 	w.Runner = staticRunnerResolver{runner: &recordingRunner{}}
-	job := testJob("request-1", "tenant-a", "session-1")
-	job.Tenant.UserID = ""
+	w.SessionLocker = nil
 
-	if _, err := w.Run(context.Background(), job); err == nil {
-		t.Fatal("run succeeded without user_id")
+	if _, err := w.Run(context.Background(), testJob("request-1", "tenant-a", "session-1")); err == nil {
+		t.Fatal("run succeeded without session locker")
 	}
 }
 
-func TestWorkerRunRejectsUnsupportedArtifactRefs(t *testing.T) {
+func TestRuntimeRunnerResolverBuildsAndCachesFrameworkRunner(t *testing.T) {
 	w := testWorker(t, sharedBackendConfig())
-	w.Runner = staticRunnerResolver{runner: &recordingRunner{}}
-	job := testJob("request-1", "tenant-a", "session-1")
-	job.Message.ArtifactRefs = []string{"artifact://file@1"}
+	exec, err := w.Prepare(context.Background(), testJob("request-1", "tenant-a", "session-1"))
+	if err != nil {
+		t.Fatalf("prepare job: %v", err)
+	}
+	models, err := platformruntime.NewOpenAIModelResolver(
+		staticModelAPIKeyResolver("test-model-key"),
+		platformruntime.WithModelEndpointPolicy(allowConfiguredEndpoint{}),
+	)
+	if err != nil {
+		t.Fatalf("new model resolver: %v", err)
+	}
+	sessions := sessioninmemory.NewSessionService()
+	resolver, err := platformruntime.NewRuntimeRunnerResolver(
+		models,
+		staticSessionResolver{service: sessions},
+	)
+	if err != nil {
+		t.Fatalf("new runtime runner resolver: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := resolver.Close(); err != nil {
+			t.Errorf("close runtime runner resolver: %v", err)
+		}
+	})
 
-	if _, err := w.Run(context.Background(), job); err == nil {
-		t.Fatal("run succeeded with unsupported artifact refs")
+	first, err := resolver.ResolveRunner(context.Background(), exec)
+	if err != nil {
+		t.Fatalf("resolve first runner: %v", err)
+	}
+	second, err := resolver.ResolveRunner(context.Background(), exec)
+	if err != nil {
+		t.Fatalf("resolve cached runner: %v", err)
+	}
+	if first != second {
+		t.Fatal("runtime runner resolver did not return the cached runner")
 	}
 }
 
-func testJob(requestID, tenantID, sessionID string) gateway.Job {
-	return gateway.Job{
-		RequestID:    requestID,
-		TenantSource: gateway.TenantSourceAuthenticatedClaims,
-		Tenant: tenant.RuntimeContext{
-			TenantID:           tenantID,
-			AppID:              "support",
-			ConfigVersion:      "v1",
-			SessionID:          sessionID,
-			SessionPrincipalID: "principal-1",
-			UserID:             "user-1",
-			TraceID:            "trace-1",
-		},
-		Message: gateway.Message{Text: "hello"},
+func TestWorkerRecordsAuthoritativeAuditAroundRunnerExecution(t *testing.T) {
+	cfg := testAppConfig("tenant-a", sharedBackendConfig())
+	cfg.Audit = tenant.AuditPolicy{Enabled: true, RetentionDays: 30}
+	configs, err := config.NewStaticResolver(cfg)
+	if err != nil {
+		t.Fatalf("new config resolver: %v", err)
 	}
+	runner := &recordingRunner{events: []*event.Event{runnerCompletionEvent()}}
+	audit := &recordingAuditSink{}
+	w := *worker.New(
+		configs,
+		storage.StaticResolver{},
+		worker.WithRunner(staticRunnerResolver{runner: runner}),
+		worker.WithSessionLocker(testSessionLocker{}),
+		worker.WithAuditSink(audit),
+	)
+
+	if _, err := w.Run(context.Background(), testJob("request-audit", "tenant-a", "session-audit")); err != nil {
+		t.Fatalf("run worker: %v", err)
+	}
+	if len(audit.events) != 2 ||
+		audit.events[0].Type != worker.AuditEventExecutionStarted ||
+		audit.events[1].Type != worker.AuditEventExecutionCompleted {
+		t.Fatalf("audit events = %#v", audit.events)
+	}
+}
+
+func TestOpenAIModelResolverAppliesModelParametersWithoutConfigCredentials(t *testing.T) {
+	w := testWorker(t, sharedBackendConfig())
+	exec, err := w.Prepare(context.Background(), testJob("request-1", "tenant-a", "session-1"))
+	if err != nil {
+		t.Fatalf("prepare job: %v", err)
+	}
+	exec.Config.Model.Parameters = map[string]string{
+		"base_url":    "https://model.example.test/v1",
+		"max_tokens":  "256",
+		"temperature": "0.2",
+	}
+	models, err := platformruntime.NewOpenAIModelResolver(
+		staticModelAPIKeyResolver("test-model-key"),
+		platformruntime.WithModelEndpointPolicy(allowConfiguredEndpoint{}),
+	)
+	if err != nil {
+		t.Fatalf("new model resolver: %v", err)
+	}
+	runtime, err := models.ResolveModel(context.Background(), exec)
+	if err != nil {
+		t.Fatalf("resolve model: %v", err)
+	}
+	if runtime.Model == nil {
+		t.Fatal("resolved model is nil")
+	}
+	if runtime.GenerationConfig.Temperature == nil || *runtime.GenerationConfig.Temperature != 0.2 {
+		t.Fatalf("temperature = %#v, want 0.2", runtime.GenerationConfig.Temperature)
+	}
+	if runtime.GenerationConfig.MaxTokens == nil || *runtime.GenerationConfig.MaxTokens != 256 {
+		t.Fatalf("max tokens = %#v, want 256", runtime.GenerationConfig.MaxTokens)
+	}
+
+	withoutPolicy, err := platformruntime.NewOpenAIModelResolver(staticModelAPIKeyResolver("test-model-key"))
+	if err != nil {
+		t.Fatalf("new model resolver without endpoint policy: %v", err)
+	}
+	if _, err := withoutPolicy.ResolveModel(context.Background(), exec); err == nil {
+		t.Fatal("resolve model succeeded with a configured base_url but no endpoint policy")
+	}
+
+	insecurePolicy, err := platformruntime.NewOpenAIModelResolver(
+		staticModelAPIKeyResolver("test-model-key"),
+		platformruntime.WithModelEndpointPolicy(staticEndpointPolicy("http://127.0.0.1:8080/v1")),
+	)
+	if err != nil {
+		t.Fatalf("new model resolver with endpoint policy: %v", err)
+	}
+	if _, err := insecurePolicy.ResolveModel(context.Background(), exec); err == nil {
+		t.Fatal("resolve model succeeded with an insecure resolved base_url")
+	}
+
+	exec.Config.Model.Parameters = map[string]string{"api_key": "must-not-be-stored-here"}
+	if _, err := models.ResolveModel(context.Background(), exec); err == nil {
+		t.Fatal("resolve model succeeded with api_key in immutable config")
+	}
+}
+
+func TestExecutionJobRejectsMissingUserID(t *testing.T) {
+	tenantContext := testJob("request-1", "tenant-a", "session-1").Tenant()
+	tenantContext.UserID = ""
+	_, err := execution.NewJob(
+		"request-1",
+		gateway.TenantSourceAuthenticatedClaims,
+		tenantContext,
+		gateway.Message{Text: "hello"},
+	)
+	if err == nil {
+		t.Fatal("new execution job succeeded without user_id")
+	}
+}
+
+func TestExecutionJobRejectsUnsupportedArtifactRefs(t *testing.T) {
+	_, err := execution.NewJob(
+		"request-1",
+		gateway.TenantSourceAuthenticatedClaims,
+		testJob("request-1", "tenant-a", "session-1").Tenant(),
+		gateway.Message{Text: "hello", ArtifactRefs: []string{"artifact://file@1"}},
+	)
+	if err == nil {
+		t.Fatal("new execution job succeeded with unsupported artifact refs")
+	}
+}
+
+func TestWorkerRunSkipsSinkAfterLockContextCanceled(t *testing.T) {
+	lockContext, cancelLock := context.WithCancel(context.Background())
+	runner := &recordingRunner{
+		events: []*event.Event{runnerCompletionEvent()},
+		cancel: cancelLock,
+	}
+	sink := &recordingEventSink{}
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = staticRunnerResolver{runner: runner}
+	w.SessionLocker = staticSessionLocker{ctx: lockContext}
+	w.Events = sink
+
+	if _, err := w.Run(context.Background(), testJob("request-1", "tenant-a", "session-1")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v, want context canceled", err)
+	}
+	if len(sink.events) != 0 {
+		t.Fatalf("sink received %d events after lock context cancellation", len(sink.events))
+	}
+}
+
+func TestWorkerRunCancelsManagedRunnerWhenExecutionContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := &managedBlockingRunner{
+		started: make(chan struct{}),
+		events:  make(chan *event.Event),
+	}
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = staticRunnerResolver{runner: runner}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.Run(ctx, testJob("request-managed-cancel", "tenant-a", "session-1"))
+		done <- err
+	}()
+	<-runner.started
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v, want context canceled", err)
+	}
+	if !runner.canceled.Load() {
+		t.Fatal("managed runner was not canceled")
+	}
+}
+
+func testJob(requestID, tenantID, sessionID string) execution.Job {
+	return testJobWith(requestID, tenantID, sessionID, nil)
+}
+
+func testJobWith(
+	requestID, tenantID, sessionID string,
+	mutate func(*tenant.RuntimeContext, *gateway.Message),
+) execution.Job {
+	tenantContext := tenant.RuntimeContext{
+		TenantID:           tenantID,
+		AppID:              "support",
+		ConfigVersion:      "v1",
+		SessionID:          sessionID,
+		SessionPrincipalID: "principal-1",
+		UserID:             "user-1",
+		TraceID:            "trace-1",
+	}
+	message := gateway.Message{Text: "hello"}
+	if mutate != nil {
+		mutate(&tenantContext, &message)
+	}
+	job, err := execution.NewJob(
+		requestID,
+		gateway.TenantSourceAuthenticatedClaims,
+		tenantContext,
+		message,
+	)
+	if err != nil {
+		panic(err)
+	}
+	return job
 }
 
 type invalidConfigResolver struct {
@@ -540,7 +778,7 @@ func (mismatchedStorageResolver) Resolve(
 ) (storage.Handles, error) {
 	handles, err := (storage.StaticResolver{}).Resolve(
 		context.Background(),
-		testJob("request-1", "tenant-b", "session-1").Tenant,
+		testJob("request-1", "tenant-b", "session-1").Tenant(),
 		backend,
 	)
 	if err != nil {
@@ -570,7 +808,11 @@ func testWorker(t *testing.T, backend tenant.BackendConfig) worker.Worker {
 	if err != nil {
 		t.Fatalf("new config resolver: %v", err)
 	}
-	return *worker.New(configs, storage.StaticResolver{})
+	return *worker.New(
+		configs,
+		storage.StaticResolver{},
+		worker.WithSessionLocker(testSessionLocker{}),
+	)
 }
 
 func sessionContractWorker(t *testing.T) (worker.Worker, *sessioninmemory.SessionService) {
@@ -597,8 +839,9 @@ func testAppConfig(tenantID string, backend tenant.BackendConfig) tenant.AppConf
 		AppID:    "support",
 		Version:  "v1",
 		Model: tenant.ModelConfig{
-			Provider: "openai",
-			Model:    "gpt-4.1-mini",
+			Provider:  "openai",
+			APIKeyRef: tenant.SecretRef{Name: "model-key"},
+			Model:     "gpt-4.1-mini",
 		},
 		BackendConfig: backend,
 	}
@@ -616,12 +859,60 @@ func (r staticRunnerResolver) ResolveRunner(
 }
 
 type recordingRunner struct {
+	ctx       context.Context
 	userID    string
 	sessionID string
 	message   model.Message
 	options   agent.RunOptions
 	events    []*event.Event
 	err       error
+	cancel    context.CancelFunc
+}
+
+type managedBlockingRunner struct {
+	started  chan struct{}
+	events   chan *event.Event
+	canceled atomic.Bool
+}
+
+func (r *managedBlockingRunner) Run(
+	_ context.Context,
+	_, _ string,
+	_ model.Message,
+	_ ...agent.RunOption,
+) (<-chan *event.Event, error) {
+	close(r.started)
+	return r.events, nil
+}
+
+func (r *managedBlockingRunner) Cancel(requestID string) bool {
+	if requestID == "" {
+		return false
+	}
+	r.canceled.Store(true)
+	close(r.events)
+	return true
+}
+
+func (*managedBlockingRunner) RunStatus(string) (runner.RunStatus, bool) {
+	return runner.RunStatus{}, false
+}
+
+func (*managedBlockingRunner) Close() error {
+	return nil
+}
+
+type recordingAuditSink struct {
+	events []worker.AuditEvent
+}
+
+func (s *recordingAuditSink) RecordAudit(
+	_ context.Context,
+	_ worker.Execution,
+	event worker.AuditEvent,
+) error {
+	s.events = append(s.events, event)
+	return nil
 }
 
 type sessionContractAgent struct {
@@ -665,16 +956,20 @@ func (*sessionContractAgent) FindSubAgent(string) agent.Agent {
 }
 
 func (r *recordingRunner) Run(
-	_ context.Context,
+	ctx context.Context,
 	userID string,
 	sessionID string,
 	message model.Message,
 	runOpts ...agent.RunOption,
 ) (<-chan *event.Event, error) {
+	r.ctx = ctx
 	r.userID = userID
 	r.sessionID = sessionID
 	r.message = message
 	r.options = agent.NewRunOptions(runOpts...)
+	if r.cancel != nil {
+		r.cancel()
+	}
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -684,6 +979,111 @@ func (r *recordingRunner) Run(
 	}
 	close(ch)
 	return ch, nil
+}
+
+type testSessionLocker struct{}
+
+func (testSessionLocker) Lock(ctx context.Context, _ string) (worker.SessionLock, error) {
+	return testSessionLock{ctx: ctx}, nil
+}
+
+type staticSessionLocker struct {
+	ctx context.Context
+}
+
+func (l staticSessionLocker) Lock(context.Context, string) (worker.SessionLock, error) {
+	return testSessionLock(l), nil
+}
+
+type testSessionLock struct {
+	ctx context.Context
+}
+
+func (l testSessionLock) Context() context.Context {
+	return l.ctx
+}
+
+func (testSessionLock) Release() error {
+	return nil
+}
+
+type sessionLockTestContextKey struct{}
+
+type recordingSessionLocker struct {
+	partitionKey string
+	lock         *recordingSessionLock
+}
+
+func (l *recordingSessionLocker) Lock(ctx context.Context, partitionKey string) (worker.SessionLock, error) {
+	l.partitionKey = partitionKey
+	l.lock = &recordingSessionLock{
+		ctx: context.WithValue(ctx, sessionLockTestContextKey{}, "locked"),
+	}
+	return l.lock, nil
+}
+
+type recordingSessionLock struct {
+	ctx      context.Context
+	released atomic.Bool
+}
+
+func (l *recordingSessionLock) Context() context.Context {
+	return l.ctx
+}
+
+func (l *recordingSessionLock) Release() error {
+	l.released.Store(true)
+	return nil
+}
+
+type eventSinkFunc func(context.Context, worker.Execution, *event.Event) error
+
+func (f eventSinkFunc) HandleRunnerEvent(
+	ctx context.Context,
+	exec worker.Execution,
+	evt *event.Event,
+) error {
+	return f(ctx, exec, evt)
+}
+
+type staticModelAPIKeyResolver string
+
+func (r staticModelAPIKeyResolver) ResolveModelAPIKey(
+	_ context.Context,
+	_ worker.Execution,
+) (string, error) {
+	return string(r), nil
+}
+
+type allowConfiguredEndpoint struct{}
+
+func (allowConfiguredEndpoint) ResolveModelBaseURL(
+	_ context.Context,
+	_ worker.Execution,
+	configuredURL string,
+) (string, error) {
+	return configuredURL, nil
+}
+
+type staticEndpointPolicy string
+
+func (p staticEndpointPolicy) ResolveModelBaseURL(
+	_ context.Context,
+	_ worker.Execution,
+	_ string,
+) (string, error) {
+	return string(p), nil
+}
+
+type staticSessionResolver struct {
+	service session.Service
+}
+
+func (r staticSessionResolver) ResolveSession(
+	_ context.Context,
+	_ worker.Execution,
+) (session.Service, error) {
+	return r.service, nil
 }
 
 func (*recordingRunner) Close() error {

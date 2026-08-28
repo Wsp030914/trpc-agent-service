@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// Status is the lifecycle state of a tenant.
+// Status is the lifecycle state of a tenant or agent application.
 type Status string
 
 const (
@@ -21,10 +21,10 @@ const (
 
 // Tenant describes the top-level isolation boundary for platform data.
 type Tenant struct {
-	ID     string
-	Name   string
-	Status Status
-	Audit  AuditPolicy
+	ID     string      `json:"tenant_id"`
+	Name   string      `json:"name"`
+	Status Status      `json:"status"`
+	Audit  AuditPolicy `json:"audit"`
 }
 
 // Validate checks the persisted tenant configuration. The zero value is invalid.
@@ -51,10 +51,11 @@ func (t Tenant) Scope(appID string) Scope {
 
 // AgentApp describes an agent application owned by a tenant.
 type AgentApp struct {
-	TenantID            string
-	AppID               string
-	Name                string
-	ActiveConfigVersion string
+	TenantID            string `json:"tenant_id"`
+	AppID               string `json:"app_id"`
+	Name                string `json:"name"`
+	ActiveConfigVersion string `json:"active_config_version"`
+	Status              Status `json:"status"`
 }
 
 // Validate checks the persisted agent application metadata. The zero value is invalid.
@@ -71,20 +72,23 @@ func (a AgentApp) Validate() error {
 	if a.ActiveConfigVersion == "" {
 		return errors.New("active_config_version is required")
 	}
+	if !validStatus(a.Status) {
+		return errors.New("app status is invalid")
+	}
 	return nil
 }
 
 // AppConfig is an immutable version of tenant application configuration.
 type AppConfig struct {
-	TenantID       string
-	AppID          string
-	Version        string
-	Model          ModelConfig
-	Tools          ToolPolicy
-	BackendConfig  BackendConfig
-	Audit          AuditPolicy
-	SecretRefs     []SecretRef
-	ChannelBinding []string
+	TenantID       string        `json:"tenant_id"`
+	AppID          string        `json:"app_id"`
+	Version        string        `json:"version"`
+	Model          ModelConfig   `json:"model"`
+	Tools          ToolPolicy    `json:"tools"`
+	BackendConfig  BackendConfig `json:"backend_config"`
+	Audit          AuditPolicy   `json:"audit"`
+	SecretRefs     []SecretRef   `json:"secret_refs"`
+	ChannelBinding []string      `json:"channel_binding"`
 }
 
 // Clone returns a deep copy of caller-owned slices and maps in the config.
@@ -137,11 +141,16 @@ func (c AppConfig) Validate() error {
 	return nil
 }
 
-// ModelConfig identifies the model runtime selected by a tenant application.
+// ModelConfig identifies the model runtime and scoped API key selected by a
+// tenant application.
 type ModelConfig struct {
-	Provider   string
-	Model      string
-	Parameters map[string]string
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	// APIKeyRef is the external secret selected for this model. It is required
+	// because the production worker resolves the model credential only through
+	// a scoped secret reference.
+	APIKeyRef  SecretRef         `json:"api_key_ref"`
+	Parameters map[string]string `json:"parameters"`
 }
 
 // Clone returns a deep copy of the model config.
@@ -152,12 +161,16 @@ func (c ModelConfig) Clone() ModelConfig {
 }
 
 // Validate checks model provider and model name fields. Parameters may be nil.
+// The API key reference is required.
 func (c ModelConfig) Validate() error {
 	if c.Provider == "" {
 		return errors.New("model provider is required")
 	}
 	if c.Model == "" {
 		return errors.New("model is required")
+	}
+	if err := c.APIKeyRef.Validate(); err != nil {
+		return fmt.Errorf("api key ref: %w", err)
 	}
 	if err := validateStringMap(c.Parameters, "model parameter"); err != nil {
 		return err
@@ -167,8 +180,8 @@ func (c ModelConfig) Validate() error {
 
 // ToolPolicy declares the tool contract for a tenant application.
 type ToolPolicy struct {
-	VisibleTools    []string
-	ExecutableTools []string
+	VisibleTools    []string `json:"visible_tools"`
+	ExecutableTools []string `json:"executable_tools"`
 }
 
 // Clone returns a deep copy of the tool policy.
@@ -219,10 +232,10 @@ const (
 
 // BackendRef references one concrete backend without exposing its secret.
 type BackendRef struct {
-	Kind    BackendKind
-	Name    string
-	DSNRef  string
-	Options map[string]string
+	Kind    BackendKind       `json:"kind"`
+	Name    string            `json:"name"`
+	DSNRef  string            `json:"dsn_ref"`
+	Options map[string]string `json:"options"`
 }
 
 // Clone returns a deep copy of the backend reference.
@@ -254,12 +267,12 @@ func (r BackendRef) Validate() error {
 
 // BackendConfig groups the backends used by one app config version.
 type BackendConfig struct {
-	Name      string
-	Session   BackendRef
-	Memory    BackendRef
-	Knowledge BackendRef
-	Artifact  BackendRef
-	Audit     BackendRef
+	Name      string     `json:"name"`
+	Session   BackendRef `json:"session"`
+	Memory    BackendRef `json:"memory"`
+	Knowledge BackendRef `json:"knowledge"`
+	Artifact  BackendRef `json:"artifact"`
+	Audit     BackendRef `json:"audit"`
 }
 
 // Clone returns a deep copy of backend references in the config.
@@ -300,9 +313,9 @@ func (c BackendConfig) Validate() error {
 
 // AuditPolicy controls tenant audit behavior.
 type AuditPolicy struct {
-	Enabled       bool
-	RetentionDays int
-	RedactPII     bool
+	Enabled       bool `json:"enabled"`
+	RetentionDays int  `json:"retention_days"`
+	RedactPII     bool `json:"redact_pii"`
 }
 
 // Validate checks audit retention values. The zero value disables audit.
@@ -315,8 +328,8 @@ func (p AuditPolicy) Validate() error {
 
 // SecretRef points to a secret managed outside the database.
 type SecretRef struct {
-	Name    string
-	Version string
+	Name    string `json:"name"`
+	Version string `json:"version"`
 }
 
 // Validate checks that the secret reference has a stable name.
@@ -330,20 +343,20 @@ func (r SecretRef) Validate() error {
 
 // RuntimeContext carries trusted tenant routing metadata through one request.
 type RuntimeContext struct {
-	TenantID      string
-	AppID         string
-	ConfigVersion string
-	Channel       string
-	BindingID     string
-	SessionID     string
+	TenantID      string `json:"tenant_id"`
+	AppID         string `json:"app_id"`
+	ConfigVersion string `json:"config_version"`
+	Channel       string `json:"channel"`
+	BindingID     string `json:"binding_id"`
+	SessionID     string `json:"session_id"`
 	// SessionPrincipalID identifies the owner of the conversation session. It
 	// equals UserID for a private conversation and identifies the group or
 	// thread for a shared conversation.
-	SessionPrincipalID string
+	SessionPrincipalID string `json:"session_principal_id"`
 	// UserID identifies the user who sent the current message.
-	UserID string
+	UserID string `json:"user_id"`
 	// TraceID identifies the end-to-end trace for this request.
-	TraceID string
+	TraceID string `json:"trace_id"`
 }
 
 // Scope returns the tenant and application scope for persistence keys.
@@ -379,8 +392,8 @@ func (c RuntimeContext) Validate() error {
 
 // Scope identifies the tenant and application prefix used by shared backends.
 type Scope struct {
-	TenantID string
-	AppID    string
+	TenantID string `json:"tenant_id"`
+	AppID    string `json:"app_id"`
 }
 
 // NewScope creates a validated tenant application scope.

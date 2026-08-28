@@ -1,0 +1,100 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: trpc_agent_service
+      POSTGRES_USER: trpc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:56379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  gateway:
+    build: .
+    environment:
+      TRPC_AGENT_SERVICE_ROLE: gateway
+      TRPC_AGENT_SERVICE_POSTGRES_DSN: ${TRPC_AGENT_SERVICE_POSTGRES_DSN:?set TRPC_AGENT_SERVICE_POSTGRES_DSN in .env}
+
+      TRPC_AGENT_SERVICE_REDIS_URL: ${TRPC_AGENT_SERVICE_REDIS_URL:?set TRPC_AGENT_SERVICE_REDIS_URL in .env}
+      TRPC_AGENT_SERVICE_DISPATCHER_ID: gateway-1
+      TRPC_AGENT_SERVICE_ADMIN_TOKEN: ${TRPC_AGENT_SERVICE_ADMIN_TOKEN:?set TRPC_AGENT_SERVICE_ADMIN_TOKEN in .env}
+      TRPC_AGENT_SERVICE_HEALTH_ADDR: :8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  worker-1:
+    build: .
+    init: true
+    environment:
+      TRPC_AGENT_SERVICE_ROLE: worker
+      TRPC_AGENT_SERVICE_WORKER_ID: worker-1
+      TRPC_AGENT_SERVICE_POSTGRES_DSN: ${TRPC_AGENT_SERVICE_POSTGRES_DSN:?set TRPC_AGENT_SERVICE_POSTGRES_DSN in .env}
+      TRPC_AGENT_SERVICE_REDIS_URL: ${TRPC_AGENT_SERVICE_REDIS_URL:?set TRPC_AGENT_SERVICE_REDIS_URL in .env}
+      TRPC_AGENT_SERVICE_HEALTH_ADDR: :8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  worker-2:
+    build: .
+    init: true
+    environment:
+      TRPC_AGENT_SERVICE_ROLE: worker
+      TRPC_AGENT_SERVICE_WORKER_ID: worker-2
+      TRPC_AGENT_SERVICE_POSTGRES_DSN: ${TRPC_AGENT_SERVICE_POSTGRES_DSN:?set TRPC_AGENT_SERVICE_POSTGRES_DSN in .env}
+      TRPC_AGENT_SERVICE_REDIS_URL: ${TRPC_AGENT_SERVICE_REDIS_URL:?set TRPC_AGENT_SERVICE_REDIS_URL in .env}
+      TRPC_AGENT_SERVICE_HEALTH_ADDR: :8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  postgres-data:
+  redis-data:

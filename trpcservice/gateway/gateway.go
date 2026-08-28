@@ -3,7 +3,9 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -19,10 +21,35 @@ const (
 	TenantSourceVerifiedChannelBinding TenantSource = "verified_channel_binding"
 )
 
+var (
+	// ErrAdmitterRequired means a Gateway has no atomic admission backend.
+	ErrAdmitterRequired = errors.New("admitter is required")
+	// ErrAdmissionIdentityRequired means the ingress did not provide an
+	// identity that can be revalidated by the admission transaction.
+	ErrAdmissionIdentityRequired = errors.New("admission identity resolver is required")
+	// ErrIdempotencyConflict means one idempotency key was reused with another
+	// normalized request payload.
+	ErrIdempotencyConflict = errors.New("idempotency key conflicts with existing request")
+	// ErrUnsupportedAdmissionSource means the selected admission backend does
+	// not yet implement the request's trusted source type.
+	ErrUnsupportedAdmissionSource = errors.New("admission source is unsupported")
+)
+
 // Message is the normalized user input passed from gateway to workers.
 type Message struct {
 	Text         string
 	ArtifactRefs []string
+}
+
+// Validate checks whether Message is executable by the current runner boundary.
+func (m Message) Validate() error {
+	if m.Text == "" {
+		return errors.New("message text is required")
+	}
+	if len(m.ArtifactRefs) > 0 {
+		return errors.New("artifact refs are not supported by runner boundary")
+	}
+	return nil
 }
 
 // TenantResolver supplies tenant routing from an authentication or verification boundary.
@@ -31,103 +58,130 @@ type TenantResolver interface {
 	ResolveTenant(ctx context.Context) (tenant.RuntimeContext, TenantSource, error)
 }
 
-// Request is a gateway input whose tenant routing is supplied by a trusted resolver.
-type Request struct {
-	RequestID string
-	Tenant    TenantResolver
-	Message   Message
+// CredentialDigest is a non-reversible API key digest carried to admission.
+// It contains no raw credential material.
+type CredentialDigest [sha256.Size]byte
+
+// AdmissionIdentity is the trusted request identity that the admission
+// transaction must revalidate against authoritative storage.
+type AdmissionIdentity struct {
+	Tenant           tenant.RuntimeContext
+	Source           TenantSource
+	SourceID         string
+	CredentialDigest CredentialDigest
 }
 
-// Job is the tenant-scoped work item consumed by workers.
-type Job struct {
-	RequestID    string
-	TenantSource TenantSource
-	Tenant       tenant.RuntimeContext
-	Message      Message
-}
-
-// RoutedJob is a job plus the queue partition used for session ordering.
-type RoutedJob struct {
-	Job          Job
-	PartitionKey string
-}
-
-// Validate checks the trusted routing fields required by workers.
-func (j Job) Validate() error {
-	if j.RequestID == "" {
-		return errors.New("request_id is required")
+// Validate checks the trusted source and identity fields required for atomic
+// admission. The config version is advisory and is re-read by the backend.
+func (i AdmissionIdentity) Validate() error {
+	if err := i.Tenant.Validate(); err != nil {
+		return err
 	}
-	if !validTenantSource(j.TenantSource) {
+	if !validTenantSource(i.Source) {
 		return errors.New("tenant source is invalid")
 	}
-	if j.TenantSource == TenantSourceVerifiedChannelBinding {
-		if j.Tenant.Channel == "" {
+	if i.SourceID == "" {
+		return errors.New("source_id is required")
+	}
+	if i.Source == TenantSourceAuthenticatedClaims && i.CredentialDigest == (CredentialDigest{}) {
+		return errors.New("credential digest is required")
+	}
+	if i.Source == TenantSourceVerifiedChannelBinding {
+		if i.Tenant.Channel == "" {
 			return errors.New("channel is required for verified channel binding")
 		}
-		if j.Tenant.BindingID == "" {
+		if i.Tenant.BindingID == "" {
 			return errors.New("binding_id is required for verified channel binding")
 		}
-	}
-	return j.Tenant.Validate()
-}
-
-// PartitionKey returns the key used to serialize work for one session.
-func (j Job) PartitionKey() (string, error) {
-	return j.Tenant.Scope().Key(
-		"session",
-		j.Tenant.SessionPrincipalID,
-		j.Tenant.SessionID,
-	)
-}
-
-// NewRoutedJob creates a job envelope with a stable session partition key.
-func NewRoutedJob(job Job) (RoutedJob, error) {
-	if err := job.Validate(); err != nil {
-		return RoutedJob{}, err
-	}
-	partitionKey, err := job.PartitionKey()
-	if err != nil {
-		return RoutedJob{}, err
-	}
-	return RoutedJob{Job: job.clone(), PartitionKey: partitionKey}, nil
-}
-
-// Validate checks the job and its partition key.
-func (j RoutedJob) Validate() error {
-	if err := j.Job.Validate(); err != nil {
-		return err
-	}
-	if j.PartitionKey == "" {
-		return errors.New("partition_key is required")
-	}
-	partitionKey, err := j.Job.PartitionKey()
-	if err != nil {
-		return err
-	}
-	if j.PartitionKey != partitionKey {
-		return errors.New("partition_key does not match job scope")
 	}
 	return nil
 }
 
-// RoutedEnqueuer accepts tenant-scoped jobs with an explicit partition key.
-type RoutedEnqueuer interface {
-	EnqueueRouted(ctx context.Context, job RoutedJob) error
+// AdmissionIdentityResolver exposes an authenticated identity to the Gateway
+// without exposing raw credentials or trusting request payload tenant fields.
+type AdmissionIdentityResolver interface {
+	ResolveAdmissionIdentity(ctx context.Context) (AdmissionIdentity, error)
+}
+
+// Request is a gateway input whose tenant routing is supplied by a trusted resolver.
+type Request struct {
+	RequestID      string
+	IdempotencyKey string
+	Tenant         TenantResolver
+	Message        Message
+}
+
+// AdmissionRequest is the normalized command submitted to the atomic
+// admission backend.
+type AdmissionRequest struct {
+	RequestID      string
+	IdempotencyKey string
+	Identity       AdmissionIdentity
+	Message        Message
+}
+
+// Validate checks the fields that must be stable before the admission
+// transaction allocates a turn or writes an execution.
+func (r AdmissionRequest) Validate() error {
+	if r.RequestID == "" {
+		return errors.New("request_id is required")
+	}
+	if r.IdempotencyKey == "" {
+		return errors.New("idempotency_key is required")
+	}
+	if err := r.Identity.Validate(); err != nil {
+		return fmt.Errorf("admission identity: %w", err)
+	}
+	if err := r.Message.Validate(); err != nil {
+		return fmt.Errorf("message: %w", err)
+	}
+	return nil
+}
+
+// AdmissionResult describes the committed execution identity returned to an
+// ingress after atomic admission. Replayed is true when an identical
+// idempotent request already existed.
+type AdmissionResult struct {
+	RequestID     string
+	ConfigVersion string
+	TurnSeq       int64
+	Replayed      bool
+}
+
+// Validate checks the result returned by an admission backend.
+func (r AdmissionResult) Validate() error {
+	if r.RequestID == "" {
+		return errors.New("request_id is required")
+	}
+	if r.ConfigVersion == "" {
+		return errors.New("config_version is required")
+	}
+	if r.TurnSeq <= 0 {
+		return errors.New("turn_seq must be positive")
+	}
+	return nil
+}
+
+// Admitter atomically accepts a normalized request into the authoritative
+// execution store.
+type Admitter interface {
+	Admit(ctx context.Context, request AdmissionRequest) (AdmissionResult, error)
 }
 
 // Option configures a Gateway.
 type Option func(*Gateway)
 
-// WithRoutedEnqueuer sets the queue used for partitioned tenant-scoped jobs.
-func WithRoutedEnqueuer(enqueuer RoutedEnqueuer) Option {
+// WithAdmitter sets the authoritative backend used for atomic request
+// admission.
+func WithAdmitter(admitter Admitter) Option {
 	return func(g *Gateway) {
-		g.RoutedJobs = enqueuer
+		g.Admitter = admitter
 	}
 }
 
-// Gateway converts trusted requests into tenant-scoped jobs.
+// Gateway converts trusted requests into atomic admission commands.
 type Gateway struct {
-	RoutedJobs RoutedEnqueuer
+	Admitter Admitter
 }
 
 // New creates a Gateway with the provided options.
@@ -139,54 +193,45 @@ func New(opts ...Option) *Gateway {
 	return g
 }
 
-// Handle validates a request, creates a job, and optionally enqueues it.
-func (g Gateway) Handle(ctx context.Context, req Request) (Job, error) {
-	job, err := NewJob(ctx, req)
-	if err != nil {
-		return Job{}, err
+// Handle validates a request and submits it to the authoritative admission
+// backend. It never performs a separate in-memory enqueue.
+func (g Gateway) Handle(ctx context.Context, req Request) (AdmissionResult, error) {
+	if g.Admitter == nil {
+		return AdmissionResult{}, ErrAdmitterRequired
 	}
-	if g.RoutedJobs != nil {
-		routed, err := NewRoutedJob(job)
-		if err != nil {
-			return Job{}, err
-		}
-		if err := g.RoutedJobs.EnqueueRouted(ctx, routed); err != nil {
-			return Job{}, err
-		}
-	}
-	return job, nil
-}
-
-// NewJob resolves trusted tenant routing and creates a worker job.
-func NewJob(ctx context.Context, req Request) (Job, error) {
 	if req.Tenant == nil {
-		return Job{}, errors.New("tenant resolver is required")
+		return AdmissionResult{}, errors.New("tenant resolver is required")
 	}
-	tc, source, err := req.Tenant.ResolveTenant(ctx)
+	identityResolver, ok := req.Tenant.(AdmissionIdentityResolver)
+	if !ok {
+		return AdmissionResult{}, ErrAdmissionIdentityRequired
+	}
+	identity, err := identityResolver.ResolveAdmissionIdentity(ctx)
 	if err != nil {
-		return Job{}, err
+		return AdmissionResult{}, err
 	}
-	job := Job{
-		RequestID:    req.RequestID,
-		TenantSource: source,
-		Tenant:       tc,
+	admissionRequest := AdmissionRequest{
+		RequestID:      req.RequestID,
+		IdempotencyKey: req.IdempotencyKey,
+		Identity:       identity,
 		Message: Message{
 			Text:         req.Message.Text,
 			ArtifactRefs: slices.Clone(req.Message.ArtifactRefs),
 		},
 	}
-	if err := job.Validate(); err != nil {
-		return Job{}, err
+	if err := admissionRequest.Validate(); err != nil {
+		return AdmissionResult{}, err
 	}
-	return job, nil
+	result, err := g.Admitter.Admit(ctx, admissionRequest)
+	if err != nil {
+		return AdmissionResult{}, err
+	}
+	if err := result.Validate(); err != nil {
+		return AdmissionResult{}, fmt.Errorf("admitter result: %w", err)
+	}
+	return result, nil
 }
 
 func validTenantSource(source TenantSource) bool {
 	return source == TenantSourceAuthenticatedClaims || source == TenantSourceVerifiedChannelBinding
-}
-
-func (j Job) clone() Job {
-	cloned := j
-	cloned.Message.ArtifactRefs = slices.Clone(j.Message.ArtifactRefs)
-	return cloned
 }

@@ -17,6 +17,19 @@ func TestBindingValidateRequiresTrustedChannelConfig(t *testing.T) {
 	}
 }
 
+func TestBindingValidateAcceptsFeishu(t *testing.T) {
+	binding := validBinding()
+	binding.Channel = channels.ChannelFeishu
+	binding.ExternalAccount = "feishu-app-1"
+	binding.WebhookURL = "https://example.com/im/feishu/binding-1"
+	binding.TokenRef = tenant.SecretRef{Name: "feishu-token", Version: "v1"}
+	binding.SigningSecretRef = tenant.SecretRef{Name: "feishu-signing-secret", Version: "v1"}
+
+	if err := binding.Validate(); err != nil {
+		t.Fatalf("validate Feishu binding: %v", err)
+	}
+}
+
 func TestBindingValidateRejectsIncompleteConfig(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -1,0 +1,6 @@
+.git
+.gocache
+.env
+*.log
+coverage.out
+data/

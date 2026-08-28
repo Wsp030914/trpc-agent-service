@@ -109,9 +109,23 @@ func TestTenantAndAgentAppValidate(t *testing.T) {
 		AppID:               "support",
 		Name:                "Support",
 		ActiveConfigVersion: "v1",
+		Status:              tenant.StatusActive,
 	}
 	if err := app.Validate(); err != nil {
 		t.Fatalf("validate app: %v", err)
+	}
+}
+
+func TestAgentAppValidateRejectsInvalidStatus(t *testing.T) {
+	app := tenant.AgentApp{
+		TenantID:            "tenant-a",
+		AppID:               "support",
+		Name:                "Support",
+		ActiveConfigVersion: "v1",
+		Status:              tenant.Status("DELETED"),
+	}
+	if err := app.Validate(); err == nil {
+		t.Fatal("validate app succeeded with invalid status")
 	}
 }
 
@@ -134,6 +148,7 @@ func TestAppConfigValidateAndCloneCopiesNestedData(t *testing.T) {
 
 	cloned := cfg.Clone()
 	cfg.Model.Parameters["temperature"] = "1"
+	cfg.Model.APIKeyRef.Name = "mutated-model-key"
 	cfg.Tools.VisibleTools[0] = "mutated-visible"
 	cfg.Tools.ExecutableTools[0] = "mutated-executable"
 	cfg.BackendConfig.Session.Options["schema"] = "mutated"
@@ -142,6 +157,9 @@ func TestAppConfigValidateAndCloneCopiesNestedData(t *testing.T) {
 
 	if cloned.Model.Parameters["temperature"] != "0" {
 		t.Fatalf("cloned model parameter = %q, want 0", cloned.Model.Parameters["temperature"])
+	}
+	if cloned.Model.APIKeyRef.Name != "model-api-key" {
+		t.Fatalf("cloned model api key ref = %q, want model-api-key", cloned.Model.APIKeyRef.Name)
 	}
 	if cloned.Tools.VisibleTools[0] != "search" {
 		t.Fatalf("cloned visible tool = %q, want search", cloned.Tools.VisibleTools[0])
@@ -160,14 +178,23 @@ func TestAppConfigValidateAndCloneCopiesNestedData(t *testing.T) {
 	}
 }
 
+func TestModelConfigValidateRejectsIncompleteAPIKeyRef(t *testing.T) {
+	cfg := validAppConfig()
+	cfg.Model.APIKeyRef = tenant.SecretRef{Version: "v1"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("validate app config succeeded with incomplete model api key ref")
+	}
+}
+
 func TestAppConfigValidateAllowsNilOptionalCollections(t *testing.T) {
 	cfg := tenant.AppConfig{
 		TenantID: "tenant-a",
 		AppID:    "support",
 		Version:  "v1",
 		Model: tenant.ModelConfig{
-			Provider: "openai",
-			Model:    "gpt-4.1-mini",
+			Provider:  "openai",
+			APIKeyRef: tenant.SecretRef{Name: "model-key"},
+			Model:     "gpt-4.1-mini",
 		},
 		BackendConfig: tenant.BackendConfig{
 			Name: "default",
@@ -258,6 +285,7 @@ func validAppConfig() tenant.AppConfig {
 		Model: tenant.ModelConfig{
 			Provider:   "openai",
 			Model:      "gpt-4.1-mini",
+			APIKeyRef:  tenant.SecretRef{Name: "model-api-key", Version: "v1"},
 			Parameters: map[string]string{"temperature": "0"},
 		},
 		Tools: tenant.ToolPolicy{

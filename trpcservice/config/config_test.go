@@ -188,6 +188,7 @@ func testAppConfig(tenantID, appID, version string) tenant.AppConfig {
 		Version:  version,
 		Model: tenant.ModelConfig{
 			Provider:   "openai",
+			APIKeyRef:  tenant.SecretRef{Name: "model-key"},
 			Model:      "gpt-4.1-mini",
 			Parameters: map[string]string{"temperature": "0"},
 		},

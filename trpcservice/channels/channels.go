@@ -16,8 +16,8 @@ const (
 	ChannelWeCom Channel = "wecom"
 	// ChannelWeChatCustomer identifies WeChat customer service.
 	ChannelWeChatCustomer Channel = "wechat_customer"
-	// ChannelTelegram identifies Telegram.
-	ChannelTelegram Channel = "telegram"
+	// ChannelFeishu identifies Feishu.
+	ChannelFeishu Channel = "feishu"
 )
 
 // BindingStatus is the lifecycle state of an IM channel binding.
@@ -32,16 +32,16 @@ const (
 
 // Binding maps one verified external IM account to a tenant application.
 type Binding struct {
-	TenantID         string
-	AppID            string
-	BindingID        string
-	Channel          Channel
-	ExternalAccount  string
-	WebhookURL       string
-	TokenRef         tenant.SecretRef
-	SigningSecretRef tenant.SecretRef
-	Secret           tenant.SecretRef
-	Status           BindingStatus
+	TenantID         string           `json:"tenant_id"`
+	AppID            string           `json:"app_id"`
+	BindingID        string           `json:"binding_id"`
+	Channel          Channel          `json:"channel"`
+	ExternalAccount  string           `json:"external_account"`
+	WebhookURL       string           `json:"webhook_url"`
+	TokenRef         tenant.SecretRef `json:"token_ref"`
+	SigningSecretRef tenant.SecretRef `json:"signing_secret_ref"`
+	Secret           tenant.SecretRef `json:"secret_ref"`
+	Status           BindingStatus    `json:"status"`
 }
 
 // Scope returns the tenant application scope that owns the binding.
@@ -123,7 +123,7 @@ type Membership struct {
 
 func validChannel(channel Channel) bool {
 	switch channel {
-	case ChannelWeCom, ChannelWeChatCustomer, ChannelTelegram:
+	case ChannelWeCom, ChannelWeChatCustomer, ChannelFeishu:
 		return true
 	default:
 		return false
