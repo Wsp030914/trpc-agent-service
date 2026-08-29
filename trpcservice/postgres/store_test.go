@@ -104,7 +104,7 @@ func TestAppConfigPersistenceDocumentRoundTrip(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			modelConfig, toolPolicy, backendConfig, auditPolicy, secretRefs, bindings, err :=
+			modelConfig, toolPolicy, backendConfig, auditPolicy, secretRefs, bindings, knowledgeBaseIDs, err :=
 				marshalAppConfig(tt.cfg)
 			if err != nil {
 				t.Fatalf("marshal app config: %v", err)
@@ -119,6 +119,7 @@ func TestAppConfigPersistenceDocumentRoundTrip(t *testing.T) {
 				auditPolicy,
 				secretRefs,
 				bindings,
+				knowledgeBaseIDs,
 			)
 			if err != nil {
 				t.Fatalf("unmarshal app config: %v", err)

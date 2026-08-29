@@ -1,0 +1,143 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	"trpc.group/trpc-go/trpc-agent-go/session"
+)
+
+// SummaryImporter writes existing Session summaries to the PostgreSQL Session
+// schema selected by one immutable execution configuration.
+type SummaryImporter struct {
+	pool  *pgxpool.Pool
+	table string
+}
+
+// NewSummaryImporter creates an importer for the PostgreSQL Session backend
+// resolved by exec. The caller must Close the returned importer.
+func (r *SessionResolver) NewSummaryImporter(
+	ctx context.Context,
+	exec worker.Execution,
+) (*SummaryImporter, error) {
+	if r == nil || r.dsns == nil {
+		return nil, errors.New("postgres session resolver is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := exec.Tenant.Validate(); err != nil {
+		return nil, err
+	}
+	if _, err := r.ResolveSession(ctx, exec); err != nil {
+		return nil, fmt.Errorf("resolve postgres session service: %w", err)
+	}
+	handle := exec.Storage.Session
+	if err := handle.Validate(exec.Tenant.Scope(), storage.CapabilitySession, exec.Config.BackendConfig.Session); err != nil {
+		return nil, fmt.Errorf("session storage handle: %w", err)
+	}
+	if handle.Ref.Kind != "sql" || (handle.Ref.Provider != "" && handle.Ref.Provider != "postgres") {
+		return nil, fmt.Errorf("session backend %q must use postgres provider", handle.Ref.Name)
+	}
+	schema, err := sessionSchema(handle.Ref)
+	if err != nil {
+		return nil, err
+	}
+	dsn, err := r.dsns.ResolveSessionDSN(ctx, handle)
+	if err != nil {
+		return nil, fmt.Errorf("resolve session dsn: %w", err)
+	}
+	if dsn == "" {
+		return nil, errors.New("session dsn is required")
+	}
+	if err := ensureSchema(ctx, dsn, schema); err != nil {
+		return nil, err
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres summary importer: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping postgres summary importer: %w", err)
+	}
+	return &SummaryImporter{
+		pool:  pool,
+		table: pgx.Identifier{schema, "session_summaries"}.Sanitize(),
+	}, nil
+}
+
+// ReplaceSessionSummaries replaces all active summaries for key while
+// preserving their text, topic list, update time, and boundary metadata.
+func (i *SummaryImporter) ReplaceSessionSummaries(
+	ctx context.Context,
+	key session.Key,
+	summaries map[string]*session.Summary,
+) error {
+	if i == nil || i.pool == nil || i.table == "" {
+		return errors.New("postgres summary importer is not initialized")
+	}
+	if err := key.CheckSessionKey(); err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tx, err := i.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin replace session summaries: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, fmt.Sprintf(
+		"DELETE FROM %s WHERE app_name = $1 AND user_id = $2 AND session_id = $3",
+		i.table,
+	), key.AppName, key.UserID, key.SessionID); err != nil {
+		return fmt.Errorf("delete target session summaries: %w", err)
+	}
+	for filterKey, summary := range summaries {
+		if summary == nil {
+			continue
+		}
+		value, err := json.Marshal(summary)
+		if err != nil {
+			return fmt.Errorf("marshal summary %q: %w", filterKey, err)
+		}
+		query := fmt.Sprintf(
+			"INSERT INTO %s (app_name, user_id, session_id, filter_key, summary, updated_at, expires_at, deleted_at) "+
+				"VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL) "+
+				"ON CONFLICT (app_name, user_id, session_id, filter_key) WHERE deleted_at IS NULL "+
+				"DO UPDATE SET summary = EXCLUDED.summary, updated_at = EXCLUDED.updated_at, expires_at = EXCLUDED.expires_at",
+			i.table,
+		)
+		if _, err := tx.Exec(ctx, query,
+			key.AppName, key.UserID, key.SessionID, filterKey, value, time.Now().UTC(),
+		); err != nil {
+			return fmt.Errorf("upsert target summary %q: %w", filterKey, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit replace session summaries: %w", err)
+	}
+	return nil
+}
+
+// Close releases the database resources owned by SummaryImporter.
+func (i *SummaryImporter) Close() {
+	if i != nil && i.pool != nil {
+		i.pool.Close()
+		i.pool = nil
+	}
+}

@@ -91,7 +91,6 @@ func (s *Store) Admit(
 	if _, err := resolveAppConfigFrom(ctx, tx, app.TenantID, app.AppID, app.ActiveConfigVersion); err != nil {
 		return gateway.AdmissionResult{}, err
 	}
-
 	existing, found, err := findExecutionByIdempotency(
 		ctx,
 		tx,
@@ -108,14 +107,32 @@ func (s *Store) Admit(
 		if !bytes.Equal(existing.PayloadHash, payloadHash[:]) {
 			return gateway.AdmissionResult{}, gateway.ErrIdempotencyConflict
 		}
-		if existing.Status == "FAILED" {
-			// A failed terminal execution is re-armed instead of replayed so
-			// clients can retry the same logical request. The retry runs with
-			// the currently active configuration and a fresh attempt budget;
-			// the relay recovery refills its dispatch record.
-			tag, err := tx.Exec(
-				ctx,
-				`UPDATE platform.execution
+		if existing.Status != "FAILED" {
+			result := gateway.AdmissionResult{
+				RequestID:     existing.RequestID,
+				ConfigVersion: existing.ConfigVersion,
+				TurnSeq:       existing.TurnSeq,
+				Replayed:      true,
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return gateway.AdmissionResult{}, fmt.Errorf("commit replayed admission: %w", err)
+			}
+			return result, nil
+		}
+		blocked, err := migrationBlocksAdmission(ctx, tx, app.TenantID, app.AppID)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		if blocked {
+			return gateway.AdmissionResult{}, gateway.ErrAdmissionDraining
+		}
+		// A failed terminal execution is re-armed instead of replayed so
+		// clients can retry the same logical request. The retry runs with
+		// the currently active configuration and a fresh attempt budget;
+		// the relay recovery refills its dispatch record.
+		tag, err := tx.Exec(
+			ctx,
+			`UPDATE platform.execution
 SET status = 'PENDING', attempt = 0, config_version = $4, last_error = NULL,
     lease_owner = NULL, run_token = NULL, lease_until = NULL, finished_at = NULL,
     next_attempt_at = clock_timestamp(), updated_at = clock_timestamp()
@@ -123,38 +140,33 @@ WHERE tenant_id = $1
   AND app_id = $2
   AND request_id = $3
   AND status = 'FAILED'`,
-				credential.TenantID,
-				credential.AppID,
-				existing.RequestID,
-				app.ActiveConfigVersion,
-			)
-			if err != nil {
-				return gateway.AdmissionResult{}, fmt.Errorf("re-arm failed execution: %w", err)
-			}
-			if tag.RowsAffected() != 1 {
-				return gateway.AdmissionResult{}, fmt.Errorf("re-arm failed execution: %w", ErrNotFound)
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return gateway.AdmissionResult{}, fmt.Errorf("commit re-armed admission: %w", err)
-			}
-			return gateway.AdmissionResult{
-				RequestID:     existing.RequestID,
-				ConfigVersion: app.ActiveConfigVersion,
-				TurnSeq:       existing.TurnSeq,
-			}, nil
+			credential.TenantID,
+			credential.AppID,
+			existing.RequestID,
+			app.ActiveConfigVersion,
+		)
+		if err != nil {
+			return gateway.AdmissionResult{}, fmt.Errorf("re-arm failed execution: %w", err)
 		}
-		result := gateway.AdmissionResult{
-			RequestID:     existing.RequestID,
-			ConfigVersion: existing.ConfigVersion,
-			TurnSeq:       existing.TurnSeq,
-			Replayed:      true,
+		if tag.RowsAffected() != 1 {
+			return gateway.AdmissionResult{}, fmt.Errorf("re-arm failed execution: %w", ErrNotFound)
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return gateway.AdmissionResult{}, fmt.Errorf("commit replayed admission: %w", err)
+			return gateway.AdmissionResult{}, fmt.Errorf("commit re-armed admission: %w", err)
 		}
-		return result, nil
+		return gateway.AdmissionResult{
+			RequestID:     existing.RequestID,
+			ConfigVersion: app.ActiveConfigVersion,
+			TurnSeq:       existing.TurnSeq,
+		}, nil
 	}
-
+	blocked, err := migrationBlocksAdmission(ctx, tx, app.TenantID, app.AppID)
+	if err != nil {
+		return gateway.AdmissionResult{}, err
+	}
+	if blocked {
+		return gateway.AdmissionResult{}, gateway.ErrAdmissionDraining
+	}
 	requestExists, err := executionRequestExists(ctx, tx, credential.TenantID, credential.AppID, request.RequestID)
 	if err != nil {
 		return gateway.AdmissionResult{}, err
@@ -346,10 +358,11 @@ func resolveAppConfigFrom(
 	var auditPolicy []byte
 	var secretRefs []byte
 	var channelBindingIDs []byte
+	var knowledgeBaseIDs []byte
 	err := db.QueryRow(
 		ctx,
 		`SELECT model_config, tool_policy, backend_config, audit_policy,
-       secret_refs, channel_binding_ids
+       secret_refs, channel_binding_ids, knowledge_base_ids
 FROM platform.app_config_version
 WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 		tenantID,
@@ -362,6 +375,7 @@ WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 		&auditPolicy,
 		&secretRefs,
 		&channelBindingIDs,
+		&knowledgeBaseIDs,
 	)
 	if err != nil {
 		return tenant.AppConfig{}, resolveError("app config", err)
@@ -376,6 +390,7 @@ WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 		auditPolicy,
 		secretRefs,
 		channelBindingIDs,
+		knowledgeBaseIDs,
 	)
 }
 

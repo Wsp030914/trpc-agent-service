@@ -34,6 +34,37 @@ func TestAPIValidateAppConfigRejectsMissingChannelBinding(t *testing.T) {
 	}
 }
 
+func TestAPIValidateAppConfigRejectsUnsupportedMemoryBackend(t *testing.T) {
+	repository := &recordingRepository{}
+	cfg := testAppConfig()
+	cfg.BackendConfig.Memory = tenant.BackendRef{
+		Kind:     tenant.BackendVector,
+		Provider: "qdrant",
+		Name:     "memory",
+	}
+	if err := (admin.API{Bindings: repository}).ValidateAppConfig(context.Background(), cfg); err == nil {
+		t.Fatal("validate app config with unsupported memory backend succeeded")
+	}
+}
+
+func TestAPIValidateAppConfigRequiresArtifactCOSForKnowledgeSource(t *testing.T) {
+	cfg := testAppConfig()
+	cfg.BackendConfig.Knowledge = tenant.BackendRef{
+		Kind:     tenant.BackendVector,
+		Provider: "qdrant",
+		Name:     "shared-qdrant",
+		Options: map[string]string{
+			"embedding_model":      "text-embedding-3-small",
+			"embedding_dimensions": "1536",
+			"embedding_profile":    "text-embedding-3-small",
+			"index_generation":     "g1",
+		},
+	}
+	if err := (admin.API{Bindings: &recordingRepository{}}).ValidateAppConfig(context.Background(), cfg); err == nil {
+		t.Fatal("validate app config with Knowledge but no Artifact COS succeeded")
+	}
+}
+
 func TestAPIManagesMinimalControlPlaneWithoutPersistingRawAPIKey(t *testing.T) {
 	bindings, err := config.NewStaticBindingResolver(testBinding())
 	if err != nil {

@@ -13,6 +13,13 @@ import (
 )
 
 type authenticatedRequestContextKey struct{}
+type admittedRequestContextKey struct{}
+
+type admittedRequest struct {
+	identity AdmissionIdentity
+	message  Message
+	result   AdmissionResult
+}
 
 // AuthenticatedRequest is the request identity established by an ingress
 // authentication boundary. Tenant must be revalidated by Admission before the
@@ -137,6 +144,46 @@ func (r *QueuedRunner) Run(
 	if err := request.Validate(); err != nil {
 		return nil, err
 	}
+	if err := validateQueuedRunOptions(runOpts); err != nil {
+		return nil, err
+	}
+	command, err := queuedGatewayMessage(message)
+	if err != nil {
+		return nil, err
+	}
+	admitted, ok := ctx.Value(admittedRequestContextKey{}).(admittedRequest)
+	if !ok || admitted.message.Text != command.Text || len(admitted.message.ArtifactRefs) != len(command.ArtifactRefs) {
+		ctx, err = r.Admit(ctx, command)
+		if err != nil {
+			return nil, err
+		}
+		admitted, _ = ctx.Value(admittedRequestContextKey{}).(admittedRequest)
+	}
+	persisted, err := r.events.SubscribeExecutionEvents(
+		ctx,
+		admitted.identity.Tenant.Scope(),
+		admitted.result.RequestID,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return forwardExecutionEvents(ctx, persisted), nil
+}
+
+// Admit performs authenticated atomic admission and stores its result in the
+// returned context so a following Run does not submit the request twice.
+func (r *QueuedRunner) Admit(ctx context.Context, message Message) (context.Context, error) {
+	if r == nil || r.gateway == nil {
+		return nil, errors.New("queued runner is not initialized")
+	}
+	request, ok := AuthenticatedRequestFromContext(ctx)
+	if !ok {
+		return nil, errors.New("authenticated request is required")
+	}
+	if err := request.Validate(); err != nil {
+		return nil, err
+	}
 	identityResolver, ok := request.Tenant.(AdmissionIdentityResolver)
 	if !ok {
 		return nil, ErrAdmissionIdentityRequired
@@ -148,32 +195,16 @@ func (r *QueuedRunner) Run(
 	if err := identity.Validate(); err != nil {
 		return nil, fmt.Errorf("admission identity: %w", err)
 	}
-	if err := validateQueuedRunOptions(runOpts); err != nil {
-		return nil, err
-	}
-	command, err := queuedGatewayMessage(message)
-	if err != nil {
-		return nil, err
-	}
 	result, err := r.gateway.Handle(ctx, Request{
-		RequestID:      request.RequestID,
-		IdempotencyKey: request.IdempotencyKey,
-		Tenant:         fixedTenantResolver{identity: identity},
-		Message:        command,
+		RequestID: request.RequestID, IdempotencyKey: request.IdempotencyKey,
+		Tenant: fixedTenantResolver{identity: identity}, Message: message,
 	})
 	if err != nil {
 		return nil, err
 	}
-	persisted, err := r.events.SubscribeExecutionEvents(
-		ctx,
-		identity.Tenant.Scope(),
-		result.RequestID,
-		0,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return forwardExecutionEvents(ctx, persisted), nil
+	return context.WithValue(ctx, admittedRequestContextKey{}, admittedRequest{
+		identity: identity, message: message, result: result,
+	}), nil
 }
 
 // Close releases no resources. QueuedRunner never owns the Gateway or event

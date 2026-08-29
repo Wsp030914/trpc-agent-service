@@ -60,7 +60,7 @@ flowchart LR
 
 IM 请求先进入 Channel Adapter。Adapter 完成验签、解密和标准化后交给 Agent Gateway；Gateway 在同一事务中写入 Inbox、Execution 和 Dispatch Outbox，提交成功后 Adapter 才 ACK 外部 IM。重复投递命中已有 Inbox 时不再创建 Execution，直接 ACK。按产品启用的 HTTP/RPC 请求复用相应 tRPC-Agent-Go `server/*`，认证后调用 QueuedRunner；经验证的用户 claims 生成用户身份，仅 API Key 的请求固定使用 Credential 服务主体，payload 不能覆盖用户或会话主体。QueuedRunner 只负责入队，流式入口再订阅持久化执行事件，真实 Runner 只存在于 Worker。
 
-Gateway 的生产准入使用一个短事务：按固定顺序锁定并复核 Credential 或 Channel Binding、Tenant 和 Agent App，读取 active config version，处理请求幂等，锁定 Session lane 分配 `turn_seq`，同时创建 Execution 和 Dispatch Outbox。Execution 覆盖一条请求的最小可恢复生命周期，Runner 重试不创建第二条 Execution。配置切换、凭据撤销和租户状态更新取得相同权威行的冲突锁；权威数据后端变更只能由 `MIGRATING` 编排流程切换。事务提交是准入线性化点，Execution 中的 `config_version` 后续不变。
+Gateway 的生产准入使用一个短事务：按固定顺序锁定并复核 Credential 或 Channel Binding、Tenant 和 Agent App，读取 active config version，处理请求幂等，锁定 Session lane 分配 `turn_seq`，同时创建 Execution 和 Dispatch Outbox。Execution 覆盖一条请求的最小可恢复生命周期，Runner 重试不创建第二条 Execution。配置切换、凭据撤销和租户状态更新取得相同权威行的冲突锁；权威后端变更只由 `data_migration` 的 `DRAINING`、`COPYING`、`VERIFYING` 流程切换。事务提交是准入线性化点，Execution 中的 `config_version` 后续不变。
 
 Relay 将 PostgreSQL `dispatch_outbox` 发布到 Redis Streams，Worker 通过 Consumer Group 接收任务。执行前按配置版本加载模型、工具策略和数据后端配置，并通过 Storage Adapter 取得带租户作用域的 Session、Memory、Knowledge、Artifact 后端能力；Audit 始终写平台 SQL。Redis Session Lease 串行化同一 Session 的 Runner，PostgreSQL `run_token` 保护执行状态更新。本方案不为 Session Provider 实现旧 Worker 写入栅栏，Lease 丢失时取消 Runner 并排空事件通道；旧 Runner 的最后一次 Session 迟到写入是明确接受的残余风险。
 

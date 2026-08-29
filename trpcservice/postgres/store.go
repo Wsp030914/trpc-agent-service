@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,6 +16,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -125,6 +127,9 @@ func (s *Store) CreateAgentApp(
 	if err := config.ValidateAppConfigBindings(ctx, initial, s); err != nil {
 		return fmt.Errorf("initial app config channel bindings: %w", err)
 	}
+	if len(initial.KnowledgeBaseIDs) != 0 {
+		return errors.New("initial app config cannot bind knowledge bases before the app exists")
+	}
 	if app.TenantID != initial.TenantID || app.AppID != initial.AppID {
 		return errors.New("initial app config does not match agent app scope")
 	}
@@ -209,13 +214,16 @@ func (s *Store) InsertAppConfigVersion(ctx context.Context, cfg tenant.AppConfig
 	if err := config.ValidateAppConfigBindings(ctx, cfg, s); err != nil {
 		return fmt.Errorf("app config channel bindings: %w", err)
 	}
+	if err := s.validateKnowledgeBaseIDs(ctx, cfg); err != nil {
+		return err
+	}
 	return insertAppConfig(ctx, s.pool, cfg)
 }
 
 // ActivateAppConfig changes which immutable config version new admissions use.
-// It rejects versions whose authoritative backends (session, memory,
-// knowledge, artifact, audit) differ from the currently active version,
-// because switching them requires a MIGRATING maintenance window.
+// Session, Memory, and Artifact backend changes require a data migration.
+// Knowledge is derived: a changed generation must be fully indexed before the
+// active version can switch.
 func (s *Store) ActivateAppConfig(ctx context.Context, tenantID, appID, version string) error {
 	if err := s.validate(); err != nil {
 		return err
@@ -252,6 +260,13 @@ FOR UPDATE`,
 	if activeVersion == version {
 		return tx.Commit(ctx)
 	}
+	blocked, err := activeDataMigrationExists(ctx, tx, tenantID, appID)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		return errors.New("app config activation is blocked by data migration")
+	}
 	activeBackend, err := storedBackendConfig(ctx, tx, tenantID, appID, activeVersion)
 	if err != nil {
 		return err
@@ -262,6 +277,59 @@ FOR UPDATE`,
 	}
 	if !sameAuthoritativeBackends(activeBackend, targetBackend) {
 		return errors.New("config activation changes authoritative backends; migrate the backends before switching the active version")
+	}
+	if !sameBackendRef(activeBackend.Knowledge, targetBackend.Knowledge) && !targetBackend.Knowledge.IsZero() {
+		generation := targetBackend.Knowledge.Options["index_generation"]
+		if generation == "" {
+			return errors.New("knowledge backend index_generation is required")
+		}
+		if !activeBackend.Knowledge.IsZero() && activeBackend.Knowledge.Options["index_generation"] == generation {
+			return errors.New("knowledge backend changes require a new index_generation")
+		}
+		scope := tenant.Scope{TenantID: tenantID, AppID: appID}
+		target, err := resolveAppConfigFrom(ctx, tx, tenantID, appID, version)
+		if err != nil {
+			return err
+		}
+		buildID, buildStatus, err := ensureKnowledgeGenerationBuild(ctx, tx, scope, version, generation)
+		if err != nil {
+			return err
+		}
+		if buildStatus == platformknowledge.IndexJobFailed {
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit failed knowledge generation: %w", err)
+			}
+			return fmt.Errorf("%w for config %q", tenant.ErrKnowledgeGenerationFailed, version)
+		}
+		if _, err := enqueueKnowledgeGeneration(ctx, tx, scope, version, buildID, target.KnowledgeBaseIDs, generation); err != nil {
+			return err
+		}
+		cause, failed, err := failedKnowledgeGenerationJob(ctx, tx, buildID)
+		if err != nil {
+			return err
+		}
+		if failed {
+			if err := failKnowledgeGenerationBuild(ctx, tx, buildID, cause); err != nil {
+				return err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit failed knowledge generation: %w", err)
+			}
+			return fmt.Errorf("%w for config %q", tenant.ErrKnowledgeGenerationFailed, version)
+		}
+		ready, err := knowledgeGenerationReady(ctx, tx, scope, version, buildID, target.KnowledgeBaseIDs, generation)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit knowledge generation rebuild: %w", err)
+			}
+			return fmt.Errorf("%w for config %q", tenant.ErrKnowledgeGenerationPending, version)
+		}
+		if err := completeKnowledgeGenerationBuild(ctx, tx, buildID); err != nil {
+			return err
+		}
 	}
 	commandTag, err := tx.Exec(
 		ctx,
@@ -280,6 +348,68 @@ WHERE tenant_id = $1 AND app_id = $2`,
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit activate app config: %w", err)
+	}
+	return nil
+}
+
+// RebuildKnowledgeGeneration creates a fresh immutable build after a terminal
+// indexing failure. The target config remains inactive until ActivateAppConfig
+// observes that every source has completed the new build.
+func (s *Store) RebuildKnowledgeGeneration(ctx context.Context, tenantID, appID, version string) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if tenantID == "" || appID == "" || version == "" {
+		return errors.New("tenant_id, app_id, and config version are required")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin rebuild knowledge generation: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	var activeVersion string
+	if err := tx.QueryRow(ctx, `
+SELECT active_config_version
+FROM platform.agent_app
+WHERE tenant_id = $1 AND app_id = $2
+FOR UPDATE`, tenantID, appID).Scan(&activeVersion); err != nil {
+		return fmt.Errorf("lock agent app: %w", resolveError("agent app", err))
+	}
+	if activeVersion == version {
+		return errors.New("active config does not require a knowledge rebuild")
+	}
+	target, err := resolveAppConfigFrom(ctx, tx, tenantID, appID, version)
+	if err != nil {
+		return err
+	}
+	if target.BackendConfig.Knowledge.IsZero() {
+		return errors.New("knowledge backend is not configured")
+	}
+	generation := target.BackendConfig.Knowledge.Options["index_generation"]
+	if generation == "" {
+		return errors.New("knowledge backend index_generation is required")
+	}
+	scope := tenant.Scope{TenantID: tenantID, AppID: appID}
+	_, status, err := ensureKnowledgeGenerationBuild(ctx, tx, scope, version, generation)
+	if err != nil {
+		return err
+	}
+	if status != platformknowledge.IndexJobFailed {
+		return errors.New("knowledge generation rebuild is not failed")
+	}
+	buildID := uuid.NewString()
+	if _, err := tx.Exec(ctx, `
+UPDATE platform.knowledge_generation_build
+SET build_id = $2, status = 'PENDING', last_error = '', updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $3 AND config_version = $4 AND status = 'FAILED'`,
+		tenantID, buildID, appID, version); err != nil {
+		return fmt.Errorf("restart knowledge generation build: %w", err)
+	}
+	if _, err := enqueueKnowledgeGeneration(ctx, tx, scope, version, buildID, target.KnowledgeBaseIDs, generation); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit rebuild knowledge generation: %w", err)
 	}
 	return nil
 }
@@ -312,14 +442,14 @@ WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 func sameAuthoritativeBackends(a, b tenant.BackendConfig) bool {
 	return sameBackendRef(a.Session, b.Session) &&
 		sameBackendRef(a.Memory, b.Memory) &&
-		sameBackendRef(a.Knowledge, b.Knowledge) &&
-		sameBackendRef(a.Artifact, b.Artifact) &&
-		sameBackendRef(a.Audit, b.Audit)
+		sameBackendRef(a.Artifact, b.Artifact)
 }
 
 func sameBackendRef(a, b tenant.BackendRef) bool {
 	return a.Kind == b.Kind &&
+		a.Provider == b.Provider &&
 		a.Name == b.Name &&
+		a.SecretRef == b.SecretRef &&
 		a.DSNRef == b.DSNRef &&
 		reflect.DeepEqual(a.Options, b.Options)
 }
@@ -350,6 +480,7 @@ func (s *Store) ResolveAppConfig(
 	var auditPolicy []byte
 	var secretRefs []byte
 	var channelBindingIDs []byte
+	var knowledgeBaseIDs []byte
 	err := s.pool.QueryRow(
 		ctx,
 		`SELECT
@@ -358,7 +489,8 @@ func (s *Store) ResolveAppConfig(
     backend_config,
     audit_policy,
     secret_refs,
-    channel_binding_ids
+    channel_binding_ids,
+    knowledge_base_ids
 FROM platform.app_config_version
 WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 		tenantID,
@@ -371,6 +503,7 @@ WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 		&auditPolicy,
 		&secretRefs,
 		&channelBindingIDs,
+		&knowledgeBaseIDs,
 	)
 	if err != nil {
 		return tenant.AppConfig{}, resolveError("app config", err)
@@ -385,6 +518,7 @@ WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 		auditPolicy,
 		secretRefs,
 		channelBindingIDs,
+		knowledgeBaseIDs,
 	)
 	if err != nil {
 		return tenant.AppConfig{}, err
@@ -522,7 +656,7 @@ func insertAppConfig(ctx context.Context, db databaseExecutor, cfg tenant.AppCon
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("app config: %w", err)
 	}
-	modelConfig, toolPolicy, backendConfig, auditPolicy, secretRefs, bindings, err :=
+	modelConfig, toolPolicy, backendConfig, auditPolicy, secretRefs, bindings, knowledgeBaseIDs, err :=
 		marshalAppConfig(cfg)
 	if err != nil {
 		return err
@@ -538,8 +672,9 @@ func insertAppConfig(ctx context.Context, db databaseExecutor, cfg tenant.AppCon
     backend_config,
     audit_policy,
     secret_refs,
-    channel_binding_ids
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    channel_binding_ids,
+    knowledge_base_ids
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		cfg.TenantID,
 		cfg.AppID,
 		cfg.Version,
@@ -549,6 +684,7 @@ func insertAppConfig(ctx context.Context, db databaseExecutor, cfg tenant.AppCon
 		auditPolicy,
 		secretRefs,
 		bindings,
+		knowledgeBaseIDs,
 	); err != nil {
 		return fmt.Errorf("insert app config: %w", err)
 	}
@@ -558,6 +694,30 @@ func insertAppConfig(ctx context.Context, db databaseExecutor, cfg tenant.AppCon
 func (s *Store) validate() error {
 	if s == nil || s.pool == nil {
 		return errors.New("postgres store is not initialized")
+	}
+	return nil
+}
+
+func (s *Store) validateKnowledgeBaseIDs(ctx context.Context, cfg tenant.AppConfig) error {
+	if len(cfg.KnowledgeBaseIDs) == 0 {
+		return nil
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `
+SELECT count(*)
+FROM platform.knowledge_base
+WHERE tenant_id = $1
+  AND app_id = $2
+  AND status = 'ACTIVE'
+  AND knowledge_base_id = ANY($3)`,
+		cfg.TenantID,
+		cfg.AppID,
+		cfg.KnowledgeBaseIDs,
+	).Scan(&count); err != nil {
+		return fmt.Errorf("validate knowledge base bindings: %w", err)
+	}
+	if count != len(cfg.KnowledgeBaseIDs) {
+		return errors.New("knowledge base binding is missing or inactive")
 	}
 	return nil
 }
@@ -593,14 +753,15 @@ type backendConfigDocument struct {
 	Memory    backendRefDocument `json:"memory,omitempty"`
 	Knowledge backendRefDocument `json:"knowledge,omitempty"`
 	Artifact  backendRefDocument `json:"artifact,omitempty"`
-	Audit     backendRefDocument `json:"audit,omitempty"`
 }
 
 type backendRefDocument struct {
-	Kind    tenant.BackendKind `json:"kind,omitempty"`
-	Name    string             `json:"name,omitempty"`
-	DSNRef  string             `json:"dsn_ref,omitempty"`
-	Options map[string]string  `json:"options,omitempty"`
+	Kind      tenant.BackendKind `json:"kind,omitempty"`
+	Provider  string             `json:"provider,omitempty"`
+	Name      string             `json:"name,omitempty"`
+	SecretRef secretRefDocument  `json:"secret_ref,omitempty"`
+	DSNRef    string             `json:"dsn_ref,omitempty"`
+	Options   map[string]string  `json:"options,omitempty"`
 }
 
 type auditPolicyDocument struct {
@@ -621,6 +782,7 @@ func marshalAppConfig(cfg tenant.AppConfig) (
 	[]byte,
 	[]byte,
 	[]byte,
+	[]byte,
 	error,
 ) {
 	modelConfig, err := json.Marshal(modelConfigDocument{
@@ -630,22 +792,22 @@ func marshalAppConfig(cfg tenant.AppConfig) (
 		Parameters: cfg.Model.Parameters,
 	})
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal model config: %w", err)
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal model config: %w", err)
 	}
 	toolPolicy, err := json.Marshal(toolPolicyDocument{
 		VisibleTools:    cfg.Tools.VisibleTools,
 		ExecutableTools: cfg.Tools.ExecutableTools,
 	})
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal tool policy: %w", err)
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal tool policy: %w", err)
 	}
 	backendConfig, err := json.Marshal(newBackendConfigDocument(cfg.BackendConfig))
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal backend config: %w", err)
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal backend config: %w", err)
 	}
 	auditPolicy, err := marshalAuditPolicy(cfg.Audit)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, err
 	}
 	var secretRefDocuments []secretRefDocument
 	if cfg.SecretRefs != nil {
@@ -656,13 +818,21 @@ func marshalAppConfig(cfg tenant.AppConfig) (
 	}
 	encodedSecretRefs, err := json.Marshal(secretRefDocuments)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal secret refs: %w", err)
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal secret refs: %w", err)
 	}
 	bindings, err := json.Marshal(cfg.ChannelBinding)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal channel bindings: %w", err)
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal channel bindings: %w", err)
 	}
-	return modelConfig, toolPolicy, backendConfig, auditPolicy, encodedSecretRefs, bindings, nil
+	knowledgeBaseIDsValue := cfg.KnowledgeBaseIDs
+	if knowledgeBaseIDsValue == nil {
+		knowledgeBaseIDsValue = []string{}
+	}
+	knowledgeBaseIDs, err := json.Marshal(knowledgeBaseIDsValue)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal knowledge base ids: %w", err)
+	}
+	return modelConfig, toolPolicy, backendConfig, auditPolicy, encodedSecretRefs, bindings, knowledgeBaseIDs, nil
 }
 
 func unmarshalAppConfig(
@@ -675,6 +845,7 @@ func unmarshalAppConfig(
 	auditPolicy []byte,
 	secretRefs []byte,
 	bindings []byte,
+	knowledgeBaseIDs []byte,
 ) (tenant.AppConfig, error) {
 	var modelDocument modelConfigDocument
 	if err := json.Unmarshal(modelConfig, &modelDocument); err != nil {
@@ -700,6 +871,13 @@ func unmarshalAppConfig(
 	if err := json.Unmarshal(bindings, &channelBinding); err != nil {
 		return tenant.AppConfig{}, fmt.Errorf("unmarshal channel bindings: %w", err)
 	}
+	var knowledgeBaseIDList []string
+	if err := json.Unmarshal(knowledgeBaseIDs, &knowledgeBaseIDList); err != nil {
+		return tenant.AppConfig{}, fmt.Errorf("unmarshal knowledge base ids: %w", err)
+	}
+	if len(knowledgeBaseIDList) == 0 {
+		knowledgeBaseIDList = nil
+	}
 	var refs []tenant.SecretRef
 	if secretDocuments != nil {
 		refs = make([]tenant.SecretRef, len(secretDocuments))
@@ -721,10 +899,11 @@ func unmarshalAppConfig(
 			VisibleTools:    toolDocument.VisibleTools,
 			ExecutableTools: toolDocument.ExecutableTools,
 		},
-		BackendConfig:  backendDocument.value(),
-		Audit:          audit,
-		SecretRefs:     refs,
-		ChannelBinding: channelBinding,
+		BackendConfig:    backendDocument.value(),
+		Audit:            audit,
+		SecretRefs:       refs,
+		ChannelBinding:   channelBinding,
+		KnowledgeBaseIDs: knowledgeBaseIDList,
 	}
 	if err := cfg.Validate(); err != nil {
 		return tenant.AppConfig{}, fmt.Errorf("stored app config: %w", err)
@@ -775,16 +954,17 @@ func newBackendConfigDocument(config tenant.BackendConfig) backendConfigDocument
 		Memory:    newBackendRefDocument(config.Memory),
 		Knowledge: newBackendRefDocument(config.Knowledge),
 		Artifact:  newBackendRefDocument(config.Artifact),
-		Audit:     newBackendRefDocument(config.Audit),
 	}
 }
 
 func newBackendRefDocument(ref tenant.BackendRef) backendRefDocument {
 	return backendRefDocument{
-		Kind:    ref.Kind,
-		Name:    ref.Name,
-		DSNRef:  ref.DSNRef,
-		Options: ref.Options,
+		Kind:      ref.Kind,
+		Provider:  ref.Provider,
+		Name:      ref.Name,
+		SecretRef: newSecretRefDocument(ref.SecretRef),
+		DSNRef:    ref.DSNRef,
+		Options:   ref.Options,
 	}
 }
 
@@ -795,16 +975,17 @@ func (d backendConfigDocument) value() tenant.BackendConfig {
 		Memory:    d.Memory.value(),
 		Knowledge: d.Knowledge.value(),
 		Artifact:  d.Artifact.value(),
-		Audit:     d.Audit.value(),
 	}
 }
 
 func (d backendRefDocument) value() tenant.BackendRef {
 	return tenant.BackendRef{
-		Kind:    d.Kind,
-		Name:    d.Name,
-		DSNRef:  d.DSNRef,
-		Options: d.Options,
+		Kind:      d.Kind,
+		Provider:  d.Provider,
+		Name:      d.Name,
+		SecretRef: d.SecretRef.value(),
+		DSNRef:    d.DSNRef,
+		Options:   d.Options,
 	}
 }
 

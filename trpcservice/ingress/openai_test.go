@@ -97,6 +97,82 @@ func TestOpenAIHandlerMapsAuthenticationFailure(t *testing.T) {
 	}
 }
 
+func TestOpenAIHandlerMapsDrainingAdmission(t *testing.T) {
+	handler, admitter, source, _ := newTestOpenAIHandler(t)
+	admitter.err = gateway.ErrAdmissionDraining
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, validOpenAIRequest())
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if response.Header().Get("Retry-After") != retryAfterSeconds {
+		t.Fatalf("retry after = %q", response.Header().Get("Retry-After"))
+	}
+	if !admitter.called || source.requestID != "" {
+		t.Fatal("draining admission reached event subscription")
+	}
+}
+
+func TestOpenAIHandlerDoesNotAdmitOtherRoutes(t *testing.T) {
+	handler, admitter, _, _ := newTestOpenAIHandler(t)
+	request := validOpenAIRequest()
+	request.URL.Path = "/v1/not-found"
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+	if admitter.called {
+		t.Fatal("unknown route reached admission")
+	}
+}
+
+func TestOpenAIHandlerRejectsUnsupportedToolCallsBeforeAdmission(t *testing.T) {
+	handler, admitter, _, _ := newTestOpenAIHandler(t)
+	request := validOpenAIRequest()
+	request.Body = io.NopCloser(bytes.NewBufferString(`{
+"messages":[{"role":"user","content":"hello","tool_calls":[{"id":"call-1"}]}]
+}`))
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+	if admitter.called {
+		t.Fatal("unsupported tool call reached admission")
+	}
+}
+
+func TestOpenAIHandlerMapsAdmissionErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{name: "revoked credential", err: auth.ErrCredentialInactive, code: http.StatusForbidden},
+		{name: "idempotency conflict", err: gateway.ErrIdempotencyConflict, code: http.StatusConflict},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, admitter, _, _ := newTestOpenAIHandler(t)
+			admitter.err = tt.err
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, validOpenAIRequest())
+
+			if response.Code != tt.code {
+				t.Fatalf("response status = %d, want %d", response.Code, tt.code)
+			}
+		})
+	}
+}
+
 func TestOpenAIHandlerRejectsUnpersistablePayload(t *testing.T) {
 	handler, admitter, _, credentials := newTestOpenAIHandler(t)
 	request := validOpenAIRequest()
@@ -197,6 +273,7 @@ func (d testDirectory) ResolveAgentApp(context.Context, string, string) (tenant.
 type recordingAdmitter struct {
 	called  bool
 	request gateway.AdmissionRequest
+	err     error
 }
 
 func (a *recordingAdmitter) Admit(
@@ -205,6 +282,9 @@ func (a *recordingAdmitter) Admit(
 ) (gateway.AdmissionResult, error) {
 	a.called = true
 	a.request = request
+	if a.err != nil {
+		return gateway.AdmissionResult{}, a.err
+	}
 	return gateway.AdmissionResult{
 		RequestID:     request.RequestID,
 		ConfigVersion: "v1",

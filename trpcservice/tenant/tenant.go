@@ -9,6 +9,15 @@ import (
 	"strings"
 )
 
+var (
+	// ErrKnowledgeGenerationPending reports that a target Knowledge generation
+	// has not indexed every source document required before activation.
+	ErrKnowledgeGenerationPending = errors.New("knowledge generation rebuild is pending")
+	// ErrKnowledgeGenerationFailed reports that a target Knowledge generation
+	// needs an explicit rebuild before activation can continue.
+	ErrKnowledgeGenerationFailed = errors.New("knowledge generation rebuild failed")
+)
+
 // Status is the lifecycle state of a tenant or agent application.
 type Status string
 
@@ -80,15 +89,16 @@ func (a AgentApp) Validate() error {
 
 // AppConfig is an immutable version of tenant application configuration.
 type AppConfig struct {
-	TenantID       string        `json:"tenant_id"`
-	AppID          string        `json:"app_id"`
-	Version        string        `json:"version"`
-	Model          ModelConfig   `json:"model"`
-	Tools          ToolPolicy    `json:"tools"`
-	BackendConfig  BackendConfig `json:"backend_config"`
-	Audit          AuditPolicy   `json:"audit"`
-	SecretRefs     []SecretRef   `json:"secret_refs"`
-	ChannelBinding []string      `json:"channel_binding"`
+	TenantID         string        `json:"tenant_id"`
+	AppID            string        `json:"app_id"`
+	Version          string        `json:"version"`
+	Model            ModelConfig   `json:"model"`
+	Tools            ToolPolicy    `json:"tools"`
+	BackendConfig    BackendConfig `json:"backend_config"`
+	Audit            AuditPolicy   `json:"audit"`
+	SecretRefs       []SecretRef   `json:"secret_refs"`
+	ChannelBinding   []string      `json:"channel_binding"`
+	KnowledgeBaseIDs []string      `json:"knowledge_base_ids"`
 }
 
 // Clone returns a deep copy of caller-owned slices and maps in the config.
@@ -99,6 +109,7 @@ func (c AppConfig) Clone() AppConfig {
 	cloned.BackendConfig = c.BackendConfig.Clone()
 	cloned.SecretRefs = cloneSecretRefs(c.SecretRefs)
 	cloned.ChannelBinding = slices.Clone(c.ChannelBinding)
+	cloned.KnowledgeBaseIDs = slices.Clone(c.KnowledgeBaseIDs)
 	return cloned
 }
 
@@ -124,6 +135,9 @@ func (c AppConfig) Validate() error {
 	}
 	if err := c.BackendConfig.Validate(); err != nil {
 		return fmt.Errorf("backend_config: %w", err)
+	}
+	if err := validateUniqueStrings(c.KnowledgeBaseIDs, "knowledge base"); err != nil {
+		return err
 	}
 	if err := c.Audit.Validate(); err != nil {
 		return fmt.Errorf("audit policy: %w", err)
@@ -228,13 +242,21 @@ const (
 	BackendVector BackendKind = "vector"
 	// BackendObject stores artifacts and knowledge source objects.
 	BackendObject BackendKind = "object"
+	// BackendExternal stores data through an external managed service.
+	BackendExternal BackendKind = "external"
 )
 
 // BackendRef references one concrete backend without exposing its secret.
 type BackendRef struct {
-	Kind    BackendKind       `json:"kind"`
-	Name    string            `json:"name"`
-	DSNRef  string            `json:"dsn_ref"`
+	Kind     BackendKind `json:"kind"`
+	Provider string      `json:"provider,omitempty"`
+	Name     string      `json:"name"`
+	// SecretRef identifies credentials owned by the tenant application scope.
+	// It replaces DSNRef for new configuration versions.
+	SecretRef SecretRef `json:"secret_ref,omitempty"`
+	// DSNRef is retained only to read configuration versions published before
+	// phase two. New configuration versions must use SecretRef.
+	DSNRef  string            `json:"dsn_ref,omitempty"`
 	Options map[string]string `json:"options"`
 }
 
@@ -247,7 +269,8 @@ func (r BackendRef) Clone() BackendRef {
 
 // IsZero reports whether the backend reference is not configured.
 func (r BackendRef) IsZero() bool {
-	return r.Kind == "" && r.Name == "" && r.DSNRef == "" && len(r.Options) == 0
+	return r.Kind == "" && r.Provider == "" && r.Name == "" &&
+		r.SecretRef == (SecretRef{}) && r.DSNRef == "" && len(r.Options) == 0
 }
 
 // Validate checks that the backend reference can be resolved later.
@@ -258,6 +281,14 @@ func (r BackendRef) Validate() error {
 	}
 	if r.Name == "" {
 		return errors.New("backend name is required")
+	}
+	if r.SecretRef != (SecretRef{}) {
+		if err := r.SecretRef.Validate(); err != nil {
+			return fmt.Errorf("backend secret_ref: %w", err)
+		}
+	}
+	if r.SecretRef != (SecretRef{}) && r.DSNRef != "" {
+		return errors.New("backend secret_ref and dsn_ref cannot both be set")
 	}
 	if err := validateStringMap(r.Options, "backend option"); err != nil {
 		return err
@@ -272,7 +303,6 @@ type BackendConfig struct {
 	Memory    BackendRef `json:"memory"`
 	Knowledge BackendRef `json:"knowledge"`
 	Artifact  BackendRef `json:"artifact"`
-	Audit     BackendRef `json:"audit"`
 }
 
 // Clone returns a deep copy of backend references in the config.
@@ -283,7 +313,6 @@ func (c BackendConfig) Clone() BackendConfig {
 		Memory:    c.Memory.Clone(),
 		Knowledge: c.Knowledge.Clone(),
 		Artifact:  c.Artifact.Clone(),
-		Audit:     c.Audit.Clone(),
 	}
 }
 
@@ -303,9 +332,6 @@ func (c BackendConfig) Validate() error {
 		return err
 	}
 	if err := validateOptionalBackendRef("artifact backend", c.Artifact); err != nil {
-		return err
-	}
-	if err := validateOptionalBackendRef("audit backend", c.Audit); err != nil {
 		return err
 	}
 	return nil
@@ -449,7 +475,7 @@ func validStatus(status Status) bool {
 
 func validBackendKind(kind BackendKind) bool {
 	switch kind {
-	case BackendInMemory, BackendSQL, BackendRedis, BackendVector, BackendObject:
+	case BackendInMemory, BackendSQL, BackendRedis, BackendVector, BackendObject, BackendExternal:
 		return true
 	default:
 		return false

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -11,46 +12,70 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
+	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
+	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/ingress"
+	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
+	knowledgecos "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/cos"
+	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
+	memorytencentdb "github.com/liuzengh/trpc-agent-service/trpcservice/memory/tencentdb"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
+	migrationredispostgres "github.com/liuzengh/trpc-agent-service/trpcservice/migration/redispostgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	platformredis "github.com/liuzengh/trpc-agent-service/trpcservice/redis"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/relay"
 	platformruntime "github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/secret"
+	platformsession "github.com/liuzengh/trpc-agent-service/trpcservice/session"
 	sessionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/session/postgres"
+	sessionredis "github.com/liuzengh/trpc-agent-service/trpcservice/session/redis"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/chunking"
+	frameworkdocument "trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 )
 
 const (
-	envRole            = "TRPC_AGENT_SERVICE_ROLE"
-	envPostgresDSN     = "TRPC_AGENT_SERVICE_POSTGRES_DSN"
-	envRedisURL        = "TRPC_AGENT_SERVICE_REDIS_URL"
-	envRedisStream     = "TRPC_AGENT_SERVICE_REDIS_STREAM"
-	envRedisGroup      = "TRPC_AGENT_SERVICE_REDIS_GROUP"
-	envDispatcherID    = "TRPC_AGENT_SERVICE_DISPATCHER_ID"
-	envHealthAddr      = "TRPC_AGENT_SERVICE_HEALTH_ADDR"
-	envWorkerID        = "TRPC_AGENT_SERVICE_WORKER_ID"
-	envAdminToken      = "TRPC_AGENT_SERVICE_ADMIN_TOKEN"
-	envShutdownTimeout = "TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT"
+	envRole              = "TRPC_AGENT_SERVICE_ROLE"
+	envPostgresDSN       = "TRPC_AGENT_SERVICE_POSTGRES_DSN"
+	envRedisURL          = "TRPC_AGENT_SERVICE_REDIS_URL"
+	envRedisStream       = "TRPC_AGENT_SERVICE_REDIS_STREAM"
+	envRedisGroup        = "TRPC_AGENT_SERVICE_REDIS_GROUP"
+	envDispatcherID      = "TRPC_AGENT_SERVICE_DISPATCHER_ID"
+	envHealthAddr        = "TRPC_AGENT_SERVICE_HEALTH_ADDR"
+	envWorkerID          = "TRPC_AGENT_SERVICE_WORKER_ID"
+	envAdminToken        = "TRPC_AGENT_SERVICE_ADMIN_TOKEN"
+	envTencentDBGateways = "TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS"
+	envShutdownTimeout   = "TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT"
+	envCOSEndpoints      = "TRPC_AGENT_SERVICE_COS_ENDPOINTS"
+	envQdrantEndpoints   = "TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS"
 
 	defaultHealthAddr      = ":8080"
 	defaultRedisStream     = "trpc-agent-service:dispatch"
 	defaultRedisGroup      = "workers"
 	healthCheckTimeout     = 2 * time.Second
 	defaultShutdownTimeout = 30 * time.Second
+	dataMigrationLease     = 30 * time.Second
+	dataMigrationPoll      = time.Second
+	artifactCleanupLease   = 30 * time.Second
+	artifactCleanupRetry   = time.Minute
+	knowledgeIndexLease    = 30 * time.Second
+	knowledgeIndexRetry    = time.Minute
+	knowledgeIndexAttempts = 5
 )
 
 var errWorkerShutdownTimeout = errors.New("worker did not stop before shutdown deadline")
@@ -223,7 +248,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		}
 	}
 	if config.Role.runsWorker() {
-		runtime, err = newWorkerRuntime(store, config.PostgresDSN, redisClient, stream, config.WorkerID, os.Getenv)
+		runtime, err = newWorkerRuntime(store, config.PostgresDSN, config.RedisURL, redisClient, stream, config.WorkerID, os.Getenv)
 		if err != nil {
 			return err
 		}
@@ -313,6 +338,10 @@ func runWorkerUntilShutdown(
 	go func() {
 		done <- runtime.consumer.Run(runCtx)
 	}()
+	migrationDone := make(chan error, 1)
+	go func() {
+		migrationDone <- runtime.runDataMigrations(runCtx)
+	}()
 
 	select {
 	case err := <-relayDone:
@@ -322,7 +351,22 @@ func runWorkerUntilShutdown(
 		return err
 	case err := <-done:
 		state.ready.Store(false)
-		return err
+		cancelRun()
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancelShutdown()
+		migrationErr, stopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
+		return dataMigrationShutdownResult(err, migrationErr, stopped)
+	case err := <-migrationDone:
+		if err == nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
+		state.ready.Store(false)
+		runtime.consumer.StopClaiming()
+		cancelRun()
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancelShutdown()
+		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
+		return workerShutdownResult(err, workerErr, stopped)
 	case <-health.done:
 		state.ready.Store(false)
 		runtime.consumer.StopClaiming()
@@ -330,7 +374,8 @@ func runWorkerUntilShutdown(
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancelShutdown()
 		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
-		return workerShutdownResult(health.wait(), workerErr, stopped)
+		migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
+		return dataMigrationShutdownResult(workerShutdownResult(health.wait(), workerErr, stopped), migrationErr, migrationStopped)
 	case <-ctx.Done():
 		state.ready.Store(false)
 		runtime.consumer.StopClaiming()
@@ -343,7 +388,8 @@ func runWorkerUntilShutdown(
 		cancelRun()
 	}
 	workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
-	return workerShutdownResult(healthErr, workerErr, stopped)
+	migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
+	return dataMigrationShutdownResult(workerShutdownResult(healthErr, workerErr, stopped), migrationErr, migrationStopped)
 }
 
 func awaitWorkerExit(ctx context.Context, done <-chan error, cancel context.CancelFunc) (error, bool) {
@@ -361,6 +407,20 @@ func awaitWorkerExit(ctx context.Context, done <-chan error, cancel context.Canc
 	}
 }
 
+func awaitDataMigrationExit(ctx context.Context, done <-chan error) (error, bool) {
+	select {
+	case err := <-done:
+		return err, true
+	case <-ctx.Done():
+		select {
+		case err := <-done:
+			return err, true
+		default:
+			return ctx.Err(), false
+		}
+	}
+}
+
 func workerShutdownResult(healthErr, workerErr error, stopped bool) error {
 	if !stopped {
 		return errors.Join(healthErr, fmt.Errorf("%w: %v", errWorkerShutdownTimeout, workerErr))
@@ -368,15 +428,39 @@ func workerShutdownResult(healthErr, workerErr error, stopped bool) error {
 	return errors.Join(healthErr, workerErr)
 }
 
+func dataMigrationShutdownResult(baseErr, migrationErr error, stopped bool) error {
+	if !stopped {
+		return errors.Join(baseErr, fmt.Errorf("%w: data migration worker: %v", errWorkerShutdownTimeout, migrationErr))
+	}
+	if errors.Is(migrationErr, context.Canceled) {
+		return baseErr
+	}
+	return errors.Join(baseErr, migrationErr)
+}
+
 type workerRuntime struct {
-	consumer *worker.Consumer
-	runners  *platformruntime.RuntimeRunnerResolver
-	sessions *sessionpostgres.SessionResolver
+	consumer         *worker.Consumer
+	runners          *platformruntime.RuntimeRunnerResolver
+	sessions         *platformsession.Router
+	postgresSessions *sessionpostgres.SessionResolver
+	redisSessions    *sessionredis.SessionResolver
+	memories         *memorytencentdb.Resolver
+	artifacts        *artifactcos.Resolver
+	knowledgeSources *knowledgecos.Resolver
+	knowledge        *knowledgeqdrant.Resolver
+	artifactServices artifactCleanupExecutor
+	store            *postgres.Store
+	owner            string
+}
+
+type artifactCleanupExecutor interface {
+	DeleteCleanup(context.Context, worker.Execution, platformartifact.CleanupRecord) error
 }
 
 func newWorkerRuntime(
 	store *postgres.Store,
 	defaultSessionDSN string,
+	defaultRedisURL string,
 	redisClient *platformredis.Client,
 	stream *platformredis.Stream,
 	owner string,
@@ -401,27 +485,110 @@ func newWorkerRuntime(
 	if err != nil {
 		return nil, err
 	}
-	runners, err := platformruntime.NewRuntimeRunnerResolver(models, sessions)
+	redisSessions, err := sessionredis.NewSessionResolver(sessionURLResolver{
+		defaultURL: defaultRedisURL,
+		secrets:    secrets,
+	})
 	if err != nil {
 		_ = sessions.Close()
+		return nil, err
+	}
+	sessionRouter, err := platformsession.NewRouter(map[string]platformsession.Resolver{
+		"postgres": sessions,
+		"redis":    redisSessions,
+	})
+	if err != nil {
+		_ = redisSessions.Close()
+		_ = sessions.Close()
+		return nil, err
+	}
+	memories, err := memorytencentdb.NewResolver(
+		secrets,
+		environmentTencentDBGatewayResolver{getenv: getenv},
+	)
+	if err != nil {
+		_ = sessionRouter.Close()
+		return nil, err
+	}
+	artifacts, err := artifactcos.NewResolver(secrets, environmentCOSEndpointResolver{getenv: getenv})
+	if err != nil {
+		_ = memories.Close()
+		_ = sessionRouter.Close()
+		return nil, err
+	}
+	artifactServices, err := platformartifact.NewExecutionResolver(artifacts, store)
+	if err != nil {
+		_ = artifacts.Close()
+		_ = memories.Close()
+		_ = sessionRouter.Close()
+		return nil, err
+	}
+	knowledgeSources, err := knowledgecos.NewResolver(
+		secrets,
+		environmentCOSEndpointResolver{getenv: getenv},
+	)
+	if err != nil {
+		_ = artifacts.Close()
+		_ = memories.Close()
+		_ = sessionRouter.Close()
+		return nil, err
+	}
+	knowledge, err := knowledgeqdrant.NewResolver(
+		secrets,
+		environmentQdrantEndpointResolver{getenv: getenv},
+		store,
+		defaultEndpointPolicy{},
+	)
+	if err != nil {
+		_ = knowledgeSources.Close()
+		_ = artifacts.Close()
+		_ = memories.Close()
+		_ = sessionRouter.Close()
+		return nil, err
+	}
+	runners, err := platformruntime.NewRuntimeRunnerResolver(
+		models,
+		sessionRouter,
+		platformruntime.WithSessionIngestorResolver(memories),
+		platformruntime.WithArtifactResolver(artifactServices),
+		platformruntime.WithKnowledgeResolver(knowledge),
+	)
+	if err != nil {
+		_ = knowledge.Close()
+		_ = knowledgeSources.Close()
+		_ = artifacts.Close()
+		_ = memories.Close()
+		_ = sessionRouter.Close()
 		return nil, err
 	}
 	locker, err := platformredis.NewSessionLocker(redisClient, 30*time.Second)
 	if err != nil {
 		_ = runners.Close()
-		_ = sessions.Close()
+		_ = knowledge.Close()
+		_ = knowledgeSources.Close()
+		_ = artifacts.Close()
+		_ = memories.Close()
+		_ = sessionRouter.Close()
 		return nil, err
 	}
 	events, err := postgres.NewExecutionEventJournal(store)
 	if err != nil {
 		_ = runners.Close()
-		_ = sessions.Close()
+		_ = knowledge.Close()
+		_ = knowledgeSources.Close()
+		_ = artifacts.Close()
+		_ = memories.Close()
+		_ = sessionRouter.Close()
 		return nil, err
 	}
 	audit, err := postgres.NewAuditStore(store)
 	if err != nil {
 		_ = runners.Close()
-		_ = sessions.Close()
+		_ = knowledge.Close()
+		_ = knowledgeSources.Close()
+		_ = artifacts.Close()
+		_ = memories.Close()
+		_ = sessionRouter.Close()
 		return nil, err
 	}
 	executor := worker.New(
@@ -435,21 +602,539 @@ func newWorkerRuntime(
 	consumer, err := worker.NewConsumer(executor, stream, store, owner)
 	if err != nil {
 		_ = runners.Close()
-		_ = sessions.Close()
+		_ = knowledge.Close()
+		_ = knowledgeSources.Close()
+		_ = artifacts.Close()
+		_ = memories.Close()
+		_ = sessionRouter.Close()
 		return nil, err
 	}
-	return &workerRuntime{consumer: consumer, runners: runners, sessions: sessions}, nil
+	return &workerRuntime{
+		consumer:         consumer,
+		runners:          runners,
+		sessions:         sessionRouter,
+		postgresSessions: sessions,
+		redisSessions:    redisSessions,
+		memories:         memories,
+		artifacts:        artifacts,
+		knowledgeSources: knowledgeSources,
+		knowledge:        knowledge,
+		artifactServices: artifactServices,
+		store:            store,
+		owner:            owner,
+	}, nil
 }
 
 func (r *workerRuntime) close() error {
 	if r == nil {
 		return nil
 	}
-	return errors.Join(r.runners.Close(), r.sessions.Close())
+	return errors.Join(r.runners.Close(), r.sessions.Close(), r.memories.Close(), r.artifacts.Close(), r.knowledgeSources.Close(), r.knowledge.Close())
+}
+
+func (r *workerRuntime) runDataMigrations(ctx context.Context) error {
+	if r == nil || r.store == nil || r.sessions == nil || r.postgresSessions == nil || r.redisSessions == nil || r.artifactServices == nil || r.knowledgeSources == nil || r.knowledge == nil || r.owner == "" {
+		return errors.New("data migration worker runtime is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(dataMigrationPoll)
+	defer ticker.Stop()
+	for {
+		if err := r.runDataMigrationPass(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("data migration worker pass failed: %v", err)
+		}
+		if err := r.runArtifactCleanupPass(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("artifact cleanup worker pass failed: %v", err)
+		}
+		if err := r.runKnowledgeIndexPass(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("knowledge index worker pass failed: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (r *workerRuntime) runDataMigrationPass(ctx context.Context) error {
+	records, err := r.store.ListOwnedDataMigrations(ctx, r.owner)
+	if err != nil {
+		return fmt.Errorf("list owned data migrations: %w", err)
+	}
+	for _, record := range records {
+		if err := r.runDataMigration(ctx, record); err != nil {
+			return err
+		}
+	}
+	record, found, err := r.store.ClaimNextDataMigration(ctx, r.owner, dataMigrationLease)
+	if err != nil {
+		return fmt.Errorf("claim expired data migration: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	return r.runDataMigration(ctx, record)
+}
+
+func (r *workerRuntime) runDataMigration(ctx context.Context, record migration.Record) error {
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	leaseDone := make(chan error, 1)
+	go r.renewDataMigrationLease(runCtx, cancel, record, leaseDone)
+
+	copier, err := migrationredispostgres.NewCopier(
+		runCtx,
+		r.store,
+		storage.StaticResolver{},
+		r.sessions,
+		r.postgresSessions,
+		r.redisSessions,
+		record,
+	)
+	if err == nil {
+		defer copier.Close()
+		err = (migration.Executor{
+			Catalog:    r.store,
+			Repository: r.store,
+			Copier:     copier,
+		}).Run(runCtx, record)
+	}
+	cancel()
+	leaseErr := <-leaseDone
+	if errors.Is(err, migration.ErrLeaseLost) || errors.Is(leaseErr, migration.ErrLeaseLost) {
+		return nil
+	}
+	if leaseErr != nil {
+		return fmt.Errorf("renew data migration lease: %w", leaseErr)
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return ctx.Err()
+	}
+	if errors.Is(err, migration.ErrDrainIncomplete) || err == nil {
+		return nil
+	}
+	if copier == nil {
+		return r.failDataMigration(ctx, record, fmt.Errorf("create Redis to PostgreSQL copier: %w", err))
+	}
+	// Executor persists copy and verification failures as FAILED. Keep this
+	// worker available for unrelated Sessions and migrations.
+	log.Printf("data migration %s failed: %v", record.ID, err)
+	return nil
+}
+
+func (r *workerRuntime) renewDataMigrationLease(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	record migration.Record,
+	done chan<- error,
+) {
+	defer close(done)
+	ticker := time.NewTicker(dataMigrationLease / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			updated, err := r.store.RenewDataMigration(ctx, record, dataMigrationLease)
+			if err != nil {
+				if ctx.Err() == nil {
+					done <- err
+					cancel()
+				}
+				return
+			}
+			record = updated
+		}
+	}
+}
+
+func (r *workerRuntime) failDataMigration(ctx context.Context, record migration.Record, cause error) error {
+	if err := r.store.UpdateDataMigrationReport(
+		context.WithoutCancel(ctx), record, record.Progress, record.Validation, cause.Error(),
+	); err != nil {
+		if errors.Is(err, migration.ErrLeaseLost) {
+			return nil
+		}
+		return fmt.Errorf("record failed data migration: %w", err)
+	}
+	if err := r.store.AdvanceDataMigration(context.WithoutCancel(ctx), record, migration.StatusFailed); err != nil {
+		if errors.Is(err, migration.ErrLeaseLost) {
+			return nil
+		}
+		return fmt.Errorf("fail data migration: %w", err)
+	}
+	log.Printf("data migration %s failed: %v", record.ID, cause)
+	return nil
+}
+
+func (r *workerRuntime) runArtifactCleanupPass(ctx context.Context) error {
+	record, found, err := r.store.ClaimNextArtifactCleanup(ctx, r.owner, artifactCleanupLease)
+	if err != nil {
+		return fmt.Errorf("claim artifact cleanup: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	config, err := r.store.ResolveAppConfig(ctx, record.TenantID, record.AppID, record.ConfigVersion)
+	if err == nil {
+		var exec worker.Execution
+		exec, err = artifactCleanupExecution(ctx, record, config)
+		if err == nil {
+			err = r.artifactServices.DeleteCleanup(ctx, exec, record)
+		}
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if retryErr := r.store.RetryArtifactCleanup(context.WithoutCancel(ctx), record, artifactCleanupRetry, err); retryErr != nil {
+			if errors.Is(retryErr, platformartifact.ErrCleanupLeaseLost) {
+				return nil
+			}
+			return fmt.Errorf("retry artifact cleanup: %w", retryErr)
+		}
+		return nil
+	}
+	if err := r.store.CompleteArtifactCleanup(ctx, record); err != nil {
+		if errors.Is(err, platformartifact.ErrCleanupLeaseLost) {
+			return nil
+		}
+		return fmt.Errorf("complete artifact cleanup: %w", err)
+	}
+	return nil
+}
+
+func (r *workerRuntime) runKnowledgeIndexPass(ctx context.Context) error {
+	job, found, err := r.store.ClaimNextKnowledgeIndex(ctx, r.owner, knowledgeIndexLease)
+	if err != nil {
+		return fmt.Errorf("claim knowledge index: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	return r.runKnowledgeIndex(ctx, job)
+}
+
+func (r *workerRuntime) runKnowledgeIndex(ctx context.Context, job platformknowledge.IndexJob) error {
+	if err := job.Validate(); err != nil {
+		return err
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	leaseDone := make(chan error, 1)
+	go r.renewKnowledgeIndexLease(runCtx, cancel, job, leaseDone)
+
+	err := r.indexKnowledgeSource(runCtx, job)
+	cancel()
+	leaseErr := <-leaseDone
+	if errors.Is(err, platformknowledge.ErrIndexLeaseLost) || errors.Is(leaseErr, platformknowledge.ErrIndexLeaseLost) {
+		return nil
+	}
+	if leaseErr != nil {
+		return fmt.Errorf("renew knowledge index lease: %w", leaseErr)
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return ctx.Err()
+	}
+	if err != nil {
+		if job.Attempt >= knowledgeIndexAttempts {
+			if failErr := r.store.FailKnowledgeIndex(context.WithoutCancel(ctx), job, err); failErr != nil {
+				if errors.Is(failErr, platformknowledge.ErrIndexLeaseLost) {
+					return nil
+				}
+				return fmt.Errorf("fail knowledge index: %w", failErr)
+			}
+			return nil
+		}
+		if retryErr := r.store.RetryKnowledgeIndex(context.WithoutCancel(ctx), job, knowledgeIndexRetry, err); retryErr != nil {
+			if errors.Is(retryErr, platformknowledge.ErrIndexLeaseLost) {
+				return nil
+			}
+			return fmt.Errorf("retry knowledge index: %w", retryErr)
+		}
+		return nil
+	}
+	if err := r.store.CompleteKnowledgeIndex(ctx, job); err != nil {
+		if errors.Is(err, platformknowledge.ErrIndexLeaseLost) {
+			return nil
+		}
+		return fmt.Errorf("complete knowledge index: %w", err)
+	}
+	return nil
+}
+
+func (r *workerRuntime) renewKnowledgeIndexLease(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	job platformknowledge.IndexJob,
+	done chan<- error,
+) {
+	defer close(done)
+	ticker := time.NewTicker(knowledgeIndexLease / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.store.RenewKnowledgeIndex(ctx, job, knowledgeIndexLease); err != nil {
+				if ctx.Err() == nil {
+					done <- err
+					cancel()
+				}
+				return
+			}
+		}
+	}
+}
+
+func (r *workerRuntime) indexKnowledgeSource(ctx context.Context, job platformknowledge.IndexJob) error {
+	config, err := r.store.ResolveAppConfig(ctx, job.Document.Scope.TenantID, job.Document.Scope.AppID, job.ConfigVersion)
+	if err != nil {
+		return fmt.Errorf("resolve knowledge index config: %w", err)
+	}
+	exec, err := knowledgeIndexExecution(ctx, job, config)
+	if err != nil {
+		return err
+	}
+	content, err := r.knowledgeSources.GetSource(ctx, exec, job.Document)
+	if err != nil {
+		return err
+	}
+	vectorDocuments, chunks, err := knowledgeSourceChunks(job, content)
+	if err != nil {
+		return err
+	}
+	for _, chunk := range chunks {
+		if err := r.store.CreateKnowledgeChunk(ctx, chunk); err != nil {
+			return err
+		}
+	}
+	if err := r.knowledge.Index(ctx, exec, vectorDocuments); err != nil {
+		return err
+	}
+	for _, chunk := range chunks {
+		if err := r.store.MarkKnowledgeChunkAvailable(ctx, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func knowledgeIndexExecution(
+	ctx context.Context,
+	job platformknowledge.IndexJob,
+	config tenant.AppConfig,
+) (worker.Execution, error) {
+	if err := job.Validate(); err != nil {
+		return worker.Execution{}, err
+	}
+	if config.TenantID != job.Document.Scope.TenantID || config.AppID != job.Document.Scope.AppID || config.Version != job.ConfigVersion {
+		return worker.Execution{}, errors.New("knowledge index config does not match job")
+	}
+	runtime := tenant.RuntimeContext{
+		TenantID:           job.Document.Scope.TenantID,
+		AppID:              job.Document.Scope.AppID,
+		ConfigVersion:      job.ConfigVersion,
+		SessionPrincipalID: "knowledge-index",
+		SessionID:          job.ID,
+		UserID:             "knowledge-index",
+		TraceID:            job.ID,
+	}
+	handles, err := (storage.StaticResolver{}).Resolve(ctx, runtime, config.BackendConfig)
+	if err != nil {
+		return worker.Execution{}, err
+	}
+	return worker.Execution{Tenant: runtime, Config: config, Storage: handles}, nil
+}
+
+func knowledgeSourceChunks(
+	job platformknowledge.IndexJob,
+	content []byte,
+) ([]*frameworkdocument.Document, []platformknowledge.Chunk, error) {
+	if err := job.Validate(); err != nil {
+		return nil, nil, err
+	}
+	if !utf8.Valid(content) {
+		return nil, nil, errors.New("knowledge source must be valid utf-8 text")
+	}
+	chunker := chunking.NewFixedSizeChunking(
+		chunking.WithChunkSize(1000),
+		chunking.WithOverlap(100),
+	)
+	parts, err := chunker.Chunk(&frameworkdocument.Document{ID: job.Document.ID, Content: string(content)})
+	if err != nil {
+		return nil, nil, fmt.Errorf("chunk knowledge source: %w", err)
+	}
+	vectorDocuments := make([]*frameworkdocument.Document, 0, len(parts))
+	chunks := make([]platformknowledge.Chunk, 0, len(parts))
+	for index, part := range parts {
+		chunkID := strconv.Itoa(index + 1)
+		key, err := job.Document.Scope.Key(
+			"knowledge-chunk",
+			job.Document.KnowledgeBaseID,
+			job.Document.ID,
+			strconv.Itoa(job.Document.Version),
+			job.Document.IndexGeneration,
+			chunkID,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		vectorDocuments = append(vectorDocuments, &frameworkdocument.Document{
+			ID:      key,
+			Content: part.Content,
+			Metadata: map[string]any{
+				platformknowledge.MetadataTenantID:        job.Document.Scope.TenantID,
+				platformknowledge.MetadataAppID:           job.Document.Scope.AppID,
+				platformknowledge.MetadataKnowledgeBaseID: job.Document.KnowledgeBaseID,
+				platformknowledge.MetadataDocumentID:      job.Document.ID,
+				platformknowledge.MetadataDocumentVersion: strconv.Itoa(job.Document.Version),
+				platformknowledge.MetadataChunkID:         chunkID,
+				platformknowledge.MetadataIndexGeneration: job.Document.IndexGeneration,
+			},
+		})
+		chunks = append(chunks, platformknowledge.Chunk{
+			Document: job.Document,
+			ChunkID:  chunkID,
+			Status:   platformknowledge.ChunkStatusPending,
+		})
+	}
+	if len(vectorDocuments) == 0 {
+		return nil, nil, errors.New("knowledge source produced no chunks")
+	}
+	return vectorDocuments, chunks, nil
+}
+
+func artifactCleanupExecution(
+	ctx context.Context,
+	record platformartifact.CleanupRecord,
+	config tenant.AppConfig,
+) (worker.Execution, error) {
+	if err := record.Validate(); err != nil {
+		return worker.Execution{}, err
+	}
+	if config.TenantID != record.TenantID || config.AppID != record.AppID || config.Version != record.ConfigVersion {
+		return worker.Execution{}, errors.New("artifact cleanup config does not match record")
+	}
+	runtime := tenant.RuntimeContext{
+		TenantID:           record.TenantID,
+		AppID:              record.AppID,
+		ConfigVersion:      record.ConfigVersion,
+		SessionPrincipalID: record.SessionPrincipalID,
+		SessionID:          record.SessionID,
+		UserID:             record.SessionPrincipalID,
+		TraceID:            record.ID,
+	}
+	handles, err := (storage.StaticResolver{}).Resolve(ctx, runtime, config.BackendConfig)
+	if err != nil {
+		return worker.Execution{}, err
+	}
+	return worker.Execution{Tenant: runtime, Config: config, Storage: handles}, nil
 }
 
 type environmentSecretProvider struct {
 	getenv func(string) string
+}
+
+type environmentCOSEndpointResolver struct {
+	getenv func(string) string
+}
+
+type environmentQdrantEndpointResolver struct {
+	getenv func(string) string
+}
+
+type environmentTencentDBGatewayResolver struct {
+	getenv func(string) string
+}
+
+func (r environmentTencentDBGatewayResolver) ResolveTencentDBGateway(
+	ctx context.Context,
+	backendName string,
+) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if backendName == "" {
+		return "", errors.New("tencentdb memory backend name is required")
+	}
+	if r.getenv == nil {
+		return "", errors.New("environment reader is required")
+	}
+	var gateways map[string]string
+	if err := json.Unmarshal([]byte(r.getenv(envTencentDBGateways)), &gateways); err != nil {
+		return "", fmt.Errorf("decode %s: %w", envTencentDBGateways, err)
+	}
+	gatewayURL := strings.TrimSpace(gateways[backendName])
+	if gatewayURL == "" {
+		return "", fmt.Errorf("tencentdb memory gateway is not configured for backend %q", backendName)
+	}
+	return gatewayURL, nil
+}
+
+func (r environmentQdrantEndpointResolver) ResolveQdrantEndpoint(
+	ctx context.Context,
+	backendName string,
+) (knowledgeqdrant.Endpoint, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return knowledgeqdrant.Endpoint{}, err
+	}
+	if backendName == "" {
+		return knowledgeqdrant.Endpoint{}, errors.New("qdrant backend name is required")
+	}
+	if r.getenv == nil {
+		return knowledgeqdrant.Endpoint{}, errors.New("environment reader is required")
+	}
+	var endpoints map[string]knowledgeqdrant.Endpoint
+	if err := json.Unmarshal([]byte(r.getenv(envQdrantEndpoints)), &endpoints); err != nil {
+		return knowledgeqdrant.Endpoint{}, fmt.Errorf("decode %s: %w", envQdrantEndpoints, err)
+	}
+	endpoint, ok := endpoints[backendName]
+	if !ok {
+		return knowledgeqdrant.Endpoint{}, fmt.Errorf("qdrant endpoint is not configured for backend %q", backendName)
+	}
+	return endpoint, nil
+}
+
+func (r environmentCOSEndpointResolver) ResolveCOSEndpoint(
+	ctx context.Context,
+	backendName string,
+) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if backendName == "" {
+		return "", errors.New("cos backend name is required")
+	}
+	if r.getenv == nil {
+		return "", errors.New("environment reader is required")
+	}
+	var endpoints map[string]string
+	if err := json.Unmarshal([]byte(r.getenv(envCOSEndpoints)), &endpoints); err != nil {
+		return "", fmt.Errorf("decode %s: %w", envCOSEndpoints, err)
+	}
+	endpoint := endpoints[backendName]
+	if endpoint == "" {
+		return "", fmt.Errorf("cos endpoint is not configured for backend %q", backendName)
+	}
+	return endpoint, nil
 }
 
 func (p environmentSecretProvider) ResolveSecret(
@@ -493,6 +1178,25 @@ func scopedSecretEnvironmentKey(scope tenant.Scope, ref tenant.SecretRef) string
 type sessionDSNResolver struct {
 	defaultDSN string
 	secrets    environmentSecretProvider
+}
+
+type sessionURLResolver struct {
+	defaultURL string
+	secrets    environmentSecretProvider
+}
+
+func (r sessionURLResolver) ResolveSessionURL(ctx context.Context, handle storage.Handle) (string, error) {
+	secretRef := handle.Ref.SecretRef
+	if secretRef == (tenant.SecretRef{}) && handle.Ref.DSNRef != "" {
+		secretRef = tenant.SecretRef{Name: handle.Ref.DSNRef}
+	}
+	if secretRef == (tenant.SecretRef{}) {
+		if r.defaultURL == "" {
+			return "", errors.New("session backend secret_ref is required")
+		}
+		return r.defaultURL, nil
+	}
+	return r.secrets.ResolveSecret(ctx, handle.Scope, secretRef)
 }
 
 // defaultEndpointPolicy is the production model endpoint policy: it allows
@@ -539,13 +1243,17 @@ func (r sessionDSNResolver) ResolveSessionDSN(
 	ctx context.Context,
 	handle storage.Handle,
 ) (string, error) {
-	if handle.Ref.DSNRef == "" {
+	secretRef := handle.Ref.SecretRef
+	if secretRef == (tenant.SecretRef{}) && handle.Ref.DSNRef != "" {
+		secretRef = tenant.SecretRef{Name: handle.Ref.DSNRef}
+	}
+	if secretRef == (tenant.SecretRef{}) {
 		if r.defaultDSN == "" {
-			return "", errors.New("session backend dsn_ref is required")
+			return "", errors.New("session backend secret_ref is required")
 		}
 		return r.defaultDSN, nil
 	}
-	return r.secrets.ResolveSecret(ctx, handle.Scope, tenant.SecretRef{Name: handle.Ref.DSNRef})
+	return r.secrets.ResolveSecret(ctx, handle.Scope, secretRef)
 }
 
 type healthState struct {

@@ -41,6 +41,12 @@ type RunnerResolver interface {
 	ResolveRunner(ctx context.Context, exec Execution) (runner.Runner, error)
 }
 
+// RunnerReleaser releases a Runner returned for one execution. Resolvers that
+// cache runners may omit this interface.
+type RunnerReleaser interface {
+	ReleaseRunner(runner.Runner) error
+}
+
 // SessionLock owns an acquired session partition lock. Context is canceled
 // when the authoritative backend can no longer guarantee that the lock is
 // held. Release must be called after the runner event channel is drained.
@@ -266,6 +272,11 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	if r == nil {
 		return result, errors.New("runner is required")
 	}
+	defer func() {
+		if releaseErr := releaseRunner(w.Runner, r); releaseErr != nil {
+			w.logExecution(context.WithoutCancel(runCtx), exec, "runner release failed")
+		}
+	}()
 	startedAt := time.Now()
 	if err := w.recordAudit(runCtx, exec, AuditEvent{Type: AuditEventExecutionStarted}); err != nil {
 		return result, err
@@ -343,6 +354,14 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		return result, runnerErr
 	}
 	return result, nil
+}
+
+func releaseRunner(resolver RunnerResolver, resolved runner.Runner) error {
+	releaser, ok := resolver.(RunnerReleaser)
+	if !ok {
+		return nil
+	}
+	return releaser.ReleaseRunner(resolved)
 }
 
 func cancelManagedRunnerOnContextDone(

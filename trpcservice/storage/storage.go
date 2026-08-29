@@ -26,8 +26,6 @@ const (
 	CapabilityKnowledge Capability = "knowledge"
 	// CapabilityArtifact stores generated or uploaded artifacts.
 	CapabilityArtifact Capability = "artifact"
-	// CapabilityAudit stores tenant audit logs.
-	CapabilityAudit Capability = "audit"
 )
 
 // Handle is a tenant-scoped reference to one configured backend.
@@ -79,7 +77,6 @@ type Handles struct {
 	Memory            Handle
 	Knowledge         Handle
 	Artifact          Handle
-	Audit             Handle
 }
 
 // Validate checks that handles match the runtime context and backend_config.
@@ -107,9 +104,6 @@ func (h Handles) Validate(tc tenant.RuntimeContext, backend tenant.BackendConfig
 		return err
 	}
 	if err := h.Artifact.Validate(scope, CapabilityArtifact, backend.Artifact); err != nil {
-		return err
-	}
-	if err := h.Audit.Validate(scope, CapabilityAudit, backend.Audit); err != nil {
 		return err
 	}
 	return nil
@@ -166,11 +160,6 @@ func (r StaticResolver) Resolve(
 	if err != nil {
 		return Handles{}, err
 	}
-	audit, err := r.resolveOptionalHandle(scope, CapabilityAudit, backend.Audit)
-	if err != nil {
-		return Handles{}, err
-	}
-
 	return Handles{
 		Scope:             scope,
 		BackendConfigName: backend.Name,
@@ -178,7 +167,6 @@ func (r StaticResolver) Resolve(
 		Memory:            memory,
 		Knowledge:         knowledge,
 		Artifact:          artifact,
-		Audit:             audit,
 	}, nil
 }
 
@@ -213,7 +201,9 @@ func (r StaticResolver) resolveHandle(
 
 func sameBackendRef(a, b tenant.BackendRef) bool {
 	return a.Kind == b.Kind &&
+		a.Provider == b.Provider &&
 		a.Name == b.Name &&
+		a.SecretRef == b.SecretRef &&
 		a.DSNRef == b.DSNRef &&
 		reflect.DeepEqual(a.Options, b.Options)
 }

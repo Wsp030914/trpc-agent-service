@@ -63,7 +63,7 @@ tRPC-Agent-Go 使用 `app_name + user_id + session_id` 定位 Session。平台�
 
 Tenant 或 Agent App 进入 `SUSPENDED` 后，Gateway 拒绝受影响范围的新请求，Worker 不再 claim 该范围的新 Job；已排队 Job 保持等待，恢复后继续按原顺序执行，运行中的 Job 允许完成。删除必须先暂停并等待任务进入终态，再按保留策略异步清理。
 
-后端迁移使用 `MIGRATING` 维护状态：Gateway 拒绝该 App 的新请求，Worker 继续排空已经接受的 Job；HTTP/RPC 返回带 `Retry-After` 的可重试错误，IM Adapter 在验签后 ACK 但不创建 Execution，并按通道能力发送维护提示。平台不延后执行迁移窗口内的新输入，也不依赖外部 IM 长期重投。确认没有 Session 写入者后执行全量复制和校验，再原子切换后端配置并恢复 `ACTIVE`。迁移失败时保持旧配置并恢复接收。模型、Tool Policy 和审计策略可以通过普通 `config_version` 发布；Session、Memory、Knowledge、Artifact 的权威后端变更只能作为迁移目标版本，经该流程切换，不能直接激活。`MIGRATING` 不复用 `SUSPENDED`，因为后者会停止 Worker claim，无法排空已有 Job。
+后端迁移由 `data_migration` 的 `DRAINING`、`COPYING`、`VERIFYING` 非终态维护：Gateway 拒绝该 App 的新请求，Worker 继续排空已经接受的 Job；HTTP/RPC 返回带 `Retry-After` 的可重试错误，IM Adapter 在验签后 ACK 但不创建 Execution，并按通道能力发送维护提示。平台不延后执行迁移窗口内的新输入，也不依赖外部 IM 长期重投。确认没有 Session 写入者后执行全量复制和校验，再原子切换后端配置。迁移失败时标记 `FAILED`，旧配置保持 active 并恢复接收。模型、Tool Policy 和审计策略可以通过普通 `config_version` 发布；Session、Memory、Knowledge、Artifact 的权威后端变更只能作为迁移目标版本，经该流程切换，不能直接激活。
 
 ## 4. 数据后端与同步策略
 
@@ -119,7 +119,7 @@ Trace、Metrics 和普通日志允许异步上报，采集失败不阻塞任务�
 
 模型超时和节点关停都通过 `context.Context` 控制。Worker 取消任务后仍要消费 Runner Event Channel 到关闭，避免 goroutine 泄漏，并在退出前 flush telemetry。
 
-配置采用版本化发布。模型、工具和策略变更生成新的 `config_version`，新请求使用新版本，已入队任务继续使用入队时记录的版本。权威数据后端的目标配置不能直接成为 active version，必须通过 `MIGRATING` 迁移切换。发现问题时只切回旧 active version，不修改历史配置内容。
+配置采用版本化发布。模型、工具和策略变更生成新的 `config_version`，新请求使用新版本，已入队任务继续使用入队时记录的版本。权威数据后端的目标配置不能直接成为 active version，必须通过 `data_migration` 迁移切换。发现问题时保留旧 active version，不修改历史配置内容。
 
 模型、工具和审计策略支持租户级灰度发布：以稳定 Session 分区键确定性分桶，在同一规则和比例下，同一 Session 始终选择同一候选或稳定版本。扩大比例、回滚只影响后续准入任务，已入队和运行中的 Execution 保持固定 `config_version`。容量由压测确定，初始估算为 Worker 并发不低于峰值已接收消息速率乘以 p95 Agent 执行时长；持续观察 Redis Pending 与 Lease 等待、PostgreSQL QPS、模型 token 速率和 IM 回调峰值后留出余量。
 

@@ -7,7 +7,7 @@
 | 实体 | 核心字段 | 说明 |
 | --- | --- | --- |
 | tenant | `tenant_id`、`name`、`status`、`audit_policy`、`created_at` | 最高隔离边界 |
-| agent_app | `tenant_id`、`app_id`、`name`、`active_config_version`、`status` | 租户下的 Agent 应用；状态包含维护用 `MIGRATING` |
+| agent_app | `tenant_id`、`app_id`、`name`、`active_config_version`、`status` | 租户下的 Agent 应用；维护门禁不写入此表，由未完成的 `data_migration` 权威记录表达 |
 | app_config_version | `tenant_id`、`app_id`、`version`、`model_config`、`tool_policy`、`backend_config`、`audit_policy`、`status` | 不可变运行配置版本；不包含 Channel Binding 启停状态 |
 | api_credential | `tenant_id`、`app_id`、`credential_id`、`key_digest`、`key_prefix`、`status`、`expires_at`、`created_at`、`last_used_at` | 外部业务系统调用平台的入站凭据 |
 
@@ -87,7 +87,7 @@ summary.up_to_event_seq <= session.last_event_seq
 | tool_approval | `approval_id`、`tenant_id`、`app_id`、`request_id`、`turn_seq`、`user_id`、`tool_name`、`tool_call_id`、`arguments_enc`、`arguments_digest`、`status`、`expires_at`、`decided_by`、`execution_owner`、`executed_at`、`resolved_by`、`resolved_at` | 一次确定参数的危险 Tool 审批；`approval_id` 是 Tool 结果写入的幂等键，状态为待定、批准、拒绝、过期、取消、执行中、已执行、结果未知或人工已处置 |
 | role_binding | `tenant_id`、`app_id`、`user_id`、`role`、`status`、`created_at`、`updated_at` | 平台用户角色映射；外部群角色不能直接替代它 |
 | usage_entry | `tenant_id`、`app_id`、`request_id`、`user_id`、`metric`、`reserved_amount`、`actual_amount`、`settled_at`、`released_at` | 幂等用量账本；只有需要并发下严格不超额时才使用预留与释放 |
-| data_migration | `migration_id`、`tenant_id`、`app_id`、`data_kind`、`source_config_version`、`target_config_version`、`state`、`validation_result`、`error`、`created_at`、`updated_at` | 维护窗口内后端迁移的权威记录，状态为 `RUNNING`、`SUCCEEDED`、`FAILED`；App 状态单独使用 `MIGRATING` |
+| data_migration | `migration_id`、`tenant_id`、`app_id`、`source_config_version`、`target_config_version`、`status`、`lease_owner`、`lease_until`、`run_token`、`drain_deadline`、`progress`、`validation_result`、`failure_reason`、`created_at`、`updated_at` | 维护窗口内唯一权威迁移记录；状态为 `PENDING`、`DRAINING`、`COPYING`、`VERIFYING`、`SUCCEEDED`、`FAILED`。前三个非终态直接构成准入门禁 |
 | rollout_rule | `tenant_id`、`app_id`、`stable_config_version`、`candidate_config_version`、`percentage`、`status`、`updated_at` | 灰度规则；同一规则和比例下由稳定 Session 分区键计算版本，不保存每个 Session 的分配记录 |
 
 审批批准后，Worker 用 `WHERE status = APPROVED` 的条件更新 Execution 原子领取为 `EXECUTING`；只有领取成功者执行 `arguments_enc` 对应且摘要匹配的一次 Tool 调用，不重新请求模型生成参数。Runner 请求审批时，先持久化原始 `tool_call_id` 对应的 Tool 调用，再将同一 `execution` 置为 `WAITING_APPROVAL`，并停止内存中的 Runner。审批状态机属于后续治理能力，接入时须继续使用 Execution 的条件更新和 Dispatch Outbox，不引入第二个 Job 表。迁移进行时，源和目标配置版本不得被原地修改。

@@ -48,7 +48,7 @@ sequenceDiagram
     C->>U: IM 回复
 ```
 
-Admission 事务提交是请求被平台接受的线性化点；同一事务写入 Execution 与 Dispatch Outbox。HTTP/RPC 使用认证主体和 client idempotency key 去重：内容相同的重试返回原 `request_id`，内容冲突直接拒绝。终端用户身份必须来自验证后的 claims 或内部 RPC 身份；仅带 API Key 的调用固定归属到该 Credential 的服务主体，不能通过 payload 指定其他 `user_id` 或 `session_principal_id`。配置切换事务更新同一 Agent App 行：配置切换先提交时 Execution 使用新版本，Admission 先提交时固定旧版本；权威数据后端变更只能通过 `MIGRATING` 切换。Redis Session Lease 失效会取消旧 Runner；本方案不提供严格的旧 Session 写入拒绝。
+Admission 事务提交是请求被平台接受的线性化点；同一事务写入 Execution 与 Dispatch Outbox。HTTP/RPC 使用认证主体和 client idempotency key 去重：内容相同的重试返回原 `request_id`，内容冲突直接拒绝。终端用户身份必须来自验证后的 claims 或内部 RPC 身份；仅带 API Key 的调用固定归属到该 Credential 的服务主体，不能通过 payload 指定其他 `user_id` 或 `session_principal_id`。配置切换事务更新同一 Agent App 行：配置切换先提交时 Execution 使用新版本，Admission 先提交时固定旧版本；权威数据后端变更只能通过 `data_migration` 切换。Redis Session Lease 失效会取消旧 Runner；本方案不提供严格的旧 Session 写入拒绝。
 
 飞书使用相同平台时序，差异由 Channel Adapter 处理其入站校验、限流和回复协议。
 

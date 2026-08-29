@@ -61,8 +61,8 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	if err := handle.Validate(exec.Tenant.Scope(), storage.CapabilitySession, exec.Config.BackendConfig.Session); err != nil {
 		return nil, fmt.Errorf("session storage handle: %w", err)
 	}
-	if handle.Ref.Kind != tenant.BackendSQL {
-		return nil, fmt.Errorf("session backend %q must use sql", handle.Ref.Name)
+	if handle.Ref.Kind != tenant.BackendSQL || (handle.Ref.Provider != "" && handle.Ref.Provider != "postgres") {
+		return nil, fmt.Errorf("session backend %q must use postgres provider", handle.Ref.Name)
 	}
 	schema, err := sessionSchema(handle.Ref)
 	if err != nil {
@@ -148,7 +148,9 @@ func (r *SessionResolver) sessionCacheKey(exec worker.Execution) (string, error)
 		return "", err
 	}
 	parts := []string{exec.Tenant.ConfigVersion, exec.Config.BackendConfig.Name, exec.Storage.Session.Ref.Name, schema}
-	if ref := exec.Storage.Session.Ref.DSNRef; ref != "" {
+	if ref := exec.Storage.Session.Ref.SecretRef; ref != (tenant.SecretRef{}) {
+		parts = append(parts, ref.Name, ref.Version)
+	} else if ref := exec.Storage.Session.Ref.DSNRef; ref != "" {
 		parts = append(parts, ref)
 	}
 	return exec.Tenant.Scope().Key("session-service", parts...)

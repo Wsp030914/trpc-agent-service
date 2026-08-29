@@ -16,10 +16,10 @@
 | 密钥或 PII 泄漏 | 入站 API Key 只保存 digest 且原文只展示一次；可取回 Secret 只保存 `secret_ref`；日志、trace、错误报告脱敏 |
 | 成本失控 | 按租户、应用、用户设置 RPM、TPM、日预算、Tool 次数和成本告警 |
 | IM 平台限流 | Reply Outbox 退避重试；遵守 Retry-After；长回复分片；失败进入 DLQ |
-| 后端迁移丢数据或新旧写入混杂 | `MIGRATING` 暂停新请求、排空旧 Job、全量复制校验后切换；HTTP/RPC 返回可重试错误，IM ACK 并提示维护，不延后执行迁移窗口输入；失败保持旧配置恢复服务 |
+| 后端迁移丢数据或新旧写入混杂 | `data_migration` 进入 `DRAINING` 后暂停新请求、排空旧 Job、全量复制校验后切换；HTTP/RPC 返回可重试错误，IM ACK 并提示维护，不延后执行迁移窗口输入；失败标记 `FAILED`，旧配置保持 active |
 | Worker 崩溃 | Redis Pending 由 Consumer Group 重领，过期 Execution 租约由 PostgreSQL 恢复并重新发布；Execution 状态可恢复 |
 | Worker 取消泄漏 | `context.Context` 取消后仍排空 Runner Event Channel；统一管理 goroutine 和 shutdown |
-| 配置发布错误或后端直接切换 | 配置版本不可变；模型、工具和策略可灰度发布；权威后端变更必须经 `MIGRATING` 排空、复制校验后切换；回滚只切对应安全版本 |
+| 配置发布错误或后端直接切换 | 配置版本不可变；模型、工具和策略可灰度发布；权威后端变更必须经 `data_migration` 排空、复制校验后切换；失败保留对应旧 active version |
 | Job 已完成但 IM 回复未入队 | Job/Execution 终态、Reply Outbox 和必要 Audit 在平台协调库按当前 lease 条件同事务提交 |
 | 观测数据不完整 | trace_id 贯穿 IM callback、Gateway、Worker、Runner、Tool、Storage 和 Reply；采集失败不阻塞主链路 |
 | 审计事件随遥测丢失 | Audit Event 写入权威 Audit Store，跨后端使用事务 Outbox；Telemetry Collector 不作为唯一副本 |

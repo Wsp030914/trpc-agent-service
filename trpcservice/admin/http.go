@@ -34,6 +34,9 @@ func NewHTTPHandler(api API, token string) (http.Handler, error) {
 	mux.HandleFunc("/admin/v1/channel-bindings", methodHandler(http.MethodPost, handler.createChannelBinding))
 	mux.HandleFunc("/admin/v1/configs", methodHandler(http.MethodPost, handler.publishAppConfig))
 	mux.HandleFunc("/admin/v1/configs/activate", methodHandler(http.MethodPost, handler.activateAppConfig))
+	mux.HandleFunc("/admin/v1/configs/rebuild-knowledge", methodHandler(http.MethodPost, handler.rebuildKnowledgeGeneration))
+	mux.HandleFunc("/admin/v1/data-migrations", methodHandler(http.MethodPost, handler.createDataMigration))
+	mux.HandleFunc("/admin/v1/data-migrations/begin", methodHandler(http.MethodPost, handler.beginDataMigration))
 	mux.HandleFunc("/admin/v1/credentials", methodHandler(http.MethodPost, handler.issueCredential))
 	mux.HandleFunc("/admin/v1/credentials/revoke", methodHandler(http.MethodPost, handler.revokeCredential))
 	return handler.authorize(mux), nil
@@ -88,6 +91,22 @@ type revokeCredentialRequest struct {
 	TenantID     string `json:"tenant_id"`
 	AppID        string `json:"app_id"`
 	CredentialID string `json:"credential_id"`
+}
+
+type createDataMigrationRequest struct {
+	TenantID      string `json:"tenant_id"`
+	AppID         string `json:"app_id"`
+	SourceVersion string `json:"source_config_version"`
+	TargetVersion string `json:"target_config_version"`
+}
+
+type beginDataMigrationRequest struct {
+	TenantID      string    `json:"tenant_id"`
+	AppID         string    `json:"app_id"`
+	MigrationID   string    `json:"migration_id"`
+	Owner         string    `json:"owner"`
+	DrainDeadline time.Time `json:"drain_deadline"`
+	LeaseDuration string    `json:"lease_duration"`
 }
 
 type issueCredentialResponse struct {
@@ -203,10 +222,71 @@ func (h adminHTTPHandler) activateAppConfig(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := h.api.ActivateAppConfig(r.Context(), scope, request.Version); err != nil {
+		if errors.Is(err, tenant.ErrKnowledgeGenerationPending) || errors.Is(err, tenant.ErrKnowledgeGenerationFailed) {
+			writeJSONError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, "activate app config failed")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h adminHTTPHandler) rebuildKnowledgeGeneration(w http.ResponseWriter, r *http.Request) {
+	var request activateAppConfigRequest
+	if !decodeJSON(w, r, &request) || request.Version == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid knowledge generation rebuild")
+		return
+	}
+	scope := tenant.Scope{TenantID: request.TenantID, AppID: request.AppID}
+	if scope.Validate() != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid knowledge generation rebuild")
+		return
+	}
+	if err := h.api.RebuildKnowledgeGeneration(r.Context(), scope, request.Version); err != nil {
+		writeJSONError(w, http.StatusConflict, "rebuild knowledge generation failed")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h adminHTTPHandler) createDataMigration(w http.ResponseWriter, r *http.Request) {
+	var request createDataMigrationRequest
+	if !decodeJSON(w, r, &request) {
+		writeJSONError(w, http.StatusBadRequest, "invalid data migration")
+		return
+	}
+	record, err := h.api.CreateDataMigration(r.Context(), tenant.Scope{
+		TenantID: request.TenantID,
+		AppID:    request.AppID,
+	}, request.SourceVersion, request.TargetVersion)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "create data migration failed")
+		return
+	}
+	writeJSON(w, http.StatusCreated, record)
+}
+
+func (h adminHTTPHandler) beginDataMigration(w http.ResponseWriter, r *http.Request) {
+	var request beginDataMigrationRequest
+	if !decodeJSON(w, r, &request) {
+		writeJSONError(w, http.StatusBadRequest, "invalid data migration")
+		return
+	}
+	leaseDuration, err := time.ParseDuration(request.LeaseDuration)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid data migration")
+		return
+	}
+	record, err := h.api.BeginDataMigration(r.Context(), tenant.Scope{
+		TenantID: request.TenantID,
+		AppID:    request.AppID,
+	}, request.MigrationID, request.Owner, request.DrainDeadline, leaseDuration)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "begin data migration failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, record)
 }
 
 func (h adminHTTPHandler) issueCredential(w http.ResponseWriter, r *http.Request) {
@@ -272,7 +352,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 		return false
 	}
 	body := http.MaxBytesReader(w, r.Body, maxAdminRequestBytes)
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	decoder := json.NewDecoder(body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {

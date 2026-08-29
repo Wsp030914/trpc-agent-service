@@ -11,7 +11,7 @@ The module path is:
 github.com/liuzengh/trpc-agent-service
 ```
 
-The module requires Go 1.21 and pins tRPC-Agent-Go v1.11.2. The service entry
+The module requires Go 1.24.1 and pins tRPC-Agent-Go v1.11.2. The service entry
 point is `cmd/trpc-service`.
 
 ## Engineering principles

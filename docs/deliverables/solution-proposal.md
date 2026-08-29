@@ -80,7 +80,7 @@ Tenant 是最高资源和权限边界，Tenant 下可创建多个 Agent App。�
 
 Memory 的权威记录写入共享 Memory Store 后对全部 Worker 可见；向量库只承担 Knowledge 和可选语义 Memory 的派生检索，允许索引延迟。Knowledge 原文、附件和 Artifact 保存于对象存储，SQL metadata 承担权限和生命周期控制。
 
-后端切换通过 `MIGRATING` 维护窗口处理：Gateway 停止接收该 App 的新业务请求，Worker 排空已接受 Job，确认没有 Session 写入者后全量复制并校验记录数、稳定 ID、Event 顺序和校验和，再原子切换配置。HTTP/RPC 返回带 `Retry-After` 的可重试错误；IM 验签后 ACK 并提示维护，不延后执行迁移窗口内的新输入。失败时保持旧后端并恢复 `ACTIVE`。
+后端切换通过 `data_migration` 维护窗口处理：记录按 `PENDING -> DRAINING -> COPYING -> VERIFYING -> SUCCEEDED` 推进，Gateway 在 `DRAINING` 起停止接收该 App 的新业务请求，Worker 排空已接受 Job，确认没有 Session 写入者后全量复制并校验记录数、稳定 ID、Event 顺序和校验和，再原子切换配置。HTTP/RPC 返回带 `Retry-After` 的可重试错误；IM 验签后 ACK 并提示维护，不延后执行迁移窗口内的新输入。失败时标记 `FAILED`，旧后端保持 active。
 
 ### 5.3 IM 通道接入
 
@@ -117,7 +117,7 @@ IM 入站以 `tenant_id + app_id + binding_id + external_message_id` 去重。�
 | 8 月 21 日 - 8 月 23 日 | 阅读 `main` 基线与 tRPC-Agent-Go，梳理可复用能力，完成领域边界和总体设计 | 租户模型、组件职责、数据模型和架构图确定 |
 | 8 月 24 日 - 8 月 28 日 | 建立 Tenant/App/配置版本/Credential、可信身份解析和原子准入 | Tenant/App 不可由 payload 冒充；配置版本在准入时固定 |
 | 8 月 29 日 - 9 月 2 日 | 建立 Execution、Dispatch Outbox、Redis Streams、Session Lease 和 Worker 恢复 | 同一 Session 有序、不同 Session 并行；节点故障可恢复 |
-| 9 月 3 日 - 9 月 6 日 | 建立 Storage Adapter、作用域包装、幂等、Event/State/Summary 顺序与迁移编排 | 多后端路由、Memory 可见性和 `MIGRATING` 流程可验证 |
+| 9 月 3 日 - 9 月 6 日 | 建立 Storage Adapter、作用域包装、幂等、Event/State/Summary 顺序与迁移编排 | 多后端路由、Memory 可见性和 `data_migration` 流程可验证 |
 | 9 月 7 日 - 9 月 9 日 | 完成企业微信/飞书 Adapter、Tool 治理、Audit、Telemetry、灰度和容量设计 | 完整 IM 闭环、审计脱敏、关键指标与风险策略明确 |
 | 9 月 10 日 - 9 月 11 日 | Docker 部署、故障演练、文档整理和验收 | 最小部署可运行，交付架构、时序、数据模型、同步、风险和方案文档 |
 

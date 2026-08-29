@@ -33,6 +33,9 @@ var (
 	// ErrUnsupportedAdmissionSource means the selected admission backend does
 	// not yet implement the request's trusted source type.
 	ErrUnsupportedAdmissionSource = errors.New("admission source is unsupported")
+	// ErrAdmissionDraining means backend migration is draining accepted work and
+	// new requests must be retried after the advertised maintenance window.
+	ErrAdmissionDraining = errors.New("request admission is draining for data migration")
 )
 
 // Message is the normalized user input passed from gateway to workers.

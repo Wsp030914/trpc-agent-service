@@ -132,6 +132,29 @@ func TestAwaitWorkerExitReturnsWorkerResult(t *testing.T) {
 	}
 }
 
+func TestAwaitDataMigrationExitReturnsAtShutdownDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err, stopped := awaitDataMigrationExit(ctx, make(chan error))
+	if stopped || !errors.Is(err, context.Canceled) {
+		t.Fatalf("await data migration exit = %v, %t", err, stopped)
+	}
+	shutdownErr := dataMigrationShutdownResult(nil, err, stopped)
+	if !errors.Is(shutdownErr, errWorkerShutdownTimeout) {
+		t.Fatalf("shutdown error = %v", shutdownErr)
+	}
+}
+
+func TestAwaitDataMigrationExitReturnsResult(t *testing.T) {
+	done := make(chan error, 1)
+	want := errors.New("migration stopped")
+	done <- want
+	err, stopped := awaitDataMigrationExit(context.Background(), done)
+	if !stopped || !errors.Is(err, want) {
+		t.Fatalf("await data migration exit = %v, %t", err, stopped)
+	}
+}
+
 func TestEnvironmentSecretsAreScoped(t *testing.T) {
 	scope := tenant.Scope{TenantID: "tenant-a", AppID: "app-a"}
 	ref := tenant.SecretRef{Name: "model-key", Version: "v1"}
@@ -151,6 +174,19 @@ func TestEnvironmentSecretsAreScoped(t *testing.T) {
 	value, err = resolver.ResolveSessionDSN(context.Background(), storage.Handle{Scope: scope})
 	if err != nil || value != "postgres://metadata" {
 		t.Fatalf("resolve default session dsn = %q, %v", value, err)
+	}
+}
+
+func TestEnvironmentTencentDBGatewayResolverUsesBackendName(t *testing.T) {
+	resolver := environmentTencentDBGatewayResolver{getenv: environmentReader(map[string]string{
+		envTencentDBGateways: `{"memory-tenant-a":"https://memory-a.example"}`,
+	})}
+	value, err := resolver.ResolveTencentDBGateway(context.Background(), "memory-tenant-a")
+	if err != nil || value != "https://memory-a.example" {
+		t.Fatalf("resolve gateway = %q, %v", value, err)
+	}
+	if _, err := resolver.ResolveTencentDBGateway(context.Background(), "memory-tenant-b"); err == nil {
+		t.Fatal("resolved an unconfigured TencentDB gateway")
 	}
 }
 

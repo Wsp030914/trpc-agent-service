@@ -23,6 +23,8 @@ const (
 	headerUserID           = "X-User-ID"
 	headerSessionPrincipal = "X-Session-Principal-ID"
 	headerTraceID          = "X-Trace-ID"
+	retryAfterSeconds      = "60"
+	openAIChatPath         = "/v1/chat/completions"
 )
 
 var errInvalidRequestIdentity = errors.New("invalid request identity")
@@ -50,15 +52,20 @@ func NewOpenAIHandler(authenticator auth.HTTPAPIKeyResolver, queued *gateway.Que
 	if err != nil {
 		return nil, err
 	}
-	return openAIHandler{authenticator: authenticator, next: server.Handler()}, nil
+	return openAIHandler{authenticator: authenticator, queued: queued, next: server.Handler()}, nil
 }
 
 type openAIHandler struct {
 	authenticator auth.HTTPAPIKeyResolver
+	queued        *gateway.QueuedRunner
 	next          http.Handler
 }
 
 func (h openAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != openAIChatPath && r.URL.Path != openAIChatPath+"/" {
+		h.next.ServeHTTP(w, r)
+		return
+	}
 	if r.Method == http.MethodOptions {
 		h.next.ServeHTTP(w, r)
 		return
@@ -72,7 +79,8 @@ func (h openAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAuthenticationError(w, err)
 		return
 	}
-	if err := validateQueuedOpenAIRequest(w, r); err != nil {
+	message, err := validateQueuedOpenAIRequest(w, r)
+	if err != nil {
 		http.Error(w, "unsupported chat request", http.StatusBadRequest)
 		return
 	}
@@ -81,53 +89,72 @@ func (h openAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAuthenticationError(w, err)
 		return
 	}
+	ctx, err = h.queued.Admit(ctx, gateway.Message{Text: message})
+	if err != nil {
+		writeAdmissionError(w, err)
+		return
+	}
 	h.next.ServeHTTP(w, r.WithContext(ctx))
 }
 
-type openAIRequestEnvelope struct {
-	Messages []openAIRequestMessage `json:"messages"`
-	Tools    json.RawMessage        `json:"tools"`
+type queuedOpenAIRequest struct {
+	Model            string                       `json:"model"`
+	Messages         []queuedOpenAIRequestMessage `json:"messages"`
+	Temperature      *float64                     `json:"temperature,omitempty"`
+	MaxTokens        *int                         `json:"max_tokens,omitempty"`
+	Stream           bool                         `json:"stream,omitempty"`
+	Tools            json.RawMessage              `json:"tools"`
+	ToolChoice       json.RawMessage              `json:"tool_choice"`
+	TopP             *float64                     `json:"top_p,omitempty"`
+	Stop             []string                     `json:"stop,omitempty"`
+	PresencePenalty  *float64                     `json:"presence_penalty,omitempty"`
+	FrequencyPenalty *float64                     `json:"frequency_penalty,omitempty"`
+	User             string                       `json:"user,omitempty"`
 }
 
-type openAIRequestMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+type queuedOpenAIRequestMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
-func validateQueuedOpenAIRequest(w http.ResponseWriter, r *http.Request) error {
+func validateQueuedOpenAIRequest(w http.ResponseWriter, r *http.Request) (string, error) {
 	if r == nil || r.Body == nil {
-		return errors.New("request body is required")
+		return "", errors.New("request body is required")
 	}
 	body := http.MaxBytesReader(w, r.Body, maxOpenAIRequestBytes)
 	encoded, err := io.ReadAll(body)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := body.Close(); err != nil {
-		return err
+		return "", err
 	}
 	r.Body = io.NopCloser(bytes.NewReader(encoded))
 
-	var envelope openAIRequestEnvelope
+	var request queuedOpenAIRequest
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	if err := decoder.Decode(&envelope); err != nil {
-		return err
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		return "", err
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
-		return errors.New("request body contains multiple values")
+		return "", errors.New("request body contains multiple values")
 	}
-	if len(envelope.Messages) != 1 || envelope.Messages[0].Role != "user" {
-		return errors.New("exactly one user message is required")
+	if len(request.Messages) != 1 || request.Messages[0].Role != "user" {
+		return "", errors.New("exactly one user message is required")
 	}
-	var content string
-	if err := json.Unmarshal(envelope.Messages[0].Content, &content); err != nil || content == "" {
-		return errors.New("user message content is required")
+	if request.Messages[0].Content == "" {
+		return "", errors.New("user message content is required")
 	}
-	if len(envelope.Tools) != 0 && string(envelope.Tools) != "null" {
-		return errors.New("client tools are not supported")
+	if hasJSONValue(request.Tools) || hasJSONValue(request.ToolChoice) {
+		return "", errors.New("client tools are not supported")
 	}
-	return nil
+	return request.Messages[0].Content, nil
+}
+
+func hasJSONValue(value json.RawMessage) bool {
+	return len(value) != 0 && !bytes.Equal(bytes.TrimSpace(value), []byte("null"))
 }
 
 func (h openAIHandler) authenticatedRequest(r *http.Request) (gateway.AuthenticatedRequest, error) {
@@ -211,5 +238,22 @@ func writeAuthenticationError(w http.ResponseWriter, err error) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 	default:
 		http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
+	}
+}
+
+func writeAdmissionError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, gateway.ErrAdmissionDraining):
+		w.Header().Set("Retry-After", retryAfterSeconds)
+		http.Error(w, "request admission is draining", http.StatusServiceUnavailable)
+	case errors.Is(err, gateway.ErrIdempotencyConflict):
+		http.Error(w, "request idempotency conflict", http.StatusConflict)
+	case errors.Is(err, auth.ErrUnauthenticated),
+		errors.Is(err, auth.ErrCredentialInactive),
+		errors.Is(err, auth.ErrTenantInactive),
+		errors.Is(err, auth.ErrAppInactive):
+		writeAuthenticationError(w, err)
+	default:
+		http.Error(w, "request admission unavailable", http.StatusServiceUnavailable)
 	}
 }

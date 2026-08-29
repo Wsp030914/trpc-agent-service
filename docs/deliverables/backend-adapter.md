@@ -94,6 +94,6 @@ InMemory 只适合本地开发和测试：
 后端自身的 Schema 或索引准备由具体适配器负责：例如 PostgreSQL 负责平台表 DDL，
 Redis 负责 keyspace/version 准备，向量库负责 collection 和 index generation。跨后端
 数据迁移不放在 `postgres`、`redis` 或其他单一适配器中，而由包外迁移编排层在 App 的
-`MIGRATING` 维护窗口内统一处理排空旧 Job、全量复制、校验、切换和失败恢复。权威
+`data_migration` 的维护窗口内统一处理排空旧 Job、全量复制、校验、切换和失败恢复。权威
 `backend_config` 变更只能通过该编排层生效，不能经普通配置发布直接激活。编排层依赖
 能力型接口，不要求所有后端实现相同的底层迁移语义。

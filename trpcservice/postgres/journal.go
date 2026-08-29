@@ -320,8 +320,8 @@ ORDER BY event_seq`,
 }
 
 func executionEventType(evt *event.Event) string {
-	if evt.Response != nil && evt.Response.Object != "" {
-		return evt.Response.Object
+	if evt.Response != nil && evt.Object != "" {
+		return evt.Object
 	}
 	return "runner_event"
 }

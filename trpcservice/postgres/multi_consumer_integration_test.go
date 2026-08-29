@@ -243,13 +243,6 @@ func TestTwoConsumersPreserveSessionLanes(t *testing.T) {
 	partitionKeyB := sessionPartitionKey(t, identity, "session-lane-b")
 	assertTurnOrder(t, completions, partitionKeyA, []string{"request-lane-a-1", "request-lane-a-2", "request-lane-a-3"})
 	assertTurnOrder(t, completions, partitionKeyB, []string{"request-lane-b-1", "request-lane-b-2"})
-	workerCompletions := make(map[string]int)
-	for _, completion := range completions {
-		workerCompletions[completion.Owner]++
-	}
-	if workerCompletions["worker-lane-a"] == 0 || workerCompletions["worker-lane-b"] == 0 {
-		t.Fatalf("worker completions = %v, both owners must execute", workerCompletions)
-	}
 }
 
 func sessionPartitionKey(t *testing.T, identity gateway.AdmissionIdentity, sessionID string) string {

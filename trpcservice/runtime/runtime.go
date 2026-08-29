@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,8 @@ import (
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
+	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	modelopenai "trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
@@ -42,6 +45,31 @@ type ModelResolver interface {
 // The resolver owns the returned service's lifecycle.
 type SessionResolver interface {
 	ResolveSession(ctx context.Context, exec worker.Execution) (session.Service, error)
+}
+
+// SessionIngestorResolver resolves an optional long-term-memory ingestor for
+// one execution. The resolver owns the returned ingestor's lifecycle.
+type SessionIngestorResolver interface {
+	ResolveSessionIngestor(ctx context.Context, exec worker.Execution) (session.Ingestor, error)
+}
+
+// SessionIngestorCachePolicy declares whether an ingestor binds a Runner to
+// one execution and therefore cannot safely share the Runner cache.
+type SessionIngestorCachePolicy interface {
+	RequiresPerExecutionRunner(exec worker.Execution) bool
+}
+
+// ArtifactResolver resolves an SQL-guarded Artifact service for one
+// execution. A configured artifact backend binds the Runner to that trusted
+// session and therefore prevents Runner cache reuse.
+type ArtifactResolver interface {
+	ResolveArtifact(ctx context.Context, exec worker.Execution) (frameworkartifact.Service, error)
+}
+
+// KnowledgeResolver resolves an SQL-guarded Knowledge implementation for one
+// immutable application configuration version.
+type KnowledgeResolver interface {
+	ResolveKnowledge(ctx context.Context, exec worker.Execution) (frameworkknowledge.Knowledge, error)
 }
 
 // ToolResolver resolves the complete static tool set for one immutable app
@@ -157,13 +185,17 @@ func (r *OpenAIModelResolver) ResolveModel(ctx context.Context, exec worker.Exec
 // each immutable tenant application configuration version. Close releases the
 // cached runners; the SessionResolver remains responsible for session services.
 type RuntimeRunnerResolver struct {
-	models   ModelResolver
-	sessions SessionResolver
-	tools    ToolResolver
+	models    ModelResolver
+	sessions  SessionResolver
+	ingestors SessionIngestorResolver
+	artifacts ArtifactResolver
+	knowledge KnowledgeResolver
+	tools     ToolResolver
 
-	mu      sync.Mutex
-	closed  bool
-	runners map[string]runner.Runner
+	mu        sync.Mutex
+	closed    bool
+	runners   map[string]runner.Runner
+	ephemeral map[uintptr]runner.Runner
 }
 
 // RuntimeRunnerOption configures a RuntimeRunnerResolver.
@@ -174,6 +206,30 @@ type RuntimeRunnerOption func(*RuntimeRunnerResolver)
 func WithRuntimeToolResolver(resolver ToolResolver) RuntimeRunnerOption {
 	return func(runtime *RuntimeRunnerResolver) {
 		runtime.tools = resolver
+	}
+}
+
+// WithSessionIngestorResolver sets the resolver used to attach optional
+// long-term-memory ingestion to a configured runner.
+func WithSessionIngestorResolver(resolver SessionIngestorResolver) RuntimeRunnerOption {
+	return func(runtime *RuntimeRunnerResolver) {
+		runtime.ingestors = resolver
+	}
+}
+
+// WithArtifactResolver sets the resolver used to attach a session-scoped
+// Artifact service when the immutable app configuration selects one.
+func WithArtifactResolver(resolver ArtifactResolver) RuntimeRunnerOption {
+	return func(runtime *RuntimeRunnerResolver) {
+		runtime.artifacts = resolver
+	}
+}
+
+// WithKnowledgeResolver sets the resolver used to attach configured Knowledge
+// to the framework agent.
+func WithKnowledgeResolver(resolver KnowledgeResolver) RuntimeRunnerOption {
+	return func(runtime *RuntimeRunnerResolver) {
+		runtime.knowledge = resolver
 	}
 }
 
@@ -191,9 +247,10 @@ func NewRuntimeRunnerResolver(
 		return nil, errors.New("session resolver is required")
 	}
 	resolver := &RuntimeRunnerResolver{
-		models:   models,
-		sessions: sessions,
-		runners:  make(map[string]runner.Runner),
+		models:    models,
+		sessions:  sessions,
+		runners:   make(map[string]runner.Runner),
+		ephemeral: make(map[uintptr]runner.Runner),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -226,6 +283,7 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 		exec.Config.Version != exec.Tenant.ConfigVersion {
 		return nil, errors.New("app config does not match execution scope")
 	}
+	cacheable := !requiresPerExecutionRunner(r.ingestors, exec)
 	cacheKey, err := exec.Tenant.Scope().Key("runner", exec.Tenant.ConfigVersion)
 	if err != nil {
 		return nil, err
@@ -240,7 +298,8 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 		r.mu.Unlock()
 		return nil, errors.New("runtime runner resolver is closed")
 	}
-	if cached := r.runners[cacheKey]; cached != nil {
+	if cacheable && r.runners[cacheKey] != nil {
+		cached := r.runners[cacheKey]
 		r.mu.Unlock()
 		return cached, nil
 	}
@@ -262,9 +321,45 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 	if sessionService == nil {
 		return nil, errors.New("resolved session service is required")
 	}
+	var ingestor session.Ingestor
+	if r.ingestors != nil {
+		ingestor, err = r.ingestors.ResolveSessionIngestor(ctx, exec)
+		if err != nil {
+			return nil, fmt.Errorf("resolve session ingestor: %w", err)
+		}
+	}
+	var artifactService frameworkartifact.Service
+	if !exec.Config.BackendConfig.Artifact.IsZero() {
+		if r.artifacts == nil {
+			return nil, errors.New("artifact resolver is required for configured artifact backend")
+		}
+		artifactService, err = r.artifacts.ResolveArtifact(ctx, exec)
+		if err != nil {
+			return nil, fmt.Errorf("resolve artifact service: %w", err)
+		}
+		if artifactService == nil {
+			return nil, errors.New("configured artifact service is required")
+		}
+	}
+	var knowledgeService frameworkknowledge.Knowledge
+	if !exec.Config.BackendConfig.Knowledge.IsZero() {
+		if r.knowledge == nil {
+			return nil, errors.New("knowledge resolver is required for configured knowledge backend")
+		}
+		knowledgeService, err = r.knowledge.ResolveKnowledge(ctx, exec)
+		if err != nil {
+			return nil, fmt.Errorf("resolve knowledge service: %w", err)
+		}
+		if knowledgeService == nil {
+			return nil, errors.New("configured knowledge service is required")
+		}
+	}
 	agentOptions := []llmagent.Option{
 		llmagent.WithModel(modelRuntime.Model),
 		llmagent.WithGenerationConfig(modelRuntime.GenerationConfig),
+	}
+	if knowledgeService != nil {
+		agentOptions = append(agentOptions, llmagent.WithKnowledge(knowledgeService))
 	}
 	if r.tools != nil {
 		tools, err := r.tools.ResolveTools(ctx, exec)
@@ -278,11 +373,25 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 		agentOptions = append(agentOptions, llmagent.WithTools(visible))
 	}
 	agent := llmagent.New(runtimeAgentName, agentOptions...)
-	resolved := runner.NewRunner(
-		appName,
-		agent,
-		runner.WithSessionService(sessionService),
-	)
+	runnerOptions := []runner.Option{runner.WithSessionService(sessionService)}
+	if ingestor != nil {
+		runnerOptions = append(runnerOptions, runner.WithSessionIngestor(ingestor))
+	}
+	if artifactService != nil {
+		runnerOptions = append(runnerOptions, runner.WithArtifactService(artifactService))
+	}
+	resolved := runner.NewRunner(appName, agent, runnerOptions...)
+	if !cacheable {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			_ = resolved.Close()
+			return nil, errors.New("runtime runner resolver is closed")
+		}
+		r.ephemeral[runnerIdentity(resolved)] = resolved
+		r.mu.Unlock()
+		return resolved, nil
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -296,6 +405,37 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 	}
 	r.runners[cacheKey] = resolved
 	return resolved, nil
+}
+
+func requiresPerExecutionRunner(resolver SessionIngestorResolver, exec worker.Execution) bool {
+	if !exec.Config.BackendConfig.Artifact.IsZero() {
+		return true
+	}
+	policy, ok := resolver.(SessionIngestorCachePolicy)
+	return ok && policy.RequiresPerExecutionRunner(exec)
+}
+
+// ReleaseRunner closes a Runner created for an uncached Memory-enabled
+// execution. Cached runners remain owned by RuntimeRunnerResolver.Close.
+func (r *RuntimeRunnerResolver) ReleaseRunner(resolved runner.Runner) error {
+	if r == nil || resolved == nil {
+		return nil
+	}
+	r.mu.Lock()
+	key := runnerIdentity(resolved)
+	if key == 0 {
+		r.mu.Unlock()
+		return nil
+	}
+	_, ok := r.ephemeral[key]
+	if ok {
+		delete(r.ephemeral, key)
+	}
+	r.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return resolved.Close()
 }
 
 func visibleTools(policy tenant.ToolPolicy, tools []frameworktool.Tool) ([]frameworktool.Tool, error) {
@@ -332,7 +472,9 @@ func (r *RuntimeRunnerResolver) Close() error {
 	}
 	r.closed = true
 	runners := r.runners
+	ephemeral := r.ephemeral
 	r.runners = nil
+	r.ephemeral = nil
 	r.mu.Unlock()
 
 	var errs []error
@@ -341,7 +483,23 @@ func (r *RuntimeRunnerResolver) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	for _, resolved := range ephemeral {
+		if err := resolved.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	return errors.Join(errs...)
+}
+
+func runnerIdentity(resolved runner.Runner) uintptr {
+	if resolved == nil {
+		return 0
+	}
+	value := reflect.ValueOf(resolved)
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		return 0
+	}
+	return value.Pointer()
 }
 
 func openAIModelOptions(parameters map[string]string) (string, model.GenerationConfig, error) {
@@ -441,3 +599,4 @@ func validateModelBaseURL(value string) error {
 
 var _ ModelResolver = (*OpenAIModelResolver)(nil)
 var _ worker.RunnerResolver = (*RuntimeRunnerResolver)(nil)
+var _ worker.RunnerReleaser = (*RuntimeRunnerResolver)(nil)
