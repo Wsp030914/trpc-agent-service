@@ -113,13 +113,15 @@ func TestAppConfigPersistenceDocumentRoundTrip(t *testing.T) {
 				tt.cfg.TenantID,
 				tt.cfg.AppID,
 				tt.cfg.Version,
-				modelConfig,
-				toolPolicy,
-				backendConfig,
-				auditPolicy,
-				secretRefs,
-				bindings,
-				knowledgeBaseIDs,
+				appConfigColumns{
+					modelConfig:       modelConfig,
+					toolPolicy:        toolPolicy,
+					backendConfig:     backendConfig,
+					auditPolicy:       auditPolicy,
+					secretRefs:        secretRefs,
+					channelBindingIDs: bindings,
+					knowledgeBaseIDs:  knowledgeBaseIDs,
+				},
 			)
 			if err != nil {
 				t.Fatalf("unmarshal app config: %v", err)

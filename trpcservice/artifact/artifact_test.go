@@ -195,6 +195,27 @@ func TestServiceSaveArtifactQueuesCleanupWhenCompensationFails(t *testing.T) {
 	}
 }
 
+func TestServiceSaveArtifactReportsAbandonFailure(t *testing.T) {
+	metadataErr := errors.New("metadata unavailable")
+	abandonErr := errors.New("abandon unavailable")
+	storage := &fakeStorage{}
+	metadata := &fakeMetadata{createErr: metadataErr, abandonErr: abandonErr}
+	service := newTestService(t, storage, metadata)
+
+	_, err := service.SaveArtifact(
+		context.Background(), testSessionInfo(t, testScope()), "report.txt", &frameworkartifact.Artifact{},
+	)
+	if !errors.Is(err, metadataErr) || !errors.Is(err, abandonErr) {
+		t.Fatalf("SaveArtifact error = %v, want metadata and abandon errors", err)
+	}
+	if metadata.abandonCalls != 1 {
+		t.Fatalf("abandon calls = %d, want 1", metadata.abandonCalls)
+	}
+	if metadata.cleanupCalls != 0 || storage.deleteVersionCalls != 1 {
+		t.Fatalf("compensation calls = cleanup %d, delete version %d, want 0 and 1", metadata.cleanupCalls, storage.deleteVersionCalls)
+	}
+}
+
 func TestExecutionResolverBindsArtifactServiceToTrustedSession(t *testing.T) {
 	storage := &fakeStorage{}
 	metadata := &fakeMetadata{}
@@ -393,6 +414,7 @@ type fakeMetadata struct {
 	keys         []string
 	findErr      error
 	createErr    error
+	abandonErr   error
 	cleanupErr   error
 	cleanup      CleanupRecord
 }
@@ -418,7 +440,7 @@ func (m *fakeMetadata) PublishArtifact(context.Context, Record) error { return m
 
 func (m *fakeMetadata) AbandonArtifact(context.Context, Record) error {
 	m.abandonCalls++
-	return nil
+	return m.abandonErr
 }
 
 type fakeStorageResolver struct {

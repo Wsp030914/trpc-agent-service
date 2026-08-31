@@ -26,7 +26,9 @@ func NewClient(ctx context.Context, rawURL string) (*Client, error) {
 	client := goredis.NewClient(options)
 	wrapped := &Client{client: client}
 	if err := wrapped.Ping(ctx); err != nil {
-		_ = client.Close()
+		if closeErr := client.Close(); closeErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("close redis client after ping failure: %w", closeErr))
+		}
 		return nil, err
 	}
 	return wrapped, nil

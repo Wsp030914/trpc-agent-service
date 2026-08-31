@@ -268,6 +268,13 @@ Runner 构建前：过滤模型可见工具
 Tool 执行前：再次校验租户、应用、用户、通道和预算
 ```
 
+当前 `cmd/trpc-service` 尚未注册可执行工具目录，因此 Worker 注入显式的
+no-tools resolver：空工具策略可以运行，非空 `VisibleTools` 或
+`ExecutableTools` 在 Admin 发布校验和 Worker Runner 构建阶段都会明确拒绝。
+接入真实工具目录时，必须实现 `runtime.ToolResolver`，返回与配置版本和租户
+作用域绑定的候选工具，再复用上述构建前过滤和执行前校验；不能把非空工具策略
+静默降级为空工具集。
+
 日志脱敏：
 
 日志、trace 和错误报告不记录 token、DSN、API key、完整 PII 和原始 Tool 参数。
@@ -331,10 +338,10 @@ Tenant 或 Agent App 进入 `SUSPENDED` 后，Gateway 立即拒绝受影响范�
 6. 已完成共享执行基础层：按 `tenant_id/app_id/config_version` 缓存装配 OpenAI-compatible Model、LLMAgent、PostgreSQL Session 和真实 Runner；`Worker.Run` 在 Runner 生命周期内持有 Redis Session Lease。模型密钥和 Session DSN 只由注入式解析器提供，不落配置或日志；`base_url` 还必须经过 Endpoint Policy。
 7. 已完成 `run_token` 条件状态更新；当前明确不提供 Session Provider 的严格旧写入拒绝。
 8. 为实际启用的 tRPC-Agent-Go `server/*` 实现 QueuedRunner；需要流式响应或断线恢复时增加持久化 Execution Event Journal。真实 Runner 仅由 Worker 持有。Verified Channel Binding 在完成绑定持久化、验签/去重、Admission 事务复核，以及 `channel`/`binding_id` 在 Job 中持久化和恢复之前保持未启用，不能作为公开入口。
-9. 已完成：Runner 构建前按 `tool_policy` 过滤可见工具，Worker 在框架执行前再次校验执行权限；模型密钥由带作用域的 `APIKeyRef` 和 SecretProvider 解析。Worker 仅向日志和 trace 传递字段白名单，向 PostgreSQL 追加可靠 Audit，并在失去 Job 租约后拒绝追加。
+9. 已完成：Runner 构建前按 `tool_policy` 过滤可见工具，Worker 在框架执行前再次校验执行权限；当前未注册工具目录时，Admin 和 Worker 对非空工具策略 fail-closed。模型密钥由带作用域的 `APIKeyRef` 和 SecretProvider 解析。Worker 仅向日志和 trace 传递字段白名单，向 PostgreSQL 追加可靠 Audit，并在失去 Job 租约后拒绝追加。
 10. 已完成最小 Admin API：创建 Tenant/Agent App、发布不可变配置版本和切换 active version；生成 API Credential 时仅持久化 SHA-256 digest 且原文仅返回一次，撤销与 Admission 锁定同一 Credential 行并且数据库拒绝重新激活。
 11. 已完成 `cmd/trpc-service` 装配：显式选择 `gateway`、`worker` 或 `all` 角色；`/livez` 与依赖 PostgreSQL、Redis 的 `/readyz` 分离；Gateway 与 `all` 角色在同一 HTTP 服务启用 OpenAI-compatible `POST /v1/chat/completions`。入口使用 Bearer API Key 解析可信 tenant/app，再把请求头中的 request、幂等、session 和用户身份放入 QueuedRunner 上下文；请求体不能覆盖可信范围。收到终止信号后先变为 not-ready，Worker 停止 claim 新 Job 并在窗口内继续续租和排空已认领 Job。`worker`/`all` 需要稳定的 `TRPC_AGENT_SERVICE_WORKER_ID`。运行时 Secret 由按 tenant/app/ref 十六进制编码的 `TRPC_AGENT_SERVICE_SECRET_<tenant>_<app>_<name>_<version>` 环境变量注入；配置库只保留引用。
-12. 已完成 PostgreSQL、一个 Gateway 和两个 Worker 的 Docker Compose 部署。Compose 在 Gateway 暴露健康端口和 OpenAI-compatible 聊天入口。真实 PostgreSQL 集成测试验证两个 Consumer 同时处理不同 Session 的 Job，并分别以独立 Worker Owner 完成。公共 API 第二遍设计审查确认本轮只有 `Consumer.StopClaiming` 新增导出，供进程层停止认领而保留已认领 Job 的排空职责；其余新增符号均保持包内。完整 Go 验证在交付前执行。
+12. 已完成 PostgreSQL、一个 Gateway 和两个 Worker 的 Docker Compose 部署。Compose 在 Gateway 暴露健康端口和 OpenAI-compatible 聊天入口。真实 PostgreSQL 集成测试验证两个 Consumer 同时处理不同 Session 的 Job，并分别以独立 Worker Owner 完成。公共 API 第二遍设计审查确认本轮新增导出包括 `Consumer.StopClaiming`（停止认领并排空已认领 Job）、`admin.ToolPolicyValidator`/`API.ToolPolicyValidator`（发布阶段校验运行时工具能力）、`session.ValidateBackend`（校验内置 Session provider）和 `log.SafeError`（统一错误输出脱敏）；其余新增符号均保持包内。完整 Go 验证在交付前执行。
 
 ### 9.3 闭环验收
 

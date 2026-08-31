@@ -8,11 +8,14 @@ import (
 	"strings"
 	"time"
 
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	goredis "github.com/redis/go-redis/v9"
 )
 
-const dispatchPayloadField = "dispatch"
+const (
+	dispatchPayloadField = "dispatch"
+)
 
 // Stream is one Redis Stream Consumer Group used for worker dispatches.
 type Stream struct {
@@ -178,14 +181,7 @@ func decodeDelivery(message goredis.XMessage) (queue.Delivery, error) {
 }
 
 func truncateError(err error) string {
-	if err == nil {
-		return ""
-	}
-	value := err.Error()
-	if len(value) > 512 {
-		return value[:512]
-	}
-	return value
+	return platformlog.SafeError(err)
 }
 
 var _ queue.Publisher = (*Stream)(nil)

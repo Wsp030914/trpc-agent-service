@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
 
 func TestConfigFromEnvironmentRequiresExplicitWorkerIdentity(t *testing.T) {
@@ -37,6 +40,79 @@ func TestConfigFromEnvironmentRequiresExplicitWorkerIdentity(t *testing.T) {
 	if err == nil {
 		t.Fatal("config without worker ID succeeded")
 	}
+}
+
+func TestRenewLeaseCancelsWorkOnFailure(t *testing.T) {
+	t.Parallel()
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	want := errors.New("lease lost")
+	go renewLease(runCtx, cancel, 10*time.Millisecond, done, func(context.Context) error {
+		return want
+	})
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, want) {
+			t.Fatalf("renew error = %v, want %v", err, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lease renewal did not finish")
+	}
+	if runCtx.Err() == nil {
+		t.Fatal("lease renewal failure did not cancel work")
+	}
+}
+
+func TestRenewLeaseBoundsRenewalCall(t *testing.T) {
+	t.Parallel()
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go renewLease(runCtx, cancel, 30*time.Millisecond, done, func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("renew error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded lease renewal did not finish")
+	}
+	if runCtx.Err() == nil {
+		t.Fatal("bounded renewal failure did not cancel work")
+	}
+}
+
+func TestDeleteArtifactCleanupUsesBoundedContext(t *testing.T) {
+	t.Parallel()
+	executor := artifactCleanupExecutorFunc(func(ctx context.Context, _ worker.Execution, _ platformartifact.CleanupRecord) error {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return errors.New("cleanup context has no deadline")
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || remaining > artifactCleanupTimeout {
+			return fmt.Errorf("cleanup deadline remaining = %s", remaining)
+		}
+		return nil
+	})
+	if err := deleteArtifactCleanup(context.Background(), executor, worker.Execution{}, platformartifact.CleanupRecord{}); err != nil {
+		t.Fatalf("delete artifact cleanup: %v", err)
+	}
+}
+
+type artifactCleanupExecutorFunc func(context.Context, worker.Execution, platformartifact.CleanupRecord) error
+
+func (f artifactCleanupExecutorFunc) DeleteCleanup(
+	ctx context.Context,
+	exec worker.Execution,
+	record platformartifact.CleanupRecord,
+) error {
+	return f(ctx, exec, record)
 }
 
 func TestConfigFromEnvironmentRequiresAdminTokenForGateway(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -50,6 +51,9 @@ func (s *Store) CreateDataMigration(ctx context.Context, record migration.Record
 	}
 	if sameAuthoritativeBackends(source.BackendConfig, target.BackendConfig) {
 		return errors.New("data migration target does not change authoritative backends")
+	}
+	if err := validateSupportedDataMigration(source.BackendConfig, target.BackendConfig); err != nil {
+		return err
 	}
 	if !sameMigrationBehavior(source, target) {
 		return errors.New("data migration target changes behavior outside backend_config")
@@ -144,66 +148,6 @@ RETURNING migration_id, tenant_id, app_id, source_config_version, target_config_
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return migration.Record{}, fmt.Errorf("commit data migration drain: %w", err)
-	}
-	return record, nil
-}
-
-// ClaimDataMigration takes over a non-terminal migration whose owner lease is
-// expired. A new run token prevents an old worker from changing its state.
-func (s *Store) ClaimDataMigration(
-	ctx context.Context,
-	tenantID, appID, migrationID, owner string,
-	leaseDuration time.Duration,
-) (migration.Record, error) {
-	if err := s.validate(); err != nil {
-		return migration.Record{}, err
-	}
-	if tenantID == "" || appID == "" || migrationID == "" || owner == "" {
-		return migration.Record{}, errors.New("data migration scope, id, and owner are required")
-	}
-	if leaseDuration <= 0 {
-		return migration.Record{}, errors.New("data migration lease duration must be positive")
-	}
-	token := uuid.NewString()
-	var record migration.Record
-	var progress, validation []byte
-	err := s.pool.QueryRow(ctx, `
-UPDATE platform.data_migration
-SET lease_owner = $4, lease_until = clock_timestamp() + $5::interval,
-    run_token = $6, updated_at = clock_timestamp()
-WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3
-  AND status IN ('DRAINING', 'COPYING', 'VERIFYING')
-  AND (lease_until IS NULL OR lease_until <= clock_timestamp())
-RETURNING migration_id, tenant_id, app_id, source_config_version, target_config_version,
-          status, lease_owner, lease_until, run_token, drain_deadline,
-          progress, validation_result, failure_reason`,
-		migrationID, tenantID, appID, owner, intervalLiteral(leaseDuration), token,
-	).Scan(
-		&record.ID,
-		&record.TenantID,
-		&record.AppID,
-		&record.SourceConfigVersion,
-		&record.TargetConfigVersion,
-		&record.Status,
-		&record.LeaseOwner,
-		&record.LeaseUntil,
-		&record.RunToken,
-		&record.DrainDeadline,
-		&progress,
-		&validation,
-		&record.FailureReason,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return migration.Record{}, fmt.Errorf("claim data migration: %w", ErrNotFound)
-	}
-	if err != nil {
-		return migration.Record{}, fmt.Errorf("claim data migration: %w", err)
-	}
-	if err := unmarshalDataMigrationReport(&record, progress, validation); err != nil {
-		return migration.Record{}, err
-	}
-	if err := record.Validate(); err != nil {
-		return migration.Record{}, fmt.Errorf("claimed data migration: %w", err)
 	}
 	return record, nil
 }
@@ -453,6 +397,7 @@ func (s *Store) UpdateDataMigrationReport(
 	if err := validation.Validate(); err != nil {
 		return err
 	}
+	failureReason = platformlog.SafeError(errors.New(failureReason))
 	progressJSON, err := json.Marshal(progress)
 	if err != nil {
 		return fmt.Errorf("marshal data migration progress: %w", err)
@@ -598,4 +543,27 @@ func sameMigrationBehavior(source, target tenant.AppConfig) bool {
 		reflect.DeepEqual(source.Audit, target.Audit) &&
 		reflect.DeepEqual(source.SecretRefs, target.SecretRefs) &&
 		reflect.DeepEqual(source.ChannelBinding, target.ChannelBinding)
+}
+
+// validateSupportedDataMigration rejects backend transitions that the worker
+// cannot copy without silently leaving one authoritative backend behind.
+func validateSupportedDataMigration(source, target tenant.BackendConfig) error {
+	if !sameBackendRef(source.Memory, target.Memory) || !sameBackendRef(source.Artifact, target.Artifact) {
+		return errors.New("data migration only supports session backend changes")
+	}
+	if !isRedisSessionBackend(source.Session) {
+		return errors.New("data migration source session backend must use redis")
+	}
+	if !isPostgresSessionBackend(target.Session) {
+		return errors.New("data migration target session backend must use postgres")
+	}
+	return nil
+}
+
+func isRedisSessionBackend(ref tenant.BackendRef) bool {
+	return ref.Kind == tenant.BackendRedis && (ref.Provider == "" || ref.Provider == "redis")
+}
+
+func isPostgresSessionBackend(ref tenant.BackendRef) bool {
+	return ref.Kind == tenant.BackendSQL && (ref.Provider == "" || ref.Provider == "postgres")
 }

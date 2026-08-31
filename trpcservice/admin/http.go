@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -352,7 +353,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 		return false
 	}
 	body := http.MaxBytesReader(w, r.Body, maxAdminRequestBytes)
-	defer func() { _ = body.Close() }()
+	defer func() {
+		if err := body.Close(); err != nil {
+			log.Printf("close admin request body: %v", err)
+		}
+	}()
 	decoder := json.NewDecoder(body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -365,7 +370,9 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("write admin json response: %v", err)
+	}
 }
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {

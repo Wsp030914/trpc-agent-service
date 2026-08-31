@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -31,6 +32,7 @@ func (s *Store) EnqueueKnowledgeIndex(ctx context.Context, job platformknowledge
 }
 
 func insertKnowledgeIndexJob(ctx context.Context, db databaseExecutor, job platformknowledge.IndexJob) error {
+	job.LastError = platformlog.SafeError(errors.New(job.LastError))
 	_, err := db.Exec(ctx, `
 INSERT INTO platform.knowledge_index_job (
     job_id, tenant_id, app_id, knowledge_base_id, document_id, document_version,
@@ -217,6 +219,7 @@ func failKnowledgeGenerationBuild(
 	if cause == "" {
 		cause = "knowledge index job failed"
 	}
+	cause = platformlog.SafeError(errors.New(cause))
 	if _, err := tx.Exec(ctx, `
 UPDATE platform.knowledge_generation_build
 SET status = 'FAILED', last_error = $2, updated_at = clock_timestamp()
@@ -428,7 +431,7 @@ SET status = 'PENDING', next_attempt_at = clock_timestamp() + $4::interval,
     updated_at = clock_timestamp()
 WHERE job_id = $1 AND status = 'RUNNING' AND lease_owner = $2 AND run_token = $3
   AND lease_until > clock_timestamp()`,
-		job.ID, job.LeaseOwner, job.RunToken, intervalLiteral(delay), cause.Error())
+		job.ID, job.LeaseOwner, job.RunToken, intervalLiteral(delay), platformlog.SafeError(cause))
 	if err != nil {
 		return fmt.Errorf("retry knowledge index: %w", err)
 	}
@@ -459,7 +462,7 @@ UPDATE platform.knowledge_index_job
 SET status = 'FAILED', lease_owner = NULL, lease_until = NULL, run_token = NULL,
     last_error = $4, updated_at = clock_timestamp()
 WHERE job_id = $1 AND status = 'RUNNING' AND lease_owner = $2 AND run_token = $3
-  AND lease_until > clock_timestamp()`, job.ID, job.LeaseOwner, job.RunToken, cause.Error())
+	  AND lease_until > clock_timestamp()`, job.ID, job.LeaseOwner, job.RunToken, platformlog.SafeError(cause))
 	if err != nil {
 		return fmt.Errorf("fail knowledge index: %w", err)
 	}

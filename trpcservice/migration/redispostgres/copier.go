@@ -11,7 +11,6 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 	platformsession "github.com/liuzengh/trpc-agent-service/trpcservice/session"
 	sessionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/session/postgres"
-	sessionredis "github.com/liuzengh/trpc-agent-service/trpcservice/session/redis"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
@@ -35,10 +34,9 @@ func NewCopier(
 	stores storage.Resolver,
 	sessions platformsession.Resolver,
 	postgresSessions *sessionpostgres.SessionResolver,
-	redisSessions *sessionredis.SessionResolver,
 	record migration.Record,
 ) (*Copier, error) {
-	if configs == nil || stores == nil || sessions == nil || postgresSessions == nil || redisSessions == nil {
+	if configs == nil || stores == nil || sessions == nil || postgresSessions == nil {
 		return nil, errors.New("data migration copier dependencies are required")
 	}
 	if err := record.Validate(); err != nil {
@@ -64,16 +62,19 @@ func NewCopier(
 	if !isPostgresSession(targetExec.Config.BackendConfig.Session) {
 		return nil, errors.New("data migration target session backend must use postgres")
 	}
-	if err := redisSessions.CheckSessionBackend(ctx, sourceExec); err != nil {
-		return nil, fmt.Errorf("check redis source session backend: %w", err)
-	}
 	source, err := sessions.ResolveSession(ctx, sourceExec)
 	if err != nil {
 		return nil, fmt.Errorf("resolve redis source session: %w", err)
 	}
+	if source == nil {
+		return nil, errors.New("resolved redis source session is required")
+	}
 	target, err := sessions.ResolveSession(ctx, targetExec)
 	if err != nil {
 		return nil, fmt.Errorf("resolve postgres target session: %w", err)
+	}
+	if target == nil {
+		return nil, errors.New("resolved postgres target session is required")
 	}
 	importer, err := postgresSessions.NewSummaryImporter(ctx, targetExec)
 	if err != nil {
@@ -81,7 +82,7 @@ func NewCopier(
 	}
 	return &Copier{
 		core: migration.RedisPostgresCopier{
-			Source:    source,
+			Source:    verifiedRedisSource{Service: source},
 			Target:    target,
 			Summaries: importer,
 		},
@@ -103,6 +104,44 @@ func (c *Copier) VerifySession(ctx context.Context, key session.Key) error {
 		return errors.New("redis postgres migration copier is required")
 	}
 	return c.core.VerifySession(ctx, key)
+}
+
+type verifiedRedisSource struct {
+	session.Service
+}
+
+func (s verifiedRedisSource) GetSession(
+	ctx context.Context,
+	key session.Key,
+	options ...session.Option,
+) (*session.Session, error) {
+	value, err := s.Service.GetSession(ctx, key, options...)
+	if err != nil || value != nil {
+		return value, err
+	}
+	values, err := s.ListSessions(ctx, session.UserKey{
+		AppName: key.AppName,
+		UserID:  key.UserID,
+	}, session.WithListSessionOnlyMeta())
+	if err != nil {
+		return nil, fmt.Errorf("verify absent redis source session: %w", err)
+	}
+	for _, candidate := range values {
+		if candidate != nil && candidate.ID == key.SessionID {
+			return nil, errors.New("redis source returned an existing session as absent")
+		}
+	}
+	return nil, nil
+}
+
+// GetSessionSummaries fails closed because the pinned Redis provider exposes
+// only summary text, not the complete filter-keyed Summary records required
+// for lossless migration.
+func (s verifiedRedisSource) GetSessionSummaries(
+	context.Context,
+	session.Key,
+) (map[string]*session.Summary, error) {
+	return nil, migration.ErrSummaryImportRequired
 }
 
 // Close releases the dedicated PostgreSQL summary import connection pool.

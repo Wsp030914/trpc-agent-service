@@ -83,7 +83,7 @@ func (i *SummaryImporter) ReplaceSessionSummaries(
 	ctx context.Context,
 	key session.Key,
 	summaries map[string]*session.Summary,
-) error {
+) (err error) {
 	if i == nil || i.pool == nil || i.table == "" {
 		return errors.New("postgres summary importer is not initialized")
 	}
@@ -100,7 +100,11 @@ func (i *SummaryImporter) ReplaceSessionSummaries(
 	if err != nil {
 		return fmt.Errorf("begin replace session summaries: %w", err)
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	defer func() {
+		if rollbackErr := tx.Rollback(context.Background()); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			err = errors.Join(err, fmt.Errorf("rollback replace session summaries: %w", rollbackErr))
+		}
+	}()
 	if _, err := tx.Exec(ctx, fmt.Sprintf(
 		"DELETE FROM %s WHERE app_name = $1 AND user_id = $2 AND session_id = $3",
 		i.table,
@@ -132,6 +136,53 @@ func (i *SummaryImporter) ReplaceSessionSummaries(
 		return fmt.Errorf("commit replace session summaries: %w", err)
 	}
 	return nil
+}
+
+// GetSessionSummaries returns all active summaries stored for key.
+func (i *SummaryImporter) GetSessionSummaries(
+	ctx context.Context,
+	key session.Key,
+) (map[string]*session.Summary, error) {
+	if i == nil || i.pool == nil || i.table == "" {
+		return nil, errors.New("postgres summary importer is not initialized")
+	}
+	if err := key.CheckSessionKey(); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rows, err := i.pool.Query(ctx, fmt.Sprintf(
+		"SELECT filter_key, summary FROM %s WHERE app_name = $1 AND user_id = $2 AND session_id = $3 AND deleted_at IS NULL ORDER BY filter_key",
+		i.table,
+	), key.AppName, key.UserID, key.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("read session summaries: %w", err)
+	}
+	defer rows.Close()
+	var result map[string]*session.Summary
+	for rows.Next() {
+		var filterKey string
+		var encoded []byte
+		if err := rows.Scan(&filterKey, &encoded); err != nil {
+			return nil, fmt.Errorf("scan session summary: %w", err)
+		}
+		var value *session.Summary
+		if err := json.Unmarshal(encoded, &value); err != nil {
+			return nil, fmt.Errorf("unmarshal session summary %q: %w", filterKey, err)
+		}
+		if result == nil {
+			result = make(map[string]*session.Summary)
+		}
+		result[filterKey] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate session summaries: %w", err)
+	}
+	return result, nil
 }
 
 // Close releases the database resources owned by SummaryImporter.

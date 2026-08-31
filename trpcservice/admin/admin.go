@@ -18,6 +18,7 @@ import (
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
 	memorytencentdb "github.com/liuzengh/trpc-agent-service/trpcservice/memory/tencentdb"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
+	platformsession "github.com/liuzengh/trpc-agent-service/trpcservice/session"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -48,6 +49,13 @@ type knowledgeGenerationRepository interface {
 	RebuildKnowledgeGeneration(context.Context, string, string, string) error
 }
 
+// ToolPolicyValidator checks whether an application tool policy can be backed
+// by the tools registered in the deployed runtime.
+type ToolPolicyValidator interface {
+	// ValidateToolPolicy rejects policies that the deployed runtime cannot serve.
+	ValidateToolPolicy(context.Context, tenant.ToolPolicy) error
+}
+
 // CreateChannelBinding validates and persists an IM account binding owned by
 // one tenant application. It does not enable an IM callback by itself.
 func (a API) CreateChannelBinding(ctx context.Context, binding channels.Binding) error {
@@ -68,12 +76,22 @@ func (a API) CreateChannelBinding(ctx context.Context, binding channels.Binding)
 type API struct {
 	Bindings   config.BindingResolver
 	Repository Repository
+	// ToolPolicyValidator rejects policies unsupported by the deployed runtime.
+	ToolPolicyValidator ToolPolicyValidator
 }
 
 // ValidateAppConfig checks app config fields and cross-resource references.
 func (a API) ValidateAppConfig(ctx context.Context, cfg tenant.AppConfig) error {
 	if err := cfg.Validate(); err != nil {
 		return err
+	}
+	if err := platformsession.ValidateBackend(cfg.BackendConfig.Session); err != nil {
+		return fmt.Errorf("session backend provider: %w", err)
+	}
+	if a.ToolPolicyValidator != nil {
+		if err := a.ToolPolicyValidator.ValidateToolPolicy(ctx, cfg.Tools); err != nil {
+			return fmt.Errorf("tool policy runtime: %w", err)
+		}
 	}
 	if !cfg.BackendConfig.Memory.IsZero() {
 		if err := memorytencentdb.ValidateBackend(cfg.BackendConfig.Memory); err != nil {

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
 // EnqueueArtifactCleanup records one unreachable object for asynchronous
@@ -24,6 +25,7 @@ func (s *Store) EnqueueArtifactCleanup(ctx context.Context, record platformartif
 	if record.Status != platformartifact.CleanupPending || record.LeaseOwner != "" || !record.LeaseUntil.IsZero() {
 		return errors.New("new artifact cleanup must be pending without a lease")
 	}
+	record.LastError = platformlog.SafeError(errors.New(record.LastError))
 	_, err := s.pool.Exec(ctx, `
 INSERT INTO platform.artifact_cleanup (
     cleanup_id, tenant_id, app_id, config_version, session_principal_id,
@@ -128,6 +130,37 @@ RETURNING cleanup.cleanup_id, cleanup.tenant_id, cleanup.app_id, cleanup.config_
 	return record, true, nil
 }
 
+// RenewArtifactCleanup extends the current worker's cleanup lease. It rejects
+// a worker that has been superseded or whose lease already expired.
+func (s *Store) RenewArtifactCleanup(
+	ctx context.Context,
+	record platformartifact.CleanupRecord,
+	leaseDuration time.Duration,
+) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	if record.Status != platformartifact.CleanupRunning || leaseDuration <= 0 {
+		return errors.New("artifact cleanup lease renewal is invalid")
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE platform.artifact_cleanup
+SET lease_until = clock_timestamp() + $4::interval, updated_at = clock_timestamp()
+WHERE cleanup_id = $1 AND status = 'RUNNING' AND lease_owner = $2 AND run_token = $3
+  AND lease_until > clock_timestamp()`,
+		record.ID, record.LeaseOwner, record.RunToken, intervalLiteral(leaseDuration))
+	if err != nil {
+		return fmt.Errorf("renew artifact cleanup: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("renew artifact cleanup: %w", platformartifact.ErrCleanupLeaseLost)
+	}
+	return nil
+}
+
 // CompleteArtifactCleanup records successful deletion for the current lease
 // holder and retains the cleanup row as an audit record.
 func (s *Store) CompleteArtifactCleanup(ctx context.Context, record platformartifact.CleanupRecord) error {
@@ -179,7 +212,7 @@ SET status = 'PENDING', next_attempt_at = clock_timestamp() + $4::interval,
     updated_at = clock_timestamp()
 WHERE cleanup_id = $1 AND status = 'RUNNING' AND lease_owner = $2 AND run_token = $3
   AND lease_until > clock_timestamp()`,
-		record.ID, record.LeaseOwner, record.RunToken, intervalLiteral(delay), cause.Error())
+		record.ID, record.LeaseOwner, record.RunToken, intervalLiteral(delay), platformlog.SafeError(cause))
 	if err != nil {
 		return fmt.Errorf("retry artifact cleanup: %w", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
 
@@ -118,7 +119,7 @@ func (e Executor) fail(ctx context.Context, record Record, progress Progress, va
 	if ctx.Err() != nil {
 		return cause
 	}
-	if err := e.Repository.UpdateDataMigrationReport(ctx, record, progress, validation, cause.Error()); err != nil {
+	if err := e.Repository.UpdateDataMigrationReport(ctx, record, progress, validation, platformlog.SafeError(cause)); err != nil {
 		return errors.Join(cause, err)
 	}
 	if err := e.Repository.AdvanceDataMigration(ctx, record, StatusFailed); err != nil {

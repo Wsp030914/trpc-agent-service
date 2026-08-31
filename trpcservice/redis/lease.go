@@ -12,7 +12,13 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-const sessionLeasePrefix = "trpc-agent-service:session:"
+const (
+	sessionLeasePrefix    = "trpc-agent-service:session:"
+	leaseRetryInterval    = 100 * time.Millisecond
+	leaseReleaseTimeout   = 5 * time.Second
+	leaseRenewDivisor     = 3
+	leaseRenewSuccessCode = 1
+)
 
 var renewLeaseScript = goredis.NewScript(`
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -69,7 +75,7 @@ func (l *SessionLocker) Lock(ctx context.Context, partitionKey string) (worker.S
 		if result == "OK" {
 			break
 		}
-		timer := time.NewTimer(100 * time.Millisecond)
+		timer := time.NewTimer(leaseRetryInterval)
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -115,7 +121,7 @@ func (l *sessionLease) Release() error {
 		close(l.stop)
 		<-l.done
 		l.cancel()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
 		defer cancel()
 		if _, err := releaseLeaseScript.Run(ctx, l.client, []string{l.key}, l.token).Result(); err != nil {
 			l.err = fmt.Errorf("release redis session lease: %w", err)
@@ -126,7 +132,7 @@ func (l *sessionLease) Release() error {
 
 func (l *sessionLease) renew() {
 	defer close(l.done)
-	interval := l.ttl / 3
+	interval := l.ttl / leaseRenewDivisor
 	if interval <= 0 {
 		interval = time.Nanosecond
 	}
@@ -137,10 +143,10 @@ func (l *sessionLease) renew() {
 		case <-l.stop:
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), l.ttl/3)
+			ctx, cancel := context.WithTimeout(context.Background(), l.ttl/leaseRenewDivisor)
 			result, err := renewLeaseScript.Run(ctx, l.client, []string{l.key}, l.token, l.ttl.Milliseconds()).Int()
 			cancel()
-			if err != nil || result != 1 {
+			if err != nil || result != leaseRenewSuccessCode {
 				l.cancel()
 				return
 			}

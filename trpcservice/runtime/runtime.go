@@ -16,6 +16,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
 	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
@@ -26,7 +27,14 @@ import (
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
-const runtimeAgentName = "assistant"
+const (
+	runtimeAgentName = "assistant"
+
+	maxTemperature = 2
+	maxTopP        = 1
+	minPenalty     = -2
+	maxPenalty     = 2
+)
 
 // ModelRuntime is the model and generation settings selected for one immutable
 // application configuration version.
@@ -79,6 +87,8 @@ type KnowledgeResolver interface {
 type ToolResolver interface {
 	ResolveTools(ctx context.Context, exec worker.Execution) ([]frameworktool.Tool, error)
 }
+
+type runnerFactory func(string, frameworkagent.Agent, ...runner.Option) runner.Runner
 
 // ModelAPIKeyResolver resolves a model API key for one execution. Implementations
 // must obtain the key from an external secret store and must not log it.
@@ -196,6 +206,7 @@ type RuntimeRunnerResolver struct {
 	closed    bool
 	runners   map[string]runner.Runner
 	ephemeral map[uintptr]runner.Runner
+	newRunner runnerFactory
 }
 
 // RuntimeRunnerOption configures a RuntimeRunnerResolver.
@@ -251,6 +262,7 @@ func NewRuntimeRunnerResolver(
 		sessions:  sessions,
 		runners:   make(map[string]runner.Runner),
 		ephemeral: make(map[uintptr]runner.Runner),
+		newRunner: runner.NewRunner,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -371,6 +383,8 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 			return nil, err
 		}
 		agentOptions = append(agentOptions, llmagent.WithTools(visible))
+	} else if hasConfiguredTools(exec.Config.Tools) {
+		return nil, errors.New("tool resolver is required for configured tools")
 	}
 	agent := llmagent.New(runtimeAgentName, agentOptions...)
 	runnerOptions := []runner.Option{runner.WithSessionService(sessionService)}
@@ -380,13 +394,18 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 	if artifactService != nil {
 		runnerOptions = append(runnerOptions, runner.WithArtifactService(artifactService))
 	}
-	resolved := runner.NewRunner(appName, agent, runnerOptions...)
+	if r.newRunner == nil {
+		return nil, errors.New("runtime runner factory is not initialized")
+	}
+	resolved := r.newRunner(appName, agent, runnerOptions...)
+	if resolved == nil {
+		return nil, errors.New("runtime runner factory returned nil")
+	}
 	if !cacheable {
 		r.mu.Lock()
 		if r.closed {
 			r.mu.Unlock()
-			_ = resolved.Close()
-			return nil, errors.New("runtime runner resolver is closed")
+			return closeUnpublishedRunner(resolved, errors.New("runtime runner resolver is closed"))
 		}
 		r.ephemeral[runnerIdentity(resolved)] = resolved
 		r.mu.Unlock()
@@ -394,17 +413,29 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
-		return nil, errors.New("runtime runner resolver is closed")
+		r.mu.Unlock()
+		return closeUnpublishedRunner(resolved, errors.New("runtime runner resolver is closed"))
 	}
 	// Another caller may have published a runner for the same scope while
 	// this one was building; prefer the cached instance.
 	if cached := r.runners[cacheKey]; cached != nil {
+		r.mu.Unlock()
+		if closeErr := resolved.Close(); closeErr != nil {
+			return nil, fmt.Errorf("close duplicate runner: %w", closeErr)
+		}
 		return cached, nil
 	}
 	r.runners[cacheKey] = resolved
+	r.mu.Unlock()
 	return resolved, nil
+}
+
+func closeUnpublishedRunner(resolved runner.Runner, cause error) (runner.Runner, error) {
+	if closeErr := resolved.Close(); closeErr != nil {
+		return nil, errors.Join(cause, fmt.Errorf("close unpublished runner: %w", closeErr))
+	}
+	return nil, cause
 }
 
 func requiresPerExecutionRunner(resolver SessionIngestorResolver, exec worker.Execution) bool {
@@ -440,11 +471,14 @@ func (r *RuntimeRunnerResolver) ReleaseRunner(resolved runner.Runner) error {
 
 func visibleTools(policy tenant.ToolPolicy, tools []frameworktool.Tool) ([]frameworktool.Tool, error) {
 	visible := make([]frameworktool.Tool, 0, len(tools))
+	available := make(map[string]struct{}, len(tools))
 	for i, candidate := range tools {
 		if candidate == nil || candidate.Declaration() == nil {
 			return nil, fmt.Errorf("tool %d declaration is required", i)
 		}
-		if err := platformtool.AuthorizeVisibility(policy, candidate.Declaration().Name); err != nil {
+		name := candidate.Declaration().Name
+		available[name] = struct{}{}
+		if err := platformtool.AuthorizeVisibility(policy, name); err != nil {
 			if errors.Is(err, platformtool.ErrToolNotVisible) {
 				continue
 			}
@@ -452,7 +486,21 @@ func visibleTools(policy tenant.ToolPolicy, tools []frameworktool.Tool) ([]frame
 		}
 		visible = append(visible, candidate)
 	}
+	for _, name := range policy.VisibleTools {
+		if _, ok := available[name]; !ok {
+			return nil, fmt.Errorf("configured visible tool %q is not available", name)
+		}
+	}
+	for _, name := range policy.ExecutableTools {
+		if _, ok := available[name]; !ok {
+			return nil, fmt.Errorf("configured executable tool %q is not available", name)
+		}
+	}
 	return visible, nil
+}
+
+func hasConfiguredTools(policy tenant.ToolPolicy) bool {
+	return len(policy.VisibleTools) > 0 || len(policy.ExecutableTools) > 0
 }
 
 func runnerAppName(tc tenant.RuntimeContext) (string, error) {
@@ -514,13 +562,13 @@ func openAIModelOptions(parameters map[string]string) (string, model.GenerationC
 			}
 			baseURL = value
 		case "temperature":
-			parsed, err := parseFloatParameter(key, value, 0, 2)
+			parsed, err := parseFloatParameter(key, value, 0, maxTemperature)
 			if err != nil {
 				return "", model.GenerationConfig{}, err
 			}
 			generationConfig.Temperature = &parsed
 		case "top_p":
-			parsed, err := parseFloatParameter(key, value, 0, 1)
+			parsed, err := parseFloatParameter(key, value, 0, maxTopP)
 			if err != nil {
 				return "", model.GenerationConfig{}, err
 			}
@@ -532,13 +580,13 @@ func openAIModelOptions(parameters map[string]string) (string, model.GenerationC
 			}
 			generationConfig.MaxTokens = &parsed
 		case "presence_penalty":
-			parsed, err := parseFloatParameter(key, value, -2, 2)
+			parsed, err := parseFloatParameter(key, value, minPenalty, maxPenalty)
 			if err != nil {
 				return "", model.GenerationConfig{}, err
 			}
 			generationConfig.PresencePenalty = &parsed
 		case "frequency_penalty":
-			parsed, err := parseFloatParameter(key, value, -2, 2)
+			parsed, err := parseFloatParameter(key, value, minPenalty, maxPenalty)
 			if err != nil {
 				return "", model.GenerationConfig{}, err
 			}

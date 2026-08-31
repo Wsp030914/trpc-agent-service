@@ -1,7 +1,9 @@
 package log_test
 
 import (
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -33,5 +35,30 @@ func TestRoutingFieldsAllowlistsNonSensitiveValues(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("routing fields = %#v, want %#v", got, want)
+	}
+}
+
+func TestSafeErrorRedactsCredentialsAndToolArguments(t *testing.T) {
+	raw := errors.New(`request failed: authorization=Bearer bearer-secret api_key=sk-1234567890123456 dsn=postgres://user:db-secret@example.test/db tool_args={"email":"person@example.test"}`)
+	got := platformlog.SafeError(raw)
+	for _, secret := range []string{
+		"bearer-secret",
+		"sk-1234567890123456",
+		"db-secret",
+		`"email":"person@example.test"`,
+	} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("safe error contains %q: %q", secret, got)
+		}
+	}
+	if !strings.Contains(got, "request failed") || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("safe error = %q, want bounded diagnostic text and redactions", got)
+	}
+}
+
+func TestSafeErrorBoundsOutput(t *testing.T) {
+	got := platformlog.SafeError(errors.New(strings.Repeat("x", 1024)))
+	if len([]rune(got)) > 512 {
+		t.Fatalf("safe error length = %d, want at most 512", len([]rune(got)))
 	}
 }

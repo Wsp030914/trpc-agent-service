@@ -98,12 +98,16 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	return service, nil
 }
 
-func ensureSchema(ctx context.Context, dsn, schema string) error {
+func ensureSchema(ctx context.Context, dsn, schema string) (err error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("connect postgres session backend: %w", err)
 	}
-	defer func() { _ = conn.Close(context.Background()) }()
+	defer func() {
+		if closeErr := conn.Close(context.Background()); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close postgres session backend: %w", closeErr))
+		}
+	}()
 	if _, err := conn.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{schema}.Sanitize()); err != nil {
 		return fmt.Errorf("create postgres session schema: %w", err)
 	}

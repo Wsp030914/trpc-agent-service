@@ -2,13 +2,20 @@ package runtime
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
 	artifactmemory "trpc.group/trpc-go/trpc-agent-go/artifact/inmemory"
+	frameworkevent "trpc.group/trpc-go/trpc-agent-go/event"
+	frameworkmodel "trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
+	frameworkrunner "trpc.group/trpc-go/trpc-agent-go/runner"
 	frameworksession "trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/noop"
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
@@ -23,6 +30,93 @@ func TestVisibleToolsFiltersBeforeAgentConstruction(t *testing.T) {
 	}
 	if len(tools) != 1 || tools[0].Declaration().Name != "safe" {
 		t.Fatalf("visible tools = %#v", tools)
+	}
+}
+
+func TestVisibleToolsRejectsConfiguredUnavailableTool(t *testing.T) {
+	_, err := visibleTools(tenant.ToolPolicy{VisibleTools: []string{"missing"}}, []frameworktool.Tool{
+		testTool{name: "available"},
+	})
+	if err == nil {
+		t.Fatal("visible tools succeeded with unavailable configured tool")
+	}
+}
+
+func TestRuntimeRunnerResolverUsesToolResolver(t *testing.T) {
+	tools := &testToolResolver{tools: []frameworktool.Tool{testTool{name: "safe"}}}
+	resolver, err := NewRuntimeRunnerResolver(
+		testModelResolver{},
+		testSessionResolver{},
+		WithRuntimeToolResolver(tools),
+	)
+	if err != nil {
+		t.Fatalf("new runtime runner resolver: %v", err)
+	}
+	t.Cleanup(func() { _ = resolver.Close() })
+	exec := testMemoryExecution("user-a")
+	exec.Config.Tools = tenant.ToolPolicy{VisibleTools: []string{"safe"}}
+	if _, err := resolver.ResolveRunner(context.Background(), exec); err != nil {
+		t.Fatalf("resolve runner: %v", err)
+	}
+	if tools.calls != 1 {
+		t.Fatalf("tool resolver calls = %d, want 1", tools.calls)
+	}
+}
+
+func TestRuntimeRunnerResolverClosesDuplicateCachedRunner(t *testing.T) {
+	factory := newBlockingRunnerFactory()
+	resolver, err := NewRuntimeRunnerResolver(testModelResolver{}, testSessionResolver{})
+	if err != nil {
+		t.Fatalf("new runtime runner resolver: %v", err)
+	}
+	resolver.newRunner = factory.New
+
+	results := make(chan frameworkrunner.Runner, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			resolved, resolveErr := resolver.ResolveRunner(context.Background(), testMemoryExecution("user-a"))
+			results <- resolved
+			errs <- resolveErr
+		}()
+	}
+	select {
+	case <-factory.started:
+	case <-time.After(time.Second):
+		t.Fatal("runner factory did not receive concurrent builds")
+	}
+	close(factory.release)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("resolve runner: %v", err)
+		}
+		if <-results == nil {
+			t.Fatal("resolve runner returned nil")
+		}
+	}
+
+	factory.mu.Lock()
+	created := append([]*closeTrackingRunner(nil), factory.runners...)
+	factory.mu.Unlock()
+	if len(created) != 2 {
+		t.Fatalf("created runners = %d, want 2", len(created))
+	}
+	closed := 0
+	for _, runner := range created {
+		if runner.closes.Load() == 1 {
+			closed++
+		}
+	}
+	if closed != 1 {
+		t.Fatalf("closed duplicate runners = %d, want 1", closed)
+	}
+	if err := resolver.Close(); err != nil {
+		t.Fatalf("close resolver: %v", err)
+	}
+	for _, runner := range created {
+		if runner.closes.Load() != 1 {
+			t.Fatalf("runner close count = %d, want 1", runner.closes.Load())
+		}
 	}
 }
 
@@ -105,6 +199,62 @@ type testTool struct{ name string }
 
 func (t testTool) Declaration() *frameworktool.Declaration {
 	return &frameworktool.Declaration{Name: t.name}
+}
+
+type testToolResolver struct {
+	tools []frameworktool.Tool
+	calls int
+}
+
+func (r *testToolResolver) ResolveTools(context.Context, worker.Execution) ([]frameworktool.Tool, error) {
+	r.calls++
+	return r.tools, nil
+}
+
+type blockingRunnerFactory struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	mu          sync.Mutex
+	runners     []*closeTrackingRunner
+}
+
+func newBlockingRunnerFactory() *blockingRunnerFactory {
+	return &blockingRunnerFactory{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (f *blockingRunnerFactory) New(_ string, _ frameworkagent.Agent, _ ...frameworkrunner.Option) frameworkrunner.Runner {
+	runner := &closeTrackingRunner{}
+	f.mu.Lock()
+	f.runners = append(f.runners, runner)
+	if len(f.runners) == 2 {
+		f.startedOnce.Do(func() { close(f.started) })
+	}
+	f.mu.Unlock()
+	<-f.release
+	return runner
+}
+
+type closeTrackingRunner struct {
+	closes atomic.Int32
+}
+
+func (r *closeTrackingRunner) Run(
+	context.Context,
+	string,
+	string,
+	frameworkmodel.Message,
+	...frameworkagent.RunOption,
+) (<-chan *frameworkevent.Event, error) {
+	return nil, nil
+}
+
+func (r *closeTrackingRunner) Close() error {
+	r.closes.Add(1)
+	return nil
 }
 
 type testModelResolver struct{}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
@@ -419,12 +420,15 @@ func (s *Service) compensateSave(
 	record Record,
 	metadataErr error,
 ) error {
-	_ = s.metadata.AbandonArtifact(context.WithoutCancel(ctx), record)
+	metadataFailure := fmt.Errorf("record artifact metadata: %w", metadataErr)
+	if err := s.metadata.AbandonArtifact(context.WithoutCancel(ctx), record); err != nil {
+		metadataFailure = errors.Join(metadataFailure, fmt.Errorf("abandon artifact metadata: %w", err))
+	}
 	if err := s.deleteArtifactVersion(ctx, info, filename, record.Version); err == nil {
-		return fmt.Errorf("record artifact metadata: %w", metadataErr)
+		return metadataFailure
 	} else {
 		return s.enqueueVersionCleanup(ctx, record, errors.Join(
-			fmt.Errorf("record artifact metadata: %w", metadataErr),
+			metadataFailure,
 			fmt.Errorf("compensate artifact storage: %w", err),
 		))
 	}
@@ -442,7 +446,7 @@ func (s *Service) enqueueVersionCleanup(ctx context.Context, record Record, caus
 		ObjectKey:          record.ObjectKey,
 		Version:            record.Version,
 		Status:             CleanupPending,
-		LastError:          cause.Error(),
+		LastError:          platformlog.SafeError(cause),
 	}
 	if err := s.metadata.EnqueueArtifactCleanup(context.WithoutCancel(ctx), task); err != nil {
 		return errors.Join(cause, fmt.Errorf("record artifact cleanup: %w", err))

@@ -24,6 +24,11 @@ type Router struct {
 	resolvers map[string]Resolver
 }
 
+const (
+	postgresProvider = "postgres"
+	redisProvider    = "redis"
+)
+
 // NewRouter creates a Session resolver router from explicitly registered providers.
 func NewRouter(resolvers map[string]Resolver) (*Router, error) {
 	if len(resolvers) == 0 {
@@ -40,6 +45,32 @@ func NewRouter(resolvers map[string]Resolver) (*Router, error) {
 		cloned[provider] = resolver
 	}
 	return &Router{resolvers: cloned}, nil
+}
+
+// ValidateBackend checks whether the platform's built-in Session provider
+// registry can resolve ref. An empty provider retains the SQL and Redis
+// defaults used by older configuration versions.
+func ValidateBackend(ref tenant.BackendRef) error {
+	if err := ref.Validate(); err != nil {
+		return err
+	}
+	provider, err := sessionProvider(ref)
+	if err != nil {
+		return err
+	}
+	switch provider {
+	case postgresProvider:
+		if ref.Kind != tenant.BackendSQL {
+			return fmt.Errorf("session backend kind %q does not match provider %q", ref.Kind, provider)
+		}
+	case redisProvider:
+		if ref.Kind != tenant.BackendRedis {
+			return fmt.Errorf("session backend kind %q does not match provider %q", ref.Kind, provider)
+		}
+	default:
+		return fmt.Errorf("session provider %q is not supported", provider)
+	}
+	return nil
 }
 
 // ResolveSession selects the provider registered for the execution Session backend.
@@ -84,9 +115,9 @@ func sessionProvider(ref tenant.BackendRef) (string, error) {
 	}
 	switch ref.Kind {
 	case tenant.BackendSQL:
-		return "postgres", nil
+		return postgresProvider, nil
 	case tenant.BackendRedis:
-		return "redis", nil
+		return redisProvider, nil
 	default:
 		return "", fmt.Errorf("session backend kind %q has no legacy provider", ref.Kind)
 	}

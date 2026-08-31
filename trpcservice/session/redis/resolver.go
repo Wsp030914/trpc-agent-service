@@ -10,7 +10,6 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
-	"github.com/redis/go-redis/v9"
 	frameworksession "trpc.group/trpc-go/trpc-agent-go/session"
 	redisprovider "trpc.group/trpc-go/trpc-agent-go/session/redis"
 )
@@ -80,46 +79,6 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	}
 	r.services[key] = service
 	return service, nil
-}
-
-// CheckSessionBackend verifies that the Redis endpoint selected by exec is
-// reachable. Data migration calls it before treating an absent Session as a
-// valid source state, because the framework provider represents a failed
-// existence check as an absent Session.
-func (r *SessionResolver) CheckSessionBackend(ctx context.Context, exec worker.Execution) error {
-	if r == nil || r.urls == nil {
-		return errors.New("redis session resolver is not initialized")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	handle := exec.Storage.Session
-	if err := handle.Validate(exec.Tenant.Scope(), storage.CapabilitySession, exec.Config.BackendConfig.Session); err != nil {
-		return fmt.Errorf("session storage handle: %w", err)
-	}
-	if handle.Ref.Kind != tenant.BackendRedis || (handle.Ref.Provider != "" && handle.Ref.Provider != "redis") {
-		return fmt.Errorf("session backend %q must use redis provider", handle.Ref.Name)
-	}
-	url, err := r.urls.ResolveSessionURL(ctx, handle)
-	if err != nil {
-		return fmt.Errorf("resolve session url: %w", err)
-	}
-	if url == "" {
-		return errors.New("session redis url is required")
-	}
-	options, err := redis.ParseURL(url)
-	if err != nil {
-		return fmt.Errorf("parse session redis url: %w", err)
-	}
-	client := redis.NewClient(options)
-	defer func() { _ = client.Close() }()
-	if err := client.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("ping session redis backend: %w", err)
-	}
-	return nil
 }
 
 // Close closes cached Session services.

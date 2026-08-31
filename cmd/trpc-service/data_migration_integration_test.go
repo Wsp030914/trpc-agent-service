@@ -135,7 +135,15 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 	if err != nil {
 		t.Fatalf("create redis stream: %v", err)
 	}
-	runtime, err := newWorkerRuntime(store, *dataMigrationTestDSN, *dataMigrationTestURL, "", redisClient, stream, "worker-migration", environmentReader(nil))
+	runtime, err := newWorkerRuntime(workerRuntimeDependencies{
+		store:             store,
+		defaultSessionDSN: *dataMigrationTestDSN,
+		defaultRedisURL:   *dataMigrationTestURL,
+		redisClient:       redisClient,
+		stream:            stream,
+		owner:             "worker-migration",
+		getenv:            environmentReader(nil),
+	})
 	if err != nil {
 		t.Fatalf("new worker runtime: %v", err)
 	}
@@ -454,12 +462,25 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 	if err != nil || !found {
 		t.Fatalf("claim artifact cleanup found=%v err=%v", found, err)
 	}
+	if err := store.RenewArtifactCleanup(ctx, previous, artifactCleanupLease); err != nil {
+		t.Fatalf("renew artifact cleanup: %v", err)
+	}
+	var leaseUntil time.Time
+	if err := pool.QueryRow(ctx, `SELECT lease_until FROM platform.artifact_cleanup WHERE cleanup_id = $1`, record.ID).Scan(&leaseUntil); err != nil {
+		t.Fatalf("query renewed cleanup lease: %v", err)
+	}
+	if !leaseUntil.After(time.Now()) {
+		t.Fatalf("renewed cleanup lease = %v, want future lease", leaseUntil)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE platform.artifact_cleanup SET lease_until = clock_timestamp() - interval '1 second' WHERE cleanup_id = $1`, record.ID); err != nil {
 		t.Fatalf("expire cleanup lease: %v", err)
 	}
 	successor, found, err := store.ClaimNextArtifactCleanup(ctx, "worker-successor", artifactCleanupLease)
 	if err != nil || !found || successor.RunToken == previous.RunToken {
 		t.Fatalf("claim successor cleanup found=%v record=%+v err=%v", found, successor, err)
+	}
+	if err := store.RenewArtifactCleanup(ctx, previous, artifactCleanupLease); !errors.Is(err, platformartifact.ErrCleanupLeaseLost) {
+		t.Fatalf("previous worker renew error = %v, want lease lost", err)
 	}
 	if err := store.CompleteArtifactCleanup(ctx, previous); !errors.Is(err, platformartifact.ErrCleanupLeaseLost) {
 		t.Fatalf("previous worker complete error = %v, want lease lost", err)
@@ -689,7 +710,15 @@ func newDataMigrationTestRuntime(
 		_ = redisClient.Close()
 		t.Fatalf("create redis stream: %v", err)
 	}
-	runtime, err := newWorkerRuntime(store, *dataMigrationTestDSN, sessionRedisURL, "", redisClient, stream, owner, environmentReader(nil))
+	runtime, err := newWorkerRuntime(workerRuntimeDependencies{
+		store:             store,
+		defaultSessionDSN: *dataMigrationTestDSN,
+		defaultRedisURL:   sessionRedisURL,
+		redisClient:       redisClient,
+		stream:            stream,
+		owner:             owner,
+		getenv:            environmentReader(nil),
+	})
 	if err != nil {
 		_ = redisClient.Close()
 		t.Fatalf("new worker runtime: %v", err)

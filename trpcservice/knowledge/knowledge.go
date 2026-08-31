@@ -4,6 +4,7 @@ package knowledge
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 )
 
 var (
@@ -36,6 +38,13 @@ const (
 	MetadataChunkID = "chunk_id"
 	// MetadataIndexGeneration is the required Qdrant payload metadata field.
 	MetadataIndexGeneration = "index_generation"
+
+	// scopedSearchInitialOverfetch bounds the first candidate batch while
+	// leaving room for SQL authorization to reject vector hits.
+	scopedSearchInitialOverfetch = 4
+	// scopedSearchMaxOverfetch bounds the extra candidates requested when a
+	// provider does not expose a paging cursor through the framework API.
+	scopedSearchMaxOverfetch = 256
 )
 
 // ChunkRef identifies one derived vector chunk under its authoritative scope.
@@ -102,7 +111,7 @@ func (d Document) Validate() error {
 	if d.Version < 0 {
 		return errors.New("document version is invalid")
 	}
-	if len(d.ContentSHA256) != 32 {
+	if len(d.ContentSHA256) != sha256.Size {
 		return errors.New("document content sha256 is required")
 	}
 	if d.Status != DocumentStatusPending && d.Status != DocumentStatusAvailable && d.Status != DocumentStatusDeleted {
@@ -305,8 +314,8 @@ func NewScopedKnowledge(
 	}, nil
 }
 
-// Search retrieves candidates independently for every authorized knowledge
-// base, then filters every result through the SQL authority.
+// Search retrieves candidates for all authorized knowledge bases, then
+// filters every result through the SQL authority.
 func (k *ScopedKnowledge) Search(
 	ctx context.Context,
 	req *frameworkknowledge.SearchRequest,
@@ -327,31 +336,28 @@ func (k *ScopedKnowledge) Search(
 		return &frameworkknowledge.SearchResult{}, nil
 	}
 
-	all := make([]*frameworkknowledge.Result, 0)
-	for _, baseID := range k.baseIDs {
-		result, err := k.inner.Search(ctx, scopedRequest(req, k.scope, baseID))
+	searchLimit := scopedSearchLimit(req.MaxResults)
+	var all []*frameworkknowledge.Result
+	for {
+		searchRequest := scopedRequest(req, k.scope, k.baseIDs)
+		searchRequest.MaxResults = searchLimit
+		result, err := k.inner.Search(ctx, searchRequest)
 		if err != nil {
-			return nil, fmt.Errorf("search knowledge base %q: %w", baseID, err)
+			return nil, fmt.Errorf("search scoped knowledge: %w", err)
 		}
-		if result == nil {
-			continue
+		all, err = k.authorizeCandidates(ctx, result)
+		if err != nil {
+			return nil, err
 		}
-		for _, candidate := range result.Documents {
-			if candidate == nil || candidate.Document == nil {
-				continue
-			}
-			ref, ok := chunkRef(k.scope, k.config, baseID, candidate.Document)
-			if !ok {
-				continue
-			}
-			available, err := k.catalog.AvailableKnowledgeChunk(ctx, ref)
-			if err != nil {
-				return nil, fmt.Errorf("authorize knowledge chunk: %w", err)
-			}
-			if available {
-				all = append(all, candidate)
-			}
+		if req.MaxResults <= 0 || len(all) >= req.MaxResults ||
+			result == nil || len(result.Documents) < searchLimit {
+			break
 		}
+		nextLimit := nextScopedSearchLimit(searchLimit, req.MaxResults)
+		if nextLimit == searchLimit {
+			break
+		}
+		searchLimit = nextLimit
 	}
 	sort.SliceStable(all, func(i, j int) bool { return all[i].Score > all[j].Score })
 	if req.MaxResults > 0 && len(all) > req.MaxResults {
@@ -360,10 +366,79 @@ func (k *ScopedKnowledge) Search(
 	return searchResult(all), nil
 }
 
+func (k *ScopedKnowledge) authorizeCandidates(
+	ctx context.Context,
+	result *frameworkknowledge.SearchResult,
+) ([]*frameworkknowledge.Result, error) {
+	all := make([]*frameworkknowledge.Result, 0)
+	if result == nil {
+		return all, nil
+	}
+	for _, candidate := range result.Documents {
+		if candidate == nil || candidate.Document == nil {
+			continue
+		}
+		baseID := metadataString(candidate.Document.Metadata, MetadataKnowledgeBaseID)
+		if !slices.Contains(k.baseIDs, baseID) {
+			continue
+		}
+		ref, ok := chunkRef(k.scope, k.config, baseID, candidate.Document)
+		if !ok {
+			continue
+		}
+		available, err := k.catalog.AvailableKnowledgeChunk(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("authorize knowledge chunk: %w", err)
+		}
+		if available {
+			all = append(all, candidate)
+		}
+	}
+	return all, nil
+}
+
+func scopedSearchLimit(maxResults int) int {
+	if maxResults <= 0 {
+		return maxResults
+	}
+	extra := maxResults * (scopedSearchInitialOverfetch - 1)
+	if extra < 0 || extra > scopedSearchMaxOverfetch {
+		extra = scopedSearchMaxOverfetch
+	}
+	maxInt := int(^uint(0) >> 1)
+	if maxResults > maxInt-extra {
+		return maxInt
+	}
+	return maxResults + extra
+}
+
+func nextScopedSearchLimit(current, maxResults int) int {
+	maxLimit := scopedSearchMaxLimit(maxResults)
+	if current <= 0 || current >= maxLimit {
+		return current
+	}
+	next := current * 2
+	if next < current || next > maxLimit {
+		return maxLimit
+	}
+	return next
+}
+
+func scopedSearchMaxLimit(maxResults int) int {
+	if maxResults <= 0 {
+		return maxResults
+	}
+	maxInt := int(^uint(0) >> 1)
+	if maxResults > maxInt-scopedSearchMaxOverfetch {
+		return maxInt
+	}
+	return maxResults + scopedSearchMaxOverfetch
+}
+
 func scopedRequest(
 	req *frameworkknowledge.SearchRequest,
 	scope tenant.Scope,
-	baseID string,
+	baseIDs []string,
 ) *frameworkknowledge.SearchRequest {
 	cloned := *req
 	filter := &frameworkknowledge.SearchFilter{}
@@ -377,7 +452,17 @@ func scopedRequest(
 	}
 	filter.Metadata[MetadataTenantID] = scope.TenantID
 	filter.Metadata[MetadataAppID] = scope.AppID
-	filter.Metadata[MetadataKnowledgeBaseID] = baseID
+	delete(filter.Metadata, MetadataKnowledgeBaseID)
+	baseValues := make([]any, len(baseIDs))
+	for index, baseID := range baseIDs {
+		baseValues[index] = baseID
+	}
+	baseCondition := searchfilter.In("metadata."+MetadataKnowledgeBaseID, baseValues...)
+	if filter.FilterCondition == nil {
+		filter.FilterCondition = baseCondition
+	} else {
+		filter.FilterCondition = searchfilter.And(filter.FilterCondition, baseCondition)
+	}
 	cloned.SearchFilter = filter
 	return &cloned
 }

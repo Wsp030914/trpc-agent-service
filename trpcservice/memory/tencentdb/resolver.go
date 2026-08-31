@@ -160,11 +160,16 @@ func (r *Resolver) resolveService(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		_ = service.Close()
-		return nil, errors.New("tencentdb memory resolver is closed")
+		closedErr := errors.New("tencentdb memory resolver is closed")
+		if closeErr := service.Close(); closeErr != nil {
+			return nil, errors.Join(closedErr, fmt.Errorf("close tencentdb memory service: %w", closeErr))
+		}
+		return nil, closedErr
 	}
 	if existing := r.services[key]; existing != nil {
-		_ = service.Close()
+		if closeErr := service.Close(); closeErr != nil {
+			return nil, fmt.Errorf("close duplicate tencentdb memory service: %w", closeErr)
+		}
 		return existing, nil
 	}
 	r.services[key] = service

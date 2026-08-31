@@ -4,16 +4,12 @@ package cos
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"mime"
-	"net/http"
-	"net/url"
-	"strings"
 	"sync"
 
+	sharedcos "github.com/liuzengh/trpc-agent-service/internal/cosclient"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
@@ -94,7 +90,7 @@ func (r *Resolver) ResolveArtifact(ctx context.Context, exec worker.Execution) (
 	if err != nil {
 		return nil, fmt.Errorf("resolve cos endpoint: %w", err)
 	}
-	if err := validateEndpoint(endpoint); err != nil {
+	if err := sharedcos.ValidateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
 	serviceKey, err := artifactServiceKey(scope, exec.Tenant.ConfigVersion, ref, endpoint)
@@ -116,31 +112,21 @@ func (r *Resolver) ResolveArtifact(ctx context.Context, exec worker.Execution) (
 	if err != nil {
 		return nil, fmt.Errorf("resolve cos credentials: %w", err)
 	}
-	credentials, err := parseCredentials(credential)
+	client, err := sharedcos.New(endpoint, credential)
 	if err != nil {
 		return nil, err
 	}
 	frameworkService, err := frameworkcos.NewService(
 		ref.Name,
 		endpoint,
-		frameworkcos.WithSecretID(credentials.SecretID),
-		frameworkcos.WithSecretKey(credentials.SecretKey),
+		frameworkcos.WithClient(client),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create cos artifact service: %w", err)
 	}
-	endpointURL, err := url.Parse(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("parse cos endpoint: %w", err)
-	}
 	service := &versionedService{
 		Service: frameworkService,
-		client: cosclient.NewClient(&cosclient.BaseURL{BucketURL: endpointURL}, &http.Client{
-			Transport: &cosclient.AuthorizationTransport{
-				SecretID:  credentials.SecretID,
-				SecretKey: credentials.SecretKey,
-			},
-		}),
+		client:  client,
 	}
 
 	r.mu.Lock()
@@ -253,27 +239,6 @@ func (r *Resolver) Close() error {
 	return nil
 }
 
-type credentials struct {
-	SecretID  string `json:"secret_id"`
-	SecretKey string `json:"secret_key"`
-}
-
-func parseCredentials(value string) (credentials, error) {
-	var result credentials
-	decoder := json.NewDecoder(strings.NewReader(value))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&result); err != nil {
-		return credentials{}, fmt.Errorf("decode cos credentials: %w", err)
-	}
-	if err := ensureJSONEOF(decoder); err != nil {
-		return credentials{}, err
-	}
-	if result.SecretID == "" || result.SecretKey == "" {
-		return credentials{}, errors.New("cos credentials require secret_id and secret_key")
-	}
-	return result, nil
-}
-
 func artifactServiceKey(scope tenant.Scope, version string, ref tenant.BackendRef, endpoint string) (string, error) {
 	parts := []string{version, ref.Provider, ref.Name, ref.SecretRef.Name}
 	if ref.SecretRef.Version != "" {
@@ -281,24 +246,4 @@ func artifactServiceKey(scope tenant.Scope, version string, ref tenant.BackendRe
 	}
 	parts = append(parts, endpoint)
 	return scope.Key("artifact", parts...)
-}
-
-func validateEndpoint(value string) error {
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
-		parsed.User != nil || parsed.Fragment != "" {
-		return errors.New("operator cos endpoint must be an absolute https url")
-	}
-	return nil
-}
-
-func ensureJSONEOF(decoder *json.Decoder) error {
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("decode cos credentials: multiple json values")
-		}
-		return fmt.Errorf("decode cos credentials: %w", err)
-	}
-	return nil
 }

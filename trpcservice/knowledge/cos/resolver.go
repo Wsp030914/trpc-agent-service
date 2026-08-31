@@ -8,15 +8,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 
+	sharedcos "github.com/liuzengh/trpc-agent-service/internal/cosclient"
 	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
@@ -248,8 +246,7 @@ func (r *Resolver) resolveClient(ctx context.Context, exec worker.Execution) (*c
 	if err != nil {
 		return nil, fmt.Errorf("resolve knowledge cos endpoint: %w", err)
 	}
-	parsed, err := parseEndpoint(endpoint)
-	if err != nil {
+	if err := sharedcos.ValidateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
 	key, err := sourceClientKey(exec.Tenant.Scope(), exec.Tenant.ConfigVersion, ref, endpoint)
@@ -271,16 +268,10 @@ func (r *Resolver) resolveClient(ctx context.Context, exec worker.Execution) (*c
 	if err != nil {
 		return nil, fmt.Errorf("resolve knowledge cos credentials: %w", err)
 	}
-	credentials, err := parseCredentials(credential)
+	client, err := sharedcos.New(endpoint, credential)
 	if err != nil {
 		return nil, err
 	}
-	client := cosclient.NewClient(&cosclient.BaseURL{BucketURL: parsed}, &http.Client{
-		Transport: &cosclient.AuthorizationTransport{
-			SecretID:  credentials.SecretID,
-			SecretKey: credentials.SecretKey,
-		},
-	})
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -304,39 +295,6 @@ func validateDocumentExecution(exec worker.Execution, document platformknowledge
 		return errors.New("knowledge document scope does not match execution")
 	}
 	return nil
-}
-
-func parseEndpoint(value string) (*url.URL, error) {
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
-		return nil, errors.New("operator cos endpoint must be an absolute https url")
-	}
-	return parsed, nil
-}
-
-type credentials struct {
-	SecretID  string `json:"secret_id"`
-	SecretKey string `json:"secret_key"`
-}
-
-func parseCredentials(value string) (credentials, error) {
-	var result credentials
-	decoder := json.NewDecoder(strings.NewReader(value))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&result); err != nil {
-		return credentials{}, fmt.Errorf("decode cos credentials: %w", err)
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return credentials{}, errors.New("decode cos credentials: multiple json values")
-		}
-		return credentials{}, fmt.Errorf("decode cos credentials: %w", err)
-	}
-	if result.SecretID == "" || result.SecretKey == "" {
-		return credentials{}, errors.New("cos credentials require secret_id and secret_key")
-	}
-	return result, nil
 }
 
 func objectKey(scope tenant.Scope, baseID, documentID string, version int, digest [sha256.Size]byte) string {
