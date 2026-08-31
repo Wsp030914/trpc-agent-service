@@ -106,6 +106,28 @@ func NewChannelBindingIdentityResolver(
 	route LocatedChannelBinding,
 	runtimeContext tenant.RuntimeContext,
 ) (*ChannelBindingIdentityResolver, error) {
+	return newChannelBindingIdentityResolver(route, runtimeContext, false)
+}
+
+// NewChannelBindingInputIdentityResolver creates a Gateway resolver for a
+// channel input whose user and session principals will be mapped by the
+// admission transaction. The route and runtime scope still come only from the
+// located Binding.
+func NewChannelBindingInputIdentityResolver(
+	route LocatedChannelBinding,
+	runtimeContext tenant.RuntimeContext,
+) (*ChannelBindingIdentityResolver, error) {
+	if runtimeContext.SessionID == "" {
+		runtimeContext.SessionID = channels.DefaultSessionID
+	}
+	return newChannelBindingIdentityResolver(route, runtimeContext, true)
+}
+
+func newChannelBindingIdentityResolver(
+	route LocatedChannelBinding,
+	runtimeContext tenant.RuntimeContext,
+	mappingPending bool,
+) (*ChannelBindingIdentityResolver, error) {
 	if route.provenance == nil {
 		return nil, errors.New("channel binding route provenance is required")
 	}
@@ -122,12 +144,20 @@ func NewChannelBindingIdentityResolver(
 		runtimeContext.BindingID != snapshot.BindingID {
 		return nil, ErrChannelBindingScopeMismatch
 	}
+	if mappingPending {
+		if err := validatePendingRuntimeContext(runtimeContext); err != nil {
+			return nil, fmt.Errorf("pending channel binding context: %w", err)
+		}
+	} else if err := runtimeContext.Validate(); err != nil {
+		return nil, fmt.Errorf("channel binding runtime context: %w", err)
+	}
 	identity := AdmissionIdentity{
-		Tenant:          runtimeContext,
-		Source:          TenantSourceVerifiedChannelBinding,
-		SourceID:        snapshot.BindingID,
-		PublicRouteID:   snapshot.PublicRouteID,
-		BindingRevision: snapshot.BindingRevision,
+		Tenant:                runtimeContext,
+		Source:                TenantSourceVerifiedChannelBinding,
+		SourceID:              snapshot.BindingID,
+		PublicRouteID:         snapshot.PublicRouteID,
+		BindingRevision:       snapshot.BindingRevision,
+		channelMappingPending: mappingPending,
 		channelBindingProvenance: &channelBindingProvenance{
 			runtimeContext:   runtimeContext,
 			source:           TenantSourceVerifiedChannelBinding,
@@ -135,9 +165,14 @@ func NewChannelBindingIdentityResolver(
 			credentialDigest: CredentialDigest{},
 			publicRouteID:    snapshot.PublicRouteID,
 			bindingRevision:  snapshot.BindingRevision,
+			mappingPending:   mappingPending,
 		},
 	}
-	if err := identity.Validate(); err != nil {
+	validateIdentity := identity.Validate
+	if mappingPending {
+		validateIdentity = identity.ValidateForChannelInput
+	}
+	if err := validateIdentity(); err != nil {
 		return nil, fmt.Errorf("channel binding identity: %w", err)
 	}
 	return &ChannelBindingIdentityResolver{

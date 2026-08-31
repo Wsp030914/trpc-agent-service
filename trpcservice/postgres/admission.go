@@ -35,9 +35,23 @@ func (s *Store) Admit(
 		request.Identity.Source != gateway.TenantSourceVerifiedChannelBinding {
 		return gateway.AdmissionResult{}, gateway.ErrUnsupportedAdmissionSource
 	}
-	command, payloadHash, err := marshalAdmissionCommand(request.Identity, request.Message)
-	if err != nil {
-		return gateway.AdmissionResult{}, err
+	if request.Identity.Source == gateway.TenantSourceVerifiedChannelBinding &&
+		request.ChannelInput == nil {
+		return gateway.AdmissionResult{}, gateway.ErrChannelInputRequired
+	}
+	if request.ChannelInput != nil {
+		// Channel webhook idempotency is defined by the binding-scoped provider
+		// message ID. Do not let a caller-supplied key alias another message.
+		request.IdempotencyKey = request.ChannelInput.ExternalMessageID
+	}
+	var command []byte
+	var payloadHash [sha256.Size]byte
+	var err error
+	if request.ChannelInput == nil {
+		command, payloadHash, err = marshalAdmissionCommand(request.Identity, request.Message)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
 	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -110,13 +124,108 @@ func (s *Store) Admit(
 		return gateway.AdmissionResult{}, err
 	}
 	admission := admissionTransaction{
-		ctx:         ctx,
-		tx:          tx,
-		request:     request,
-		credential:  credential,
-		app:         app,
-		command:     command,
-		payloadHash: payloadHash,
+		ctx:              ctx,
+		tx:               tx,
+		request:          request,
+		credential:       credential,
+		app:              app,
+		command:          command,
+		payloadHash:      payloadHash,
+		runtimeContext:   request.Identity.Tenant,
+		channelAdmission: request.ChannelInput != nil,
+	}
+	if request.ChannelInput != nil {
+		if s.identityMapper == nil {
+			return gateway.AdmissionResult{}, errors.New("channel identity mapper is required")
+		}
+		mappingRequest, err := channelIdentityMappingRequest(request)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		payloadHash, err = s.identityMapper.channelPayloadHash(ctx, mappingRequest, *request.ChannelInput)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		admission.payloadHash = payloadHash
+		inbox, found, err := findChannelInbox(
+			ctx,
+			tx,
+			request.Identity.Tenant.TenantID,
+			request.Identity.Tenant.AppID,
+			request.Identity.Tenant.BindingID,
+			request.ChannelInput.ExternalMessageID,
+		)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		if found {
+			return admission.reconcileChannelInbox(inbox)
+		}
+		rejectReason, err := channelInputRejectReason(*request.ChannelInput)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		if rejectReason != "" {
+			if err := insertChannelInbox(
+				ctx,
+				tx,
+				request,
+				payloadHash[:],
+				channelInboxStatusRejected,
+				rejectReason,
+				nil,
+				nil,
+			); err != nil {
+				return gateway.AdmissionResult{}, admissionInsertError("insert rejected channel inbox", err)
+			}
+			if err := insertChannelInboxRejectionAudit(ctx, tx, request, rejectReason); err != nil {
+				return gateway.AdmissionResult{}, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return gateway.AdmissionResult{}, fmt.Errorf("commit rejected channel admission: %w", err)
+			}
+			return gateway.AdmissionResult{
+				RequestID: request.RequestID,
+				Status:    gateway.AdmissionStatusRejected,
+			}, nil
+		}
+		targetEnvelope, targetExpiresAt, err := request.ChannelInput.SealMessageReplyTarget(
+			ctx,
+			s.identityMapper.protector,
+			request.Identity.Tenant.Scope(),
+			request.RequestID,
+		)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		if err := insertChannelInbox(
+			ctx,
+			tx,
+			request,
+			payloadHash[:],
+			channelInboxStatusAdmitted,
+			"",
+			targetEnvelope,
+			targetExpiresAt,
+		); err != nil {
+			return gateway.AdmissionResult{}, admissionInsertError("insert channel inbox", err)
+		}
+		mapped, err := s.identityMapper.mapInTransaction(ctx, tx, mappingRequest)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		admission.runtimeContext = request.Identity.Tenant
+		admission.runtimeContext.ConfigVersion = app.ActiveConfigVersion
+		admission.runtimeContext.SessionPrincipalID = mapped.SessionPrincipalID
+		admission.runtimeContext.SessionID = mapped.SessionID
+		admission.runtimeContext.UserID = mapped.Identity.UserID
+		admission.command, _, err = marshalAdmissionCommandForRuntimeContext(
+			admission.runtimeContext,
+			request.Message,
+		)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
 	}
 	existing, found, err := findExecutionByIdempotency(
 		ctx,
@@ -139,13 +248,86 @@ func (s *Store) Admit(
 }
 
 type admissionTransaction struct {
-	ctx         context.Context
-	tx          pgx.Tx
-	request     gateway.AdmissionRequest
-	credential  auth.Credential
-	app         tenant.AgentApp
-	command     []byte
-	payloadHash [sha256.Size]byte
+	ctx              context.Context
+	tx               pgx.Tx
+	request          gateway.AdmissionRequest
+	credential       auth.Credential
+	app              tenant.AgentApp
+	command          []byte
+	payloadHash      [sha256.Size]byte
+	runtimeContext   tenant.RuntimeContext
+	channelAdmission bool
+}
+
+func channelIdentityMappingRequest(request gateway.AdmissionRequest) (IdentityMappingRequest, error) {
+	if request.ChannelInput == nil {
+		return IdentityMappingRequest{}, errors.New("channel input is required")
+	}
+	mapping, ok := request.ChannelInput.MappingInput()
+	if !ok {
+		return IdentityMappingRequest{}, errors.New("channel mapping input is required")
+	}
+	return IdentityMappingRequest{
+		Scope:                      request.Identity.Tenant.Scope(),
+		BindingID:                  request.Identity.Tenant.BindingID,
+		Channel:                    channels.Channel(request.Identity.Tenant.Channel),
+		Kind:                       request.ChannelInput.Conversation.Kind,
+		ExternalSenderID:           mapping.ExternalSenderID,
+		ExternalChatID:             mapping.ExternalChatID,
+		ExternalThreadID:           mapping.ExternalThreadID,
+		ProviderSenderTarget:       mapping.ProviderSenderTarget,
+		ProviderConversationTarget: mapping.ProviderConversationTarget,
+		ProviderThreadTarget:       mapping.ProviderThreadTarget,
+	}, nil
+}
+
+func (a admissionTransaction) reconcileChannelInbox(
+	inbox channelInboxRecord,
+) (gateway.AdmissionResult, error) {
+	if !bytes.Equal(inbox.PayloadHash, a.payloadHash[:]) {
+		return gateway.AdmissionResult{}, gateway.ErrIdempotencyConflict
+	}
+	switch inbox.Status {
+	case channelInboxStatusRejected:
+		if err := a.tx.Commit(a.ctx); err != nil {
+			return gateway.AdmissionResult{}, fmt.Errorf("commit rejected channel replay: %w", err)
+		}
+		return gateway.AdmissionResult{
+			RequestID: inbox.RequestID,
+			Replayed:  true,
+			Status:    gateway.AdmissionStatusRejected,
+		}, nil
+	case channelInboxStatusAdmitted:
+		existing, found, err := findExecutionByRequestID(
+			a.ctx,
+			a.tx,
+			a.credential.TenantID,
+			a.credential.AppID,
+			inbox.RequestID,
+		)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		if !found {
+			return gateway.AdmissionResult{}, errors.New("admitted channel inbox has no execution")
+		}
+		if !bytes.Equal(existing.PayloadHash, a.payloadHash[:]) {
+			return gateway.AdmissionResult{}, gateway.ErrIdempotencyConflict
+		}
+		result := gateway.AdmissionResult{
+			RequestID:     existing.RequestID,
+			ConfigVersion: existing.ConfigVersion,
+			TurnSeq:       existing.TurnSeq,
+			Replayed:      true,
+			Status:        gateway.AdmissionStatusAdmitted,
+		}
+		if err := a.tx.Commit(a.ctx); err != nil {
+			return gateway.AdmissionResult{}, fmt.Errorf("commit admitted channel replay: %w", err)
+		}
+		return result, nil
+	default:
+		return gateway.AdmissionResult{}, fmt.Errorf("channel inbox status %q is invalid", inbox.Status)
+	}
 }
 
 func (a admissionTransaction) reconcileExisting(existing admissionExecution) (gateway.AdmissionResult, error) {
@@ -153,14 +335,32 @@ func (a admissionTransaction) reconcileExisting(existing admissionExecution) (ga
 		return gateway.AdmissionResult{}, gateway.ErrIdempotencyConflict
 	}
 	if existing.Status != "FAILED" {
+		status := gateway.AdmissionStatus("")
+		if a.channelAdmission {
+			status = gateway.AdmissionStatusAdmitted
+		}
 		result := gateway.AdmissionResult{
 			RequestID:     existing.RequestID,
 			ConfigVersion: existing.ConfigVersion,
 			TurnSeq:       existing.TurnSeq,
 			Replayed:      true,
+			Status:        status,
 		}
 		if err := a.tx.Commit(a.ctx); err != nil {
 			return gateway.AdmissionResult{}, fmt.Errorf("commit replayed admission: %w", err)
+		}
+		return result, nil
+	}
+	if a.channelAdmission {
+		result := gateway.AdmissionResult{
+			RequestID:     existing.RequestID,
+			ConfigVersion: existing.ConfigVersion,
+			TurnSeq:       existing.TurnSeq,
+			Replayed:      true,
+			Status:        gateway.AdmissionStatusAdmitted,
+		}
+		if err := a.tx.Commit(a.ctx); err != nil {
+			return gateway.AdmissionResult{}, fmt.Errorf("commit failed channel replay: %w", err)
 		}
 		return result, nil
 	}
@@ -222,13 +422,17 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 		return gateway.AdmissionResult{}, fmt.Errorf("request_id already exists: %w", gateway.ErrIdempotencyConflict)
 	}
 
+	runtimeContext := a.runtimeContext
+	if runtimeContext == (tenant.RuntimeContext{}) {
+		runtimeContext = a.request.Identity.Tenant
+	}
 	turnSeq, err := allocateSessionTurn(
 		a.ctx,
 		a.tx,
 		a.credential.TenantID,
 		a.credential.AppID,
-		a.request.Identity.Tenant.SessionPrincipalID,
-		a.request.Identity.Tenant.SessionID,
+		runtimeContext.SessionPrincipalID,
+		runtimeContext.SessionID,
 	)
 	if err != nil {
 		return gateway.AdmissionResult{}, err
@@ -255,9 +459,9 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 		a.credential.TenantID,
 		a.credential.AppID,
 		a.request.RequestID,
-		a.request.Identity.Tenant.SessionPrincipalID,
-		a.request.Identity.Tenant.SessionID,
-		a.request.Identity.Tenant.UserID,
+		runtimeContext.SessionPrincipalID,
+		runtimeContext.SessionID,
+		runtimeContext.UserID,
 		turnSeq,
 		a.app.ActiveConfigVersion,
 		a.request.Identity.Source,
@@ -287,6 +491,7 @@ VALUES ($1, $2, $3)`,
 		RequestID:     a.request.RequestID,
 		ConfigVersion: a.app.ActiveConfigVersion,
 		TurnSeq:       turnSeq,
+		Status:        gateway.AdmissionStatusAdmitted,
 	}, nil
 }
 
@@ -506,6 +711,31 @@ FOR UPDATE`,
 	return value, true, nil
 }
 
+func findExecutionByRequestID(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, appID, requestID string,
+) (admissionExecution, bool, error) {
+	var value admissionExecution
+	err := tx.QueryRow(
+		ctx,
+		`SELECT request_id, config_version, turn_seq, payload_hash, status
+FROM platform.execution
+WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3
+FOR UPDATE`,
+		tenantID,
+		appID,
+		requestID,
+	).Scan(&value.RequestID, &value.ConfigVersion, &value.TurnSeq, &value.PayloadHash, &value.Status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return admissionExecution{}, false, nil
+	}
+	if err != nil {
+		return admissionExecution{}, false, fmt.Errorf("find channel execution: %w", err)
+	}
+	return value, true, nil
+}
+
 func executionRequestExists(ctx context.Context, tx pgx.Tx, tenantID, appID, requestID string) (bool, error) {
 	var exists bool
 	err := tx.QueryRow(
@@ -597,14 +827,21 @@ func marshalAdmissionCommand(
 	identity gateway.AdmissionIdentity,
 	message gateway.Message,
 ) ([]byte, [sha256.Size]byte, error) {
+	return marshalAdmissionCommandForRuntimeContext(identity.Tenant, message)
+}
+
+func marshalAdmissionCommandForRuntimeContext(
+	runtimeContext tenant.RuntimeContext,
+	message gateway.Message,
+) ([]byte, [sha256.Size]byte, error) {
 	command, err := json.Marshal(admissionCommand{
-		TenantID:           identity.Tenant.TenantID,
-		AppID:              identity.Tenant.AppID,
-		Channel:            identity.Tenant.Channel,
-		BindingID:          identity.Tenant.BindingID,
-		SessionPrincipalID: identity.Tenant.SessionPrincipalID,
-		SessionID:          identity.Tenant.SessionID,
-		UserID:             identity.Tenant.UserID,
+		TenantID:           runtimeContext.TenantID,
+		AppID:              runtimeContext.AppID,
+		Channel:            runtimeContext.Channel,
+		BindingID:          runtimeContext.BindingID,
+		SessionPrincipalID: runtimeContext.SessionPrincipalID,
+		SessionID:          runtimeContext.SessionID,
+		UserID:             runtimeContext.UserID,
 		Text:               message.Text,
 		ArtifactRefs:       append([]string(nil), message.ArtifactRefs...),
 	})
@@ -617,7 +854,9 @@ func marshalAdmissionCommand(
 func admissionInsertError(operation string, err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) &&
-		(pgErr.ConstraintName == "execution_pkey" || pgErr.ConstraintName == "execution_idempotency_idx") {
+		(pgErr.ConstraintName == "channel_inbox_pkey" ||
+			pgErr.ConstraintName == "execution_pkey" ||
+			pgErr.ConstraintName == "execution_idempotency_idx") {
 		return fmt.Errorf("%s: %w", operation, gateway.ErrIdempotencyConflict)
 	}
 	return fmt.Errorf("%s: %w", operation, err)

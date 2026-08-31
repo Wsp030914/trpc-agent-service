@@ -237,6 +237,110 @@ func (m *IdentityMapper) mapInTransaction(
 	return m.mapNormalizedTx(ctx, tx, request)
 }
 
+// channelPayloadHash returns the stable semantic hash used by channel Inbox
+// idempotency. It contains scoped digests of normalized provider identifiers,
+// not raw identifiers, and excludes internal principal IDs, targets,
+// timestamps, and route authorization snapshots. The digests are deliberately
+// independent of the rotating lookup HMAC key so provider retries remain
+// idempotent across key rotation.
+func (m *IdentityMapper) channelPayloadHash(
+	ctx context.Context,
+	request IdentityMappingRequest,
+	input channels.ChannelInput,
+) ([sha256.Size]byte, error) {
+	if m == nil || m.hasher == nil {
+		return [sha256.Size]byte{}, errors.New("identity mapper is not initialized")
+	}
+	if err := input.Validate(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	normalized, err := normalizeIdentityMappingRequest(request)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	payload := channelPayload{
+		TenantID:  normalized.Scope.TenantID,
+		AppID:     normalized.Scope.AppID,
+		BindingID: normalized.BindingID,
+		Channel:   normalized.Channel,
+		SenderKeyHash: stableChannelIDDigest(
+			normalized.Scope,
+			normalized.BindingID,
+			channels.ExternalIDUser,
+			normalized.ExternalSenderID,
+		),
+		MessageType:  input.MessageType,
+		Text:         input.Text,
+		ArtifactRefs: append([]string{}, input.ArtifactRefs...),
+	}
+	if normalized.Kind != channels.ConversationDirect {
+		threadKind := channels.ExternalIDNoThread
+		threadID := channels.NoThreadExternalID
+		if normalized.Kind == channels.ConversationTopic {
+			threadKind = channels.ExternalIDThread
+			threadID = normalized.ExternalThreadID
+		}
+		payload.ConversationKind = normalized.Kind
+		payload.ChatKeyHash = stableChannelIDDigest(
+			normalized.Scope,
+			normalized.BindingID,
+			channels.ExternalIDChat,
+			normalized.ExternalChatID,
+		)
+		payload.ThreadKeyHash = stableChannelIDDigest(
+			normalized.Scope,
+			normalized.BindingID,
+			threadKind,
+			threadID,
+		)
+	} else {
+		payload.ConversationKind = normalized.Kind
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("marshal channel payload: %w", err)
+	}
+	return sha256.Sum256(encoded), nil
+}
+
+func stableChannelIDDigest(
+	scope tenant.Scope,
+	bindingID string,
+	kind channels.ExternalIDKind,
+	externalID string,
+) string {
+	canonical := struct {
+		TenantID  string                  `json:"tenant_id"`
+		AppID     string                  `json:"app_id"`
+		BindingID string                  `json:"binding_id"`
+		Kind      channels.ExternalIDKind `json:"kind"`
+		External  string                  `json:"external_id"`
+	}{
+		TenantID:  scope.TenantID,
+		AppID:     scope.AppID,
+		BindingID: bindingID,
+		Kind:      kind,
+		External:  externalID,
+	}
+	encoded, _ := json.Marshal(canonical)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+type channelPayload struct {
+	TenantID         string                    `json:"tenant_id"`
+	AppID            string                    `json:"app_id"`
+	BindingID        string                    `json:"binding_id"`
+	Channel          channels.Channel          `json:"channel"`
+	ConversationKind channels.ConversationKind `json:"conversation_kind"`
+	SenderKeyHash    string                    `json:"sender_key_hash"`
+	ChatKeyHash      string                    `json:"chat_key_hash,omitempty"`
+	ThreadKeyHash    string                    `json:"thread_key_hash,omitempty"`
+	MessageType      channels.MessageType      `json:"message_type"`
+	Text             string                    `json:"text"`
+	ArtifactRefs     []string                  `json:"artifact_refs"`
+}
+
 func (m *IdentityMapper) mapNormalizedTx(
 	ctx context.Context,
 	tx pgx.Tx,

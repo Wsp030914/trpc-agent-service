@@ -38,7 +38,14 @@ func TestPostgresMigrationAndRepositories(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS platform CASCADE; DROP SCHEMA IF EXISTS agent CASCADE`); err != nil {
 		t.Fatalf("reset platform and session schemas: %v", err)
 	}
-	store, err := platformpostgres.New(pool)
+	store, err := platformpostgres.New(
+		pool,
+		platformpostgres.WithChannelIdentityMapping(
+			integrationExternalIDHasher{},
+			newIntegrationTargetProtector(t, "v1"),
+			[]string{"v1"},
+		),
+	)
 	if err != nil {
 		t.Fatalf("new postgres store: %v", err)
 	}
@@ -80,6 +87,8 @@ func TestPostgresMigrationAndRepositories(t *testing.T) {
 		"execution",
 		"dispatch_outbox",
 		"execution_event",
+		"channel_inbox",
+		"channel_inbox_rejection_audit",
 	} {
 		var exists bool
 		if err := pool.QueryRow(
@@ -227,33 +236,15 @@ func TestPostgresMigrationAndRepositories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve channel binding route: %v", err)
 	}
-	channelBindingResolver, err := gateway.NewChannelBindingIdentityResolver(
+	channelBindingRequest := newIM05Request(
+		t,
 		route,
-		tenant.RuntimeContext{
-			TenantID:           app.TenantID,
-			AppID:              app.AppID,
-			ConfigVersion:      "stale-v1",
-			Channel:            string(binding.Channel),
-			BindingID:          binding.BindingID,
-			SessionID:          "session-im-01",
-			SessionPrincipalID: "principal-im-01",
-			UserID:             "user-im-01",
-			TraceID:            "trace-im-01-1",
-		},
+		binding,
+		"message-im-01-1",
+		"request-im-01-1",
+		channels.MessageTypeText,
+		"channel binding admission",
 	)
-	if err != nil {
-		t.Fatalf("create channel binding identity resolver: %v", err)
-	}
-	channelBindingIdentity, err := channelBindingResolver.ResolveAdmissionIdentity(ctx)
-	if err != nil {
-		t.Fatalf("resolve channel binding identity: %v", err)
-	}
-	channelBindingRequest := gateway.AdmissionRequest{
-		RequestID:      "request-im-01-1",
-		IdempotencyKey: "message-im-01-1",
-		Identity:       channelBindingIdentity,
-		Message:        gateway.Message{Text: "channel binding admission"},
-	}
 	channelBindingResult, err := store.Admit(ctx, channelBindingRequest)
 	if err != nil {
 		t.Fatalf("admit channel binding request: %v", err)
@@ -317,31 +308,15 @@ func TestPostgresMigrationAndRepositories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve rotated channel binding route: %v", err)
 	}
-	rotatedChannelBindingResolver, err := gateway.NewChannelBindingIdentityResolver(
+	authorizationStaleRequest := newIM05Request(
+		t,
 		rotatedRoute,
-		tenant.RuntimeContext{
-			TenantID:           app.TenantID,
-			AppID:              app.AppID,
-			ConfigVersion:      "stale-v1",
-			Channel:            string(binding.Channel),
-			BindingID:          binding.BindingID,
-			SessionID:          "session-im-01",
-			SessionPrincipalID: "principal-im-01",
-			UserID:             "user-im-01",
-			TraceID:            "trace-im-01-auth-stale",
-		},
+		rotatedBinding,
+		"message-im-01-auth-stale",
+		"request-im-01-auth-stale",
+		channels.MessageTypeText,
+		"channel binding authorization stale",
 	)
-	if err != nil {
-		t.Fatalf("create rotated channel binding identity resolver: %v", err)
-	}
-	freshIdentity, err := rotatedChannelBindingResolver.ResolveAdmissionIdentity(ctx)
-	if err != nil {
-		t.Fatalf("resolve rotated channel binding identity: %v", err)
-	}
-	authorizationStaleRequest := channelBindingRequest
-	authorizationStaleRequest.RequestID = "request-im-01-auth-stale"
-	authorizationStaleRequest.IdempotencyKey = "message-im-01-auth-stale"
-	authorizationStaleRequest.Identity = freshIdentity
 	if _, err := pool.Exec(
 		ctx,
 		`UPDATE platform.channel_binding
@@ -378,11 +353,15 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
 		t.Fatalf("stale channel binding admission error = %v, want stale binding", err)
 	}
 
-	currentIdentity := freshIdentity
-	suspendedRequest := channelBindingRequest
-	suspendedRequest.RequestID = "request-im-01-suspended"
-	suspendedRequest.IdempotencyKey = "message-im-01-suspended"
-	suspendedRequest.Identity = currentIdentity
+	suspendedRequest := newIM05Request(
+		t,
+		rotatedRoute,
+		rotatedBinding,
+		"message-im-01-suspended",
+		"request-im-01-suspended",
+		channels.MessageTypeText,
+		"channel binding suspended",
+	)
 	disableTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin binding disable transaction: %v", err)

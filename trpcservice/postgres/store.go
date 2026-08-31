@@ -40,15 +40,46 @@ var (
 // and must close it after all Store operations have stopped. Store is safe for
 // concurrent use.
 type Store struct {
-	pool *pgxpool.Pool
+	pool           *pgxpool.Pool
+	identityMapper *IdentityMapper
+}
+
+// StoreOption configures a Store before it is used concurrently.
+type StoreOption func(*Store) error
+
+// WithChannelIdentityMapping configures the scoped Identity and Conversation
+// mapper used by channel admission. The supplied implementations must use
+// the platform's existing scoped secret infrastructure.
+func WithChannelIdentityMapping(
+	hasher channels.ExternalIDHasher,
+	protector channels.TargetProtector,
+	acceptedKeyVersions []string,
+) StoreOption {
+	return func(store *Store) error {
+		mapper, err := NewIdentityMapper(store, hasher, protector, acceptedKeyVersions)
+		if err != nil {
+			return err
+		}
+		store.identityMapper = mapper
+		return nil
+	}
 }
 
 // New creates a Store using a caller-owned PostgreSQL pool.
-func New(pool *pgxpool.Pool) (*Store, error) {
+func New(pool *pgxpool.Pool, options ...StoreOption) (*Store, error) {
 	if pool == nil {
 		return nil, errors.New("postgres pool is required")
 	}
-	return &Store{pool: pool}, nil
+	store := &Store{pool: pool}
+	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("postgres store option is required")
+		}
+		if err := option(store); err != nil {
+			return nil, fmt.Errorf("configure postgres store: %w", err)
+		}
+	}
+	return store, nil
 }
 
 // CreateTenant inserts a tenant control-plane record.

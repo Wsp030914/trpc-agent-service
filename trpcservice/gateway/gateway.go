@@ -36,6 +36,9 @@ var (
 	// ErrUnsupportedAdmissionSource means the selected admission backend does
 	// not yet implement the request's trusted source type.
 	ErrUnsupportedAdmissionSource = errors.New("admission source is unsupported")
+	// ErrChannelInputRequired means a verified channel admission did not carry
+	// the normalized provider-neutral message required by Inbox admission.
+	ErrChannelInputRequired = errors.New("channel input is required for channel admission")
 	// ErrAdmissionDraining means backend migration is draining accepted work and
 	// new requests must be retried after the advertised maintenance window.
 	ErrAdmissionDraining = errors.New("request admission is draining for data migration")
@@ -84,6 +87,7 @@ type AdmissionIdentity struct {
 	PublicRouteID            string
 	BindingRevision          int64
 	channelBindingProvenance *channelBindingProvenance
+	channelMappingPending    bool
 }
 
 // channelBindingProvenance is intentionally package-private. A channel
@@ -98,12 +102,27 @@ type channelBindingProvenance struct {
 	credentialDigest CredentialDigest
 	publicRouteID    string
 	bindingRevision  int64
+	mappingPending   bool
 }
 
 // Validate checks the trusted source and identity fields required for atomic
 // admission. The config version is advisory and is re-read by the backend.
 func (i AdmissionIdentity) Validate() error {
-	if err := i.Tenant.Validate(); err != nil {
+	return i.validate(false)
+}
+
+// ValidateForChannelInput checks a trusted channel identity whose sender and
+// session principals will be resolved by the admission transaction.
+func (i AdmissionIdentity) ValidateForChannelInput() error {
+	return i.validate(true)
+}
+
+func (i AdmissionIdentity) validate(allowPendingMapping bool) error {
+	if i.channelMappingPending && allowPendingMapping {
+		if err := validatePendingRuntimeContext(i.Tenant); err != nil {
+			return err
+		}
+	} else if err := i.Tenant.Validate(); err != nil {
 		return err
 	}
 	if !validTenantSource(i.Source) {
@@ -125,7 +144,8 @@ func (i AdmissionIdentity) Validate() error {
 			provenance.sourceID != i.SourceID ||
 			provenance.credentialDigest != i.CredentialDigest ||
 			provenance.publicRouteID != i.PublicRouteID ||
-			provenance.bindingRevision != i.BindingRevision {
+			provenance.bindingRevision != i.BindingRevision ||
+			provenance.mappingPending != i.channelMappingPending {
 			return errors.New("channel binding provenance does not match identity")
 		}
 		if err := channels.Channel(i.Tenant.Channel).Validate(); err != nil {
@@ -147,6 +167,28 @@ func (i AdmissionIdentity) Validate() error {
 	return nil
 }
 
+func validatePendingRuntimeContext(context tenant.RuntimeContext) error {
+	if context.TenantID == "" {
+		return errors.New("tenant_id is required")
+	}
+	if context.AppID == "" {
+		return errors.New("app_id is required")
+	}
+	if context.Channel == "" {
+		return errors.New("channel is required")
+	}
+	if context.BindingID == "" {
+		return errors.New("binding_id is required")
+	}
+	if context.SessionID == "" {
+		return errors.New("session_id is required")
+	}
+	if context.TraceID == "" {
+		return errors.New("trace_id is required")
+	}
+	return nil
+}
+
 // AdmissionIdentityResolver exposes an authenticated identity to the Gateway
 // without exposing raw credentials or trusting request payload tenant fields.
 type AdmissionIdentityResolver interface {
@@ -159,6 +201,7 @@ type Request struct {
 	IdempotencyKey string
 	Tenant         TenantResolver
 	Message        Message
+	ChannelInput   *channels.ChannelInput
 }
 
 // AdmissionRequest is the normalized command submitted to the atomic
@@ -168,6 +211,7 @@ type AdmissionRequest struct {
 	IdempotencyKey string
 	Identity       AdmissionIdentity
 	Message        Message
+	ChannelInput   *channels.ChannelInput
 }
 
 // Validate checks the fields that must be stable before the admission
@@ -179,23 +223,71 @@ func (r AdmissionRequest) Validate() error {
 	if r.IdempotencyKey == "" {
 		return errors.New("idempotency_key is required")
 	}
-	if err := r.Identity.Validate(); err != nil {
+	if r.ChannelInput == nil {
+		if r.channelMappingPending() {
+			return errors.New("channel mapping input is required")
+		}
+		if err := r.Identity.Validate(); err != nil {
+			return fmt.Errorf("admission identity: %w", err)
+		}
+		if err := r.Message.Validate(); err != nil {
+			return fmt.Errorf("message: %w", err)
+		}
+		return nil
+	}
+	if err := r.Identity.ValidateForChannelInput(); err != nil {
 		return fmt.Errorf("admission identity: %w", err)
 	}
-	if err := r.Message.Validate(); err != nil {
-		return fmt.Errorf("message: %w", err)
+	if err := r.ChannelInput.Validate(); err != nil {
+		return fmt.Errorf("channel input: %w", err)
+	}
+	if r.Identity.Source != TenantSourceVerifiedChannelBinding {
+		return ErrUnsupportedAdmissionSource
+	}
+	if r.ChannelInput.TenantID != r.Identity.Tenant.TenantID ||
+		r.ChannelInput.AppID != r.Identity.Tenant.AppID ||
+		r.ChannelInput.Channel != channels.Channel(r.Identity.Tenant.Channel) ||
+		r.ChannelInput.BindingID != r.Identity.Tenant.BindingID ||
+		r.ChannelInput.BindingRevision != r.Identity.BindingRevision {
+		return ErrChannelBindingScopeMismatch
+	}
+	if r.Message.Text != r.ChannelInput.Text ||
+		!slices.Equal(r.Message.ArtifactRefs, r.ChannelInput.ArtifactRefs) {
+		return errors.New("channel input message does not match gateway message")
+	}
+	if r.ChannelInput.MessageType == channels.MessageTypeText {
+		if err := r.Message.Validate(); err != nil {
+			return fmt.Errorf("message: %w", err)
+		}
 	}
 	return nil
 }
 
-// AdmissionResult describes the committed execution identity returned to an
-// ingress after atomic admission. Replayed is true when an identical
-// idempotent request already existed.
+func (r AdmissionRequest) channelMappingPending() bool {
+	return r.Identity.channelMappingPending
+}
+
+// AdmissionStatus describes the durable result of a channel admission.
+type AdmissionStatus string
+
+const (
+	// AdmissionStatusAdmitted means an execution and dispatch record were
+	// committed.
+	AdmissionStatusAdmitted AdmissionStatus = "ADMITTED"
+	// AdmissionStatusRejected means a verified but unsupported channel input was
+	// durably recorded without an execution.
+	AdmissionStatusRejected AdmissionStatus = "REJECTED"
+)
+
+// AdmissionResult describes the committed admission identity returned to an
+// ingress. Replayed is true when an identical idempotent request already
+// existed.
 type AdmissionResult struct {
 	RequestID     string
 	ConfigVersion string
 	TurnSeq       int64
 	Replayed      bool
+	Status        AdmissionStatus
 }
 
 // Validate checks the result returned by an admission backend.
@@ -203,11 +295,20 @@ func (r AdmissionResult) Validate() error {
 	if r.RequestID == "" {
 		return errors.New("request_id is required")
 	}
-	if r.ConfigVersion == "" {
-		return errors.New("config_version is required")
-	}
-	if r.TurnSeq <= 0 {
-		return errors.New("turn_seq must be positive")
+	switch r.Status {
+	case "", AdmissionStatusAdmitted:
+		if r.ConfigVersion == "" {
+			return errors.New("config_version is required")
+		}
+		if r.TurnSeq <= 0 {
+			return errors.New("turn_seq must be positive")
+		}
+	case AdmissionStatusRejected:
+		if r.ConfigVersion != "" || r.TurnSeq != 0 {
+			return errors.New("rejected admission cannot contain execution fields")
+		}
+	default:
+		return errors.New("admission status is invalid")
 	}
 	return nil
 }
@@ -260,14 +361,25 @@ func (g Gateway) Handle(ctx context.Context, req Request) (AdmissionResult, erro
 	if err != nil {
 		return AdmissionResult{}, err
 	}
+	var channelInput *channels.ChannelInput
+	message := Message{
+		Text:         req.Message.Text,
+		ArtifactRefs: slices.Clone(req.Message.ArtifactRefs),
+	}
+	if req.ChannelInput != nil {
+		input := req.ChannelInput.Clone()
+		channelInput = &input
+		message = Message{
+			Text:         input.Text,
+			ArtifactRefs: slices.Clone(input.ArtifactRefs),
+		}
+	}
 	admissionRequest := AdmissionRequest{
 		RequestID:      req.RequestID,
 		IdempotencyKey: req.IdempotencyKey,
 		Identity:       identity,
-		Message: Message{
-			Text:         req.Message.Text,
-			ArtifactRefs: slices.Clone(req.Message.ArtifactRefs),
-		},
+		Message:        message,
+		ChannelInput:   channelInput,
 	}
 	if err := admissionRequest.Validate(); err != nil {
 		return AdmissionResult{}, err
