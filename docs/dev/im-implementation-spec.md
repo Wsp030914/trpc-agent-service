@@ -757,8 +757,10 @@ NOT NULL；group 的无 thread sentinel 与真实 Provider thread 使用不同�
 - 默认保持大小写，不擅自 lower-case；是否大小写不敏感由 Provider Adapter
   的正式协议定义；
 - 规范化时区分 ID 类型，不能把 user ID 和 chat ID 使用同一个命名空间；
-- 使用规范化后的字节计算 HMAC-SHA-256，写入 ExternalUserKeyHash、
-  ExternalChatKeyHash、ThreadKeyHash，并记录 KeyVersion；
+  - 使用规范化后的字节计算 HMAC-SHA-256，写入 ExternalUserKeyHash、
+    ExternalChatKeyHash、ThreadKeyHash，并记录 KeyVersion。HMAC 输入必须按固定
+    长度前缀绑定 tenant_id、app_id、binding_id、typed external ID namespace
+    和 normalized external ID；不能只对外部 ID 或 `kind + ID` 做哈希；
 - HMAC key 由平台密钥服务管理，不进入仓库、日志或普通配置；
 - user_id、conversation_id 使用平台生成的不可猜测内部 ID，不直接把外部 ID
   当作主键。
@@ -786,7 +788,13 @@ Session event 或普通 Execution command。Reply Outbox 允许保存发送成�
 不是 target，不能被当作任意发送目标或写入日志。稳定目标从 Identity/Conversation 读取；
 像 WeCom `response_url` 这类消息级临时目标从 channel_inbox 读取。Adapter 发送
 时通过 scoped mapping 解密并确认 target 属于同一 tenant/app/binding，且未超过
-有效期。
+  有效期。
+
+  外部 ID 的 active HMAC key version 用于新建映射；读取时必须使用配置的 accepted
+  key versions 依次重算候选 hash，以兼容轮换期间的旧映射。候选命中旧版本时可以
+  继续保留旧 hash，不得因为读取而创建第二个内部主体。Provider target 是 opaque
+  值：映射边界只检查非空和合法 UTF-8，不 trim、lower-case、URL 解码或按 Provider
+  字段规则重写；只有外部身份键才执行协议允许的规范化。
 
 ### 6.2.1 IM-04 precondition：Provider target 持久化方案
 
@@ -813,8 +821,15 @@ blocker。
 的 Seal/Open，不负责 Secret 管理：
 
 ~~~text
-TargetProtector.Seal(ctx, scope, purpose, plaintext) -> TargetEnvelope
-TargetProtector.Open(ctx, scope, purpose, envelope) -> plaintext
+TargetProtector.Seal(ctx, target_context, purpose, plaintext) -> TargetEnvelope
+TargetProtector.Open(ctx, target_context, purpose, envelope) -> plaintext
+TargetContext {
+    scope                 // tenant_id + app_id
+    binding_id
+    channel
+    entity_type           // channel_identity | channel_conversation | channel_inbox
+    internal_entity_id    // user_id | conversation_id | request_id
+}
 TargetEnvelope {
     algorithm
     key_version
@@ -853,7 +868,12 @@ null 或任意 map。消息级 target 的 `provider_target` 可以是 WeCom
 request_id。IM-04 必须提供固定 key、固定 nonce 和固定 target 的 round-trip
 test vector，验证 canonical plaintext、AAD、Seal/Open 和错误 scope 拒绝；消息
 级 target 的 vector 由 IM-05/IM-02 或 IM-03 补充。生产环境仍只能使用随机 nonce，
-测试固定 nonce 只能通过测试专用注入点提供。
+  测试固定 nonce 只能通过测试专用注入点提供。
+
+  `TargetContext.ValidateFor(purpose)` 必须强制 purpose 与 entity_type 一一对应：
+  identity user target 只能属于 `channel_identity`，conversation chat/topic target
+  只能属于 `channel_conversation`，message reply target 只能属于
+  `channel_inbox`。TargetProtector 的 Seal/Open 和所有实现必须执行该检查。
 
 实现由现有 SecretProvider 提供密钥材料，再使用标准库 AEAD；v1 固定使用
 AES-256-GCM
@@ -1761,10 +1781,14 @@ envelope；不得自行引入 KMS、Vault 或通用 Secret 系统。
 
 - scoped Identity lookup-or-create；
 - scoped Conversation lookup-or-create；
-- group membership upsert；
-- provider target seal/open，限定在 identity/reply adapter 层；内部 target
-  明文只在同一 Admission/Reply 事务的受控作用域内短暂存在；
-- 不新增第二套用户或会话领域模型。
+  - group membership upsert；
+  - provider target seal/open，限定在 identity/reply adapter 层；内部 target
+    明文只在同一 Admission/Reply 事务的受控作用域内短暂存在；
+  - IdentityMapper 读取 active 与 accepted 旧 HMAC key versions，并在一个完整的
+    PostgreSQL transaction seam 内完成输入规范化、Binding 锁定/校验、lookup-or-
+    create 和 membership upsert；公共 Map 只是该 seam 的事务包装，不得存在跳过
+    这些检查的旁路入口；
+  - 不新增第二套用户或会话领域模型。
 
 **Tests**
 

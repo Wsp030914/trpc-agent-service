@@ -207,7 +207,10 @@ type Identity struct {
 	ExternalUserKeyHash string
 	UserID              string
 	Status              string
-	KeyVersion          string
+	// KeyVersion is the HMAC key version used for ExternalUserKeyHash. It is
+	// distinct from ProviderTargetEnvelope.KeyVersion.
+	KeyVersion             string
+	ProviderTargetEnvelope TargetEnvelope
 }
 
 // Conversation maps an external chat or thread into a session principal.
@@ -221,6 +224,10 @@ type Conversation struct {
 	ConversationID      string
 	SessionPrincipalID  string
 	Scope               string
+	// KeyVersion is the HMAC key version used for ExternalChatKeyHash and
+	// ThreadKeyHash. It is distinct from ProviderTargetEnvelope.KeyVersion.
+	KeyVersion             string
+	ProviderTargetEnvelope TargetEnvelope
 }
 
 // Membership records a user's role in one IM conversation.
