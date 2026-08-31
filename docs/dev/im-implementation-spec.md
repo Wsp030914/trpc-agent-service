@@ -253,12 +253,52 @@ Gateway、Registry、Telegram Channel 和 Outbound 实现。参考源码：
 公开且语义匹配的框架能力；`openclaw/internal/...` 既受 Go internal 包规则
 限制，也不满足本服务的多租户、Inbox、Outbox 和事务要求，不能作为运行时依赖。
 
+### 3.4.1 Go 编码风格和命名约束
+
+IM 新增代码的 Go 编码风格、包结构、命名和接口设计，遵循本仓库既有规范，并
+参考当前锁定版本 tRPC-Agent-Go v1.11.2 的实现方式。具体要求如下：
+
+- 使用小而明确的包和消费者侧接口；接口只表达当前真实能力，不为假设中的未来
+  Provider 或通用平台预留抽象；
+- 使用自然的 Go MixedCaps 命名，统一常见 initialism，避免把 Provider、部署细节
+  或内部实现状态伪装成公共概念；
+- 导出类型、函数和方法必须有完整 Godoc；`context.Context` 置于首参数，错误保留
+  cause，生命周期、并发、取消和资源所有权必须明确；
+- 按 tRPC-Agent-Go 的分层方式拆分协议解析、平台标准化、能力接口和出站编码，
+  但不复制其内部实现，不引入第二套 Gateway、Session、Runner 或消息模型；
+- 每个 IM 子任务完成时执行 `gofmt`、`goimports`、`go vet` 和项目 lint，并用
+  tRPC-Agent-Go v1.11.2 的相邻实现检查命名和边界；风格调整不得扩大任务范围或
+  改变既有公共契约。
+
 ### 3.5 减少分工的交付规则
 
 本 Spec 默认由一个主编码 Agent 按串行顺序完成，每个任务完成后由同一个验收
 流程执行单元测试、必要的 PostgreSQL 测试和 Gherkin 检查。除非后续明确要求
 并行开发，不拆出独立的“重新设计契约”“单独做 Schema”“单独做 Provider
 Sender”工作流。
+
+实现阶段固定使用“主线程 + 审查 Agent + QA Agent”三方协作，不再增加独立的
+清理 Agent、异常增强 Agent 或额外的 Spec Agent。审查 Agent 同时承担原清理
+Agent 的检查职责，只针对当前 diff 提出最小清理建议，不把清理职责扩展成新的
+架构设计：
+
+1. 主线程负责当前子任务的编码、处理审查意见和修复 QA 失败；同一时间只允许
+   主线程修改业务代码、测试和 Spec。
+2. 审查 Agent 只读检查当前子任务的 diff 和相关调用方，不修改文件，不进入其他
+   IM 子任务，也不重新设计完整 IM。它的反馈必须分成两类：
+   - 必须处理的问题：阻塞项、重要问题和会影响安全/事务/验收的问题；
+   - 独立清理建议：过度设计、重复抽象、无必要的提前扩展、兼容性收口和可维护性
+     改进。
+3. 审查 Agent 可以一并指出清理项，但清理项默认不自动变成当前任务的实现范围，
+   不得以“建议未实现”为理由阻塞当前交付；主线程在当前任务完成后决定立即处理
+   或记录到后续任务。只有实际涉及安全、数据一致性、兼容性破坏或已冻结验收
+   条件时，才升级为必须修复项。
+4. QA Agent 在主线程修复完成后只读验收，不修改代码或 Spec；若失败，只返回可
+   复现的命令、错误和对应验收项，由主线程修复后重新交给同一个 QA 流程复验。
+
+审查 Agent 不设置人为超时；在其返回最终反馈前保持等待。超时、关闭或没有
+最终报告都不能视为 PASS。每轮交接只携带当前子任务的 Spec 章节、Repo Facts、
+允许修改文件列表、当前 diff 和验收命令，避免全量上下文导致范围漂移。
 
 跨任务只允许通过本 Spec 已冻结的契约交接，不允许下一个任务重新定义上一个
 任务的模型或事务语义。每个任务提交时只需交付以下五项：
@@ -450,7 +490,7 @@ AttachmentIngestor.Prepare(
 ~~~text
 RequestID      = 服务端生成的内部 UUID/ULID
 IdempotencyKey = binding-scoped canonical(ChannelInput.external_message_id)
-Tenant         = VerifiedChannelBindingResolver
+Tenant         = ChannelBindingIdentityResolver
 Message        = gateway.Message{Text: ChannelInput.text, ArtifactRefs: ChannelInput.artifact_refs}
 ~~~
 
@@ -546,7 +586,7 @@ route_key 查询是路由定位，不是最终授权。最终授权由以下组�
 
 IM-01 本身不读取或解释 Provider signature、XML/JSON encryption envelope、
 Verification Token 或 external_account。IM-01 的单元测试和 PostgreSQL 测试
-接收 fake/preverified channel binding input；真实 Provider 协议测试分别归入
+接收 fake trusted-scope channel binding input；真实 Provider 协议测试分别归入
 IM-02 和 IM-03。
 
 ### 5.2 方案比较
@@ -597,7 +637,9 @@ SigningSecretRef、Secret、Status 和 public_route_id；Tenant/App/Binding 主�
 
 route key 轮换：
 
-- v1 支持显式生成新 route key 并替换当前值；
+- v1 在 Store/内部控制面支持显式生成新 route key 并替换当前值；IM-01
+  只交付该操作所需的 scoped storage primitive 和 stale-route 语义，不新增
+  IM-01 专属的管理 HTTP endpoint；
 - 替换 route key 时必须递增 binding_revision；
 - 替换后旧 route 立即失效，不支持默认双活；
 - 轮换不改变 binding_id、tenant/app 或 Identity/Conversation；
@@ -619,15 +661,15 @@ Binding 生命周期：
 
 | 阶段 | 必须做的检查 | 不允许做的事 |
 | --- | --- | --- |
-| IM-01 route/admission boundary | route key 格式/大小、HTTP 方法、Binding 存在、URL channel 与 Binding.Channel、Binding ACTIVE、trusted tenant/app/binding scope、binding_revision/public_route snapshot、fake/preverified input contract | 读取或验证 WeCom/Feishu signature、XML/JSON decrypt、Verification Token、external_account；从 payload 取 tenant/app；调用 Runner；先返回成功 ACK；将 fake/preverified input 暴露为生产入口 |
+| IM-01 route/admission boundary | route key 格式/大小、Binding 存在、URL channel 与 Binding.Channel、Binding ACTIVE、trusted tenant/app/binding scope、binding_revision/public_route snapshot、fake trusted-scope input contract | 注册或处理 Provider HTTP method/path、读取或验证 WeCom/Feishu signature、XML/JSON decrypt、Verification Token、external_account；从 payload 取 tenant/app；调用 Runner；先返回成功 ACK；将 fake trusted-scope input 暴露为生产入口 |
 | IM-02/IM-03 Provider Adapter | body 上限、Content-Type、secret_ref 解析、Provider 验签/解密、external_account、external_message_id、Provider 时间窗口、协议 DTO 到 `VerifiedProviderEnvelope` | 修改 tenant/app trusted scope；把 Provider DTO 传给 Gateway；调用 Runner；建立 Reply Outbox retry loop |
 | Gateway | 构造 verified channel binding identity；校验 Source、SourceID、BindingID、Channel、消息/Artifact 边界和 idempotency key；把 unresolved platform metadata 交给 Store.Admit，生成/传递 request_id | 从 payload 覆盖 tenant/app；在身份映射前强行构造内部主键；绕过 Admitter 直接入队；依赖 Provider-specific fields |
 | PostgreSQL transaction | 锁 Tenant 并验证 ACTIVE；锁 App 并验证 ACTIVE；锁 Binding 并验证 tenant/app/binding/channel/public route snapshot、binding_revision、ACTIVE 及授权属性版本；读取并验证 active config；检查 Inbox/Execution 幂等；分配 Session turn；写 Inbox、Execution、Dispatch Outbox | 只相信 Adapter 的 Binding 快照；先 ACK 后持久化；只按 request_id 不带 scope 查询 |
 
-`fake/preverified channel binding input` 只能通过测试依赖注入或 `_test.go` 内部
+`fake trusted-scope channel binding input` 只能通过测试依赖注入或 `_test.go` 内部
 构造器进入 IM-01/IM-05；不得提供生产 HTTP 路由、公共 API、可配置的生产 DI
 分支或可由客户端反序列化的 trusted identity。生产部署中，唯一能构造
-`VerifiedChannelBinding` 的路径是 IM-01 的 Binding lookup 加 IM-02/IM-03 的
+`ChannelBindingIdentityResolver` 的路径是 IM-01 的 Binding lookup 加 IM-02/IM-03 的
 Provider verification/extraction；测试 fake 不得进入可部署 wiring。
 
 `BindingSnapshot` 至少包含 tenant_id、app_id、binding_id、channel、
@@ -638,10 +680,17 @@ binding_revision 和授权属性的原子更新规则判断快照是否过期。
 
 现有 Gateway.AdmissionIdentity 的 SourceID 建议使用稳定的内部 binding_id，
 而不是 route_key。这样 route 轮换不会改变同一 Binding 的 Execution 幂等范围。
-为了让轮换或授权配置变更在进行中的请求上也可被检测，VerifiedChannelBinding
-的内部快照必须携带 public_route_id 和 binding_revision；若沿用现有公共
-AdmissionIdentity，需要增加这两个可选快照字段。PostgreSQL 只把它们作为
-transaction revalidation 条件，不能把它们单独当成授权凭据。
+为了让轮换或授权配置变更在进行中的请求上也可被检测，ChannelBindingIdentityResolver
+的内部快照必须携带 public_route_id 和 binding_revision；AdmissionIdentity 继续
+保留这些字段用于 transaction revalidation，但 verified channel 分支还必须带有
+gateway 包内不可由外部 struct literal 设置的 provenance marker。直接构造同样
+字段的 verified AdmissionIdentity 必须在 Validate 阶段拒绝；PostgreSQL 只把
+route/revision 作为 transaction revalidation 条件，不能把它们单独当成授权凭据。
+
+IM-01 不负责注册可部署的 Provider HTTP handler。`/im/{channel}/{route_key}` 是
+跨 Adapter 的 URL contract；IM-02/IM-03 各自注册对应 Provider 的 HTTP method、
+Content-Type、body limit 和 callback handler，并在进入本任务的 route resolver
+后执行协议验证。这样 IM-01 的 fake trusted-scope 测试不会形成可配置的生产旁路。
 
 IM-01 的 revision 规则覆盖 ExternalAccount、验证 SecretRef 和 Status：若
 Provider 验证使用的 Binding 快照 revision 与事务锁定行不一致，即使当前行又是
@@ -1532,7 +1581,7 @@ IM-02/IM-03 Adapter
 
     IM-01 -> IM-04 -> IM-05 -> IM-02 -> IM-03 -> IM-06 -> IM-07
 
-因此 IM-05 的测试输入使用 fake/preverified Channel Input，不依赖已完成的
+因此 IM-05 的测试输入使用 fake trusted-scope Channel Input，不依赖已完成的
 企业微信或飞书 Adapter；IM-02/IM-03 在 IM-05 的 Inbox、Execution、Dispatch
 和 commit-before-ACK 语义冻结后实现。
 
@@ -1575,7 +1624,7 @@ trpcservice/worker/
 
 | 任务 | 只负责 | 交给下一任务的稳定产物 | 明确不修改 |
 | --- | --- | --- | --- |
-| IM-01 | route lookup、Channel/ACTIVE、trusted Binding snapshot、Admission revalidation | `BindingSnapshot`、`VerifiedChannelBinding`、stale/disable race 语义 | Provider DTO、验签/解密、Inbox、Identity、Runner |
+| IM-01 | route lookup、Channel/ACTIVE、trusted Binding snapshot、Admission revalidation | `BindingSnapshot`、`ChannelBindingIdentityResolver`、stale/disable race 语义 | Provider DTO、验签/解密、Inbox、Identity、Runner |
 | IM-04 | scoped Identity/Conversation、Session principal、target envelope | `MappedPrincipal`、lookup-or-create、`target_ref` 语义和 TargetProtector | Provider 协议、Inbox/Execution/Dispatch 事务、Reply Sender |
 | IM-05 | verified input 的 Inbox 幂等、Identity/Conversation 与 Execution/Dispatch 原子提交、commit-before-ACK；冻结 `AttachmentIngestor` 调用点及 Reply/Capability/单次 outbound contract | `ChannelAdmissionResult`、Inbox replay/conflict 语义、预入站媒体失败语义、公共 Reply contract | WeCom/Feishu 协议、Reply Outbox 表、发送循环 |
 | IM-02 | 企业微信 AI Bot HTTP、验签/解密、DTO 提取、provider media reference/消息级 target 提取、标准化、协议 ACK、WeCom 单次 outbound codec/client | WeCom `VerifiedProviderEnvelope` 适配和 outbound fake；媒体下载/解密和 Artifact ingest 交给 IM-07 | 公共模型重定义、Runner、Reply Outbox/Claim/Retry、Feishu |
@@ -1634,8 +1683,8 @@ Claim、Lease、错误到状态的映射、退避和重试只在 IM-06 出现。
 
 - 保留 ResolveBinding(ctx, tenant, app, binding)；
 - 增加独立 ResolveBindingByPublicRoute(ctx, channel, route_key) 窄接口；
-- Verified binding resolver；
-- AdmissionIdentity/VerifiedChannelBinding 携带 PublicRouteID 和 binding_revision
+- Channel binding identity resolver；
+- AdmissionIdentity/ChannelBindingIdentityResolver 携带 PublicRouteID 和 binding_revision
   快照；
 - Store.Admit 增加 verified_channel_binding 的 trusted source 校验和事务重校验
   hook；Inbox 幂等、Execution/Dispatch 写入归 IM-05 扩展。
@@ -1643,11 +1692,13 @@ Claim、Lease、错误到状态的映射、退避和重试只在 IM-06 出现。
 **Tests**
 
 - route 命中/未知/Channel 不匹配；
+- route resolver 的校验不依赖 HTTP handler；Provider HTTP method/path、Content-Type、
+  body limit 和脱敏 route fingerprint 日志由 IM-02/IM-03 的入口测试覆盖；
 - public route 不能泄露或改变 tenant/app；
 - ACTIVE/SUSPENDED；
-- fake/preverified channel binding input 能进入 trusted admission；
+- fake trusted-scope channel binding input 能进入 trusted admission；
 - Tenant/App/Binding transaction revalidation；
-- fake/preverified trusted scope 生成后、commit 前的 disable race；Provider verification
+- test trusted-scope 生成后、commit 前的 disable race；Provider verification
   的真实测试归 IM-02/IM-03；
 - route rotation/stale route；
 - public_route_id 不进入普通日志；
@@ -1875,7 +1926,7 @@ envelope；不得自行引入 KMS、Vault 或通用 Secret 系统。
 
 - IM-01 trusted admission；
 - IM-04 mapping；
-- fake/preverified `VerifiedProviderEnvelope`/materialized ChannelInput contract；
+- fake provider-verified `VerifiedProviderEnvelope`/materialized ChannelInput contract；
 - `AttachmentIngestor.Prepare` 的调用点、返回值和 no-row/REJECTED 失败语义；
 - 当前 Execution/Dispatch transaction。
 
@@ -1925,7 +1976,7 @@ envelope；不得自行引入 KMS、Vault 或通用 Secret 系统。
 - supported text 的 Identity/Conversation 新建与 Inbox/Execution/Dispatch 同事务
   回滚。
 
-这些测试直接使用 fake/preverified channel binding input；不要求 WeCom 或
+这些测试直接使用 fake trusted-scope channel binding input；不要求 WeCom 或
 Feishu 协议解析已经完成。
 
 **Done criteria**
@@ -2227,8 +2278,13 @@ Session 或 Execution。重复撤回只返回原 request_id，不重复发送取
 
 ### 14.3 Migration order
 
-1. 增加并回填 channel_binding.public_route_id；
-2. 建立 route unique index；
+1. `000010_channel_binding_route_columns.sql` 增加带数据库默认值的可空
+   `channel_binding.public_route_id` 与 `binding_revision`，用 `pgcrypto` 为存量
+   Binding 回填随机 route 和 `1`；该迁移独立提交后仍允许约束尚未启用的过渡状态，
+   旧二进制写入缺失的新列时由数据库默认值补齐；
+2. `000011_channel_binding_route_constraints.sql` 在另一个独立事务中设置 NOT NULL、
+   非空/正数检查、全局唯一索引，并建立 Binding scope 不可变及授权属性变更自动
+   递增 `binding_revision` 的触发器；
 3. 建立 Identity/Conversation/Membership 表；
 4. 建立 channel_inbox；
 5. 建立 channel_recall_inbox；
@@ -2236,7 +2292,9 @@ Session 或 Execution。重复撤回只返回原 request_id，不重复发送取
 7. 建立 reply_outbox；
 8. 最后启用 IM Admission/Reply 代码。
 
-本阶段只写规格，不生成 migration。
+迁移执行器按版本顺序为每个 migration 建立独立事务；发布时必须先完成
+`000010`/`000011`，再启动读取新列的新二进制，不允许新二进制连接到未执行
+`000010` 的旧 Schema。
 
 ## 15. API Changes
 
@@ -2254,9 +2312,10 @@ Session 或 Execution。重复撤回只返回原 request_id，不重复发送取
 
 | Contract | 设计 |
 | --- | --- |
-| Public route resolver | 独立窄接口 ResolveBindingByPublicRoute(ctx, channel, routeKey)，返回包含 public_route_id、binding_revision 和授权属性快照的 BindingSnapshot；不修改现有 BindingResolver，避免破坏外部实现 |
+| Public route resolver | 独立窄接口 ResolveBindingByPublicRoute(ctx, channel, routeKey)，返回包含 public_route_id、binding_revision 和授权属性快照的 BindingSnapshot；Gateway 的 ResolveChannelBindingRoute 将其封装成带包内 provenance marker 的 LocatedChannelBinding；不修改现有 BindingResolver，避免破坏外部实现 |
 | Binding | 增加 PublicRouteID、BindingRevision；Binding.Validate 检查非空/正数，唯一性和单调递增由 DB/更新事务保证 |
-| Verified identity | 从 Binding 生成 AdmissionIdentity；Source=verified_channel_binding；SourceID=内部 binding_id；PublicRouteID 和 BindingRevision 只用于 transaction stale snapshot 检查 |
+| Channel binding identity | Provider 验证完成后，只有由 ResolveChannelBindingRoute 返回的、带包内 provenance marker 的 LocatedChannelBinding 才能传入 NewChannelBindingIdentityResolver；它生成 Source=verified_channel_binding、SourceID=内部 binding_id 的 AdmissionIdentity；AdmissionIdentity 对外保留字段兼容性，但 direct channel-binding literal 无 provenance 时必须拒绝；PublicRouteID 和 BindingRevision 只用于 transaction stale snapshot 检查 |
+| Binding provisioning | 管理面创建 Binding 时不接受调用方提供的 public_route_id/binding_revision，由 admin API 生成 route 并使用 revision=1；Store 对低层缺省调用生成 route，对显式 route 要求通过与 NewPublicRouteID 一致的生成格式校验 |
 | Channel Input | 放在 channels/channel domain；只含平台级字段和受控引用，不含 XML/JSON DTO |
 | Identity mapper | scoped lookup-or-create；返回现有 channels.Identity/Conversation |
 | Store.Admit | IM-01 建立 verified channel trusted source 和 transaction revalidation；IM-05 在该分支内加入 Inbox 幂等、Identity/Conversation、Execution、Dispatch 写入 |
@@ -2325,7 +2384,7 @@ AdmissionIdentity contract，并增加公共 API 兼容评审；不在 Adapter �
 Scenario: valid route and verified binding are admitted
   Given an ACTIVE channel Binding with public_route_id "route-a"
   And its binding_revision is 7
-  And a fake/preverified Channel Input carries the Binding trusted scope
+  And a test trusted-scope Channel Input carries the Binding trusted scope
   When IM-01 handles the route "/im/wecom/route-a"
   Then tenant_id and app_id are taken from the Binding
   And the request uses tenant source "verified_channel_binding"
@@ -2333,7 +2392,7 @@ Scenario: valid route and verified binding are admitted
 
 Scenario: disabled binding is rejected
   Given a SUSPENDED Binding
-  And a fake/preverified Channel Input targets its public_route_id
+  And a test trusted-scope Channel Input targets its public_route_id
   When IM-01 handles the route
   Then the request is rejected
   And no successful HTTP ACK is returned
@@ -2355,27 +2414,27 @@ Scenario: channel mismatch is rejected before trusted admission
 
 Scenario: payload tenant claim cannot cross route scope
   Given public_route_id "route-a" belongs to tenant "tenant-a"
-  And a fake/preverified input contains an untrusted tenant value "tenant-b"
+  And a test trusted-scope input contains an untrusted tenant value "tenant-b"
   When IM-01 builds the trusted scope
   Then the request uses tenant "tenant-a"
   And it is never routed to tenant "tenant-b"
 
 Scenario: stale public route is rejected after rotation
   Given Binding "b-1" rotated from public_route_id "route-a" to "route-b"
-  When a preverified input carries the stale route snapshot "route-a"
+  When a test trusted-scope input carries the stale route snapshot "route-a"
   And PostgreSQL admission revalidates the Binding
   Then the transaction rejects the input
   And no Inbox, Execution or Dispatch Outbox is committed
 
 Scenario: binding is disabled after verification but before commit
-  Given a fake/preverified Channel Input has passed the Adapter boundary
+  Given a test trusted-scope Channel Input has passed the Adapter boundary
   When the Binding is changed to SUSPENDED before PostgreSQL commit
   Then the admission transaction rejects the callback
   And Inbox, Execution and Dispatch Outbox are rolled back
   And no successful HTTP ACK is returned
 
 Scenario: authorization revision change rejects a stale verified input
-  Given a fake/preverified Channel Input carries binding_revision 7
+  Given a test trusted-scope Channel Input carries binding_revision 7
   When Binding.ExternalAccount or its verification SecretRef changes to revision 8 before commit
   Then the admission transaction rejects the input
   And no Inbox, Execution or Dispatch Outbox is committed
@@ -2523,12 +2582,12 @@ Scenario: concurrent first group mapping returns one conversation
 
 ### Feature: IM-05 Inbox idempotency and transaction
 
-以下 IM-05 场景直接使用 fake/preverified Channel Input，不依赖已完成的
+以下 IM-05 场景直接使用 test trusted-scope Channel Input，不依赖已完成的
 企业微信或飞书协议 Adapter。
 
 ~~~gherkin
 Scenario: first message creates one execution and one dispatch
-  Given a valid fake/preverified Channel Input with external_message_id "m-1"
+  Given a valid test trusted-scope Channel Input with external_message_id "m-1"
   When admission commits
   Then channel_inbox count is 1
   And Execution count is 1
@@ -2562,7 +2621,7 @@ Scenario: database rollback cannot produce a successful ACK
   And the response is non-success
 
 Scenario: verified provider-unsupported type is durably rejected without execution
-  Given a fake/preverified Channel Input with message_type "unsupported" and external_message_id "m-unsupported"
+  Given a test trusted-scope Channel Input with message_type "unsupported" and external_message_id "m-unsupported"
   When admission commits
   Then one channel_inbox row has status "REJECTED"
   And reject_reason is "UNSUPPORTED_MESSAGE_TYPE"
@@ -2729,11 +2788,11 @@ Scenario: duplicate recall event is idempotent
 
 ### 17.1 Test topology
 
-IM-01、IM-04、IM-05 的基础验收先使用 fake/preverified input，验证可信路由、
+IM-01、IM-04、IM-05 的基础验收先使用 test trusted-scope input，验证可信路由、
 身份映射和 commit-before-ACK 事务，不依赖任何 Provider 协议解析：
 
 ~~~text
-fake/preverified Channel Input
+test trusted-scope Channel Input
   -> IM-01 public route / Binding trusted scope
   -> IM-04 Identity / Conversation
   -> Gateway
@@ -2743,6 +2802,11 @@ fake/preverified Channel Input
   -> COMMIT
   -> fake HTTP ACK
 ~~~
+
+这条基础链路直接调用 IM-01 的 route resolver 和 Gateway/Store contract，不注册
+生产 HTTP handler。Provider HTTP method/path、Content-Type、body limit 和 route
+fingerprint 日志在 IM-02/IM-03 的 fake callback 入口测试中验证；这样 IM-01 的
+test fixture 不会成为生产旁路。
 
 Provider 协议和完整出站链路再分别验证：
 
@@ -2808,14 +2872,15 @@ ID/chat ID，验证 scope 隔离。
 
 ### 17.4 QA 用例组
 
-1. fake/preverified trusted route and Binding admission；
+1. test trusted route and Binding admission；
 2. cross-tenant/cross-binding Identity、Conversation、Session mapping；
 3. first Inbox、Execution、Dispatch transaction；
 4. sequential/concurrent duplicate and same ID different payload；
 5. DB rollback、lost ACK and Binding disable/rotation race；
 6. WeCom URL verification、signature、decryption、external_account and text；
 7. Feishu challenge、token/signature/encryption and text；
-8. unknown/disabled/mismatched route；
+8. unknown/disabled/mismatched route；Provider HTTP method/path、Content-Type、body
+   limit 和 route fingerprint 由 IM-02/03 入口覆盖；
 9. malformed、oversize、empty payload and adapter cancellation；
 10. Worker Runner event drain and completion；
 11. pre-admission media ingest success、可重试失败和永久不支持；
@@ -2855,6 +2920,10 @@ ID/chat ID，验证 scope 隔离。
 - 代码审查确认没有 Adapter -> Runner 直连、payload tenant 信任、跨租户查询或
   原始 Provider 字段越界。
 
+审查 Agent 的独立清理项必须与必须修复项分栏；只有当清理项实际涉及安全、数据
+一致性、兼容性破坏或当前 Done criteria 时，才会阻塞 QA 门禁。QA 只验证主线程
+修复后的工作树，不因已明确延期的清理项判定当前任务失败。
+
 最终 IM-01～IM-07 全部完成后，必须在仓库根目录执行并通过：
 
 ~~~text
@@ -2893,7 +2962,7 @@ goimports -l .
 14. 已验签但不支持的入站类型或永久不支持的媒体只能写 REJECTED +
     UNSUPPORTED_MESSAGE_TYPE/ATTACHMENT_REJECTED + 脱敏审计并在 commit 后 ACK；
     不创建 Execution；不支持的出站卡片/附件才可以按 capability 显式降级。
-15. fake/preverified trusted input 只能存在于测试 wiring，不能有生产 HTTP/API
+15. test trusted input 只能存在于测试 wiring，不能有生产 HTTP/API
     或客户端可构造的入口。
 16. TargetProtector 必须校验 purpose、key_version、AAD、算法、nonce 和密钥
     长度；任何不匹配都 fail closed。
@@ -2960,8 +3029,9 @@ route key 是否全局唯一、是否信任 payload tenant、是否需要独立 
 
 - 1、2.3、3.1、3.3、3.6：冻结 IM-01、IM-02/03 和 IM-06 的职责边界，以及
   企业微信 AI Bot、飞书官方 Go SDK 的产品/SDK 选择；
-- 3.4、3.5、13.0、15.2：补充 tRPC-Agent-Go/OpenClaw 的参考与不复用边界，
-  冻结公共契约、推荐目录、任务 ownership、交接物和单次出站调用语义；
+- 3.4、3.4.1、3.5、13.0、15.2：补充 tRPC-Agent-Go/OpenClaw 的参考、不复用
+  边界和 Go 编码风格约束，冻结公共契约、推荐目录、任务 ownership、交接物和
+  单次出站调用语义；
 - 4.1、4.3、5.1、5.3、5.4、5.5：冻结标准输入、完整附件链路、route、
   trusted admission、binding_revision 和 Provider 验证位置；
 - 6.2、6.2.1、14.2、15.2：冻结 group 非 NULL 唯一键、同事务映射和 IM-04
@@ -2971,7 +3041,7 @@ route key 是否全局唯一、是否信任 payload tenant、是否需要独立 
 - 9.1、9.3、10.1、10.2、10.3、10.4、11.3：移除 Adapter 的完整出站
   Sender/retry/lease 职责，改为 IM-06 统一处理；
 - 12、13：冻结逻辑 DAG、串行开发顺序和各任务 Inputs/Tests/Done criteria；
-- 16、17、18：将 Provider 协议测试归入 IM-02/03，并补齐 fake/preverified
+- 16、17、18：将 Provider 协议测试归入 IM-02/03，并补齐 test trusted-scope
   admission、路由轮换、日志和全链路计数验收。
 
 前一轮审查提出的 P1/P2 已分别落到契约或实现计划中。当前代码缺少表、接口或
@@ -3025,15 +3095,15 @@ IM-05 先冻结 `AttachmentIngestor.Prepare` 的调用点、ArtifactRef 输入�
 Execution 创建，但 IM-07 也不需要在 IM-05 之前交付。
 
 IM-01 的架构决策已闭合：route_key 定位、Channel/ACTIVE 校验、trusted
-tenant/app/binding scope、VerifiedChannelBinding admission、Gateway 入口、
+tenant/app/binding scope、channel binding admission、Gateway 入口、
 PostgreSQL transaction revalidation、binding_revision、stale route、disable
-race、日志边界和 fake/preverified 测试输入均已定义。Provider signature、
+race、日志边界和 test trusted-scope 输入均已定义。Provider signature、
 decrypt、Verification Token 和 external_account 不属于 IM-01，Provider 细节
-也不构成 IM-01 blocker。fake/preverified 仅存在于测试 wiring，不能成为生产
+也不构成 IM-01 blocker。test trusted-scope 输入仅存在于测试 wiring，不能成为生产
 入口。
 
 IM-01 的架构决策已闭合，可以开始编码：Provider signature、decrypt、
-Verification Token 和 external_account 不属于 IM-01；fake/preverified 仅存在于
+Verification Token 和 external_account 不属于 IM-01；test trusted-scope 输入仅存在于
 测试 wiring，不能成为生产入口。IM-01～IM-07 的最终验收包括正文和 Gherkin 中
 冻结的文本、附件、卡片/流式、异步回复、分片、限流、失败重试和撤回边界。
 

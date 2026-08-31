@@ -34,6 +34,7 @@ type StaticResolver struct {
 // Its zero value is an empty resolver. Constructed resolvers are safe for concurrent reads.
 type StaticBindingResolver struct {
 	bindings map[bindingKey]channels.Binding
+	routes   map[string]channels.BindingSnapshot
 }
 
 type configKey struct {
@@ -96,10 +97,11 @@ func newStaticResolver(bindingResolver BindingResolver, configs ...tenant.AppCon
 }
 
 // NewStaticBindingResolver validates and copies channel bindings. It rejects
-// duplicate tenant application binding IDs.
+// duplicate tenant application binding IDs and duplicate PublicRouteID values.
 func NewStaticBindingResolver(bindings ...channels.Binding) (*StaticBindingResolver, error) {
 	resolver := &StaticBindingResolver{
 		bindings: make(map[bindingKey]channels.Binding, len(bindings)),
+		routes:   make(map[string]channels.BindingSnapshot, len(bindings)),
 	}
 	for i, binding := range bindings {
 		if err := binding.Validate(); err != nil {
@@ -118,7 +120,11 @@ func NewStaticBindingResolver(bindings ...channels.Binding) (*StaticBindingResol
 				key.bindingID,
 			)
 		}
+		if _, exists := resolver.routes[binding.PublicRouteID]; exists {
+			return nil, fmt.Errorf("channel binding public route is duplicated")
+		}
 		resolver.bindings[key] = binding
+		resolver.routes[binding.PublicRouteID] = binding.Snapshot()
 	}
 	return resolver, nil
 }
@@ -181,6 +187,30 @@ func (r *StaticBindingResolver) ResolveBinding(
 		)
 	}
 	return binding, nil
+}
+
+// ResolveBindingByPublicRoute returns a binding snapshot located by its
+// opaque public route. The channel is checked after route lookup so callers
+// cannot use a route from another platform.
+func (r *StaticBindingResolver) ResolveBindingByPublicRoute(
+	_ context.Context,
+	channel channels.Channel,
+	publicRouteID string,
+) (channels.BindingSnapshot, error) {
+	if err := channel.Validate(); err != nil {
+		return channels.BindingSnapshot{}, err
+	}
+	if err := channels.ValidatePublicRouteID(publicRouteID); err != nil {
+		return channels.BindingSnapshot{}, err
+	}
+	snapshot, ok := r.routes[publicRouteID]
+	if !ok {
+		return channels.BindingSnapshot{}, channels.ErrBindingNotFound
+	}
+	if snapshot.Channel != channel {
+		return channels.BindingSnapshot{}, channels.ErrBindingChannelMismatch
+	}
+	return snapshot, nil
 }
 
 // ValidateAppConfigBindings verifies that each binding referenced by cfg exists

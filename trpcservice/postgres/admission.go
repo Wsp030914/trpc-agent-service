@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -30,7 +31,8 @@ func (s *Store) Admit(
 	if err := request.Validate(); err != nil {
 		return gateway.AdmissionResult{}, err
 	}
-	if request.Identity.Source != gateway.TenantSourceAuthenticatedClaims {
+	if request.Identity.Source != gateway.TenantSourceAuthenticatedClaims &&
+		request.Identity.Source != gateway.TenantSourceVerifiedChannelBinding {
 		return gateway.AdmissionResult{}, gateway.ErrUnsupportedAdmissionSource
 	}
 	command, payloadHash, err := marshalAdmissionCommand(request.Identity, request.Message)
@@ -46,18 +48,32 @@ func (s *Store) Admit(
 		rollback(tx)
 	}()
 
-	credential, err := lockCredential(ctx, tx, request.Identity.CredentialDigest)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return gateway.AdmissionResult{}, auth.ErrUnauthenticated
+	var credential auth.Credential
+	tenantID := request.Identity.Tenant.TenantID
+	appID := request.Identity.Tenant.AppID
+	if request.Identity.Source == gateway.TenantSourceAuthenticatedClaims {
+		credential, err = lockCredential(ctx, tx, request.Identity.CredentialDigest)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return gateway.AdmissionResult{}, auth.ErrUnauthenticated
+			}
+			return gateway.AdmissionResult{}, err
 		}
-		return gateway.AdmissionResult{}, err
-	}
-	if err := validateAdmissionCredential(credential, request.Identity); err != nil {
-		return gateway.AdmissionResult{}, err
+		if err := validateAdmissionCredential(credential, request.Identity); err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		tenantID = credential.TenantID
+		appID = credential.AppID
+	} else {
+		credential = auth.Credential{
+			ID:       request.Identity.SourceID,
+			TenantID: tenantID,
+			AppID:    appID,
+			Status:   auth.CredentialActive,
+		}
 	}
 
-	tnt, err := lockTenant(ctx, tx, credential.TenantID)
+	tnt, err := lockTenant(ctx, tx, tenantID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return gateway.AdmissionResult{}, auth.ErrUnauthenticated
@@ -71,7 +87,7 @@ func (s *Store) Admit(
 		return gateway.AdmissionResult{}, auth.ErrUnauthenticated
 	}
 
-	app, err := lockAgentApp(ctx, tx, credential.TenantID, credential.AppID)
+	app, err := lockAgentApp(ctx, tx, tenantID, appID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return gateway.AdmissionResult{}, auth.ErrUnauthenticated
@@ -84,6 +100,11 @@ func (s *Store) Admit(
 	if app.TenantID != request.Identity.Tenant.TenantID ||
 		app.AppID != request.Identity.Tenant.AppID {
 		return gateway.AdmissionResult{}, auth.ErrUnauthenticated
+	}
+	if request.Identity.Source == gateway.TenantSourceVerifiedChannelBinding {
+		if err := revalidateChannelBindingSnapshot(ctx, tx, request.Identity); err != nil {
+			return gateway.AdmissionResult{}, err
+		}
 	}
 	if _, err := resolveAppConfigFrom(ctx, tx, app.TenantID, app.AppID, app.ActiveConfigVersion); err != nil {
 		return gateway.AdmissionResult{}, err
@@ -373,6 +394,41 @@ FOR UPDATE`,
 	return app, nil
 }
 
+func revalidateChannelBindingSnapshot(
+	ctx context.Context,
+	tx pgx.Tx,
+	identity gateway.AdmissionIdentity,
+) error {
+	binding, err := lockChannelBinding(
+		ctx,
+		tx,
+		identity.Tenant.TenantID,
+		identity.Tenant.AppID,
+		identity.Tenant.BindingID,
+	)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return auth.ErrUnauthenticated
+		}
+		return err
+	}
+	if binding.Status != channels.BindingActive {
+		return channels.ErrBindingInactive
+	}
+	if binding.TenantID != identity.Tenant.TenantID ||
+		binding.AppID != identity.Tenant.AppID ||
+		binding.BindingID != identity.Tenant.BindingID ||
+		binding.BindingID != identity.SourceID ||
+		binding.Channel != channels.Channel(identity.Tenant.Channel) {
+		return gateway.ErrChannelBindingSnapshotStale
+	}
+	if binding.PublicRouteID != identity.PublicRouteID ||
+		binding.BindingRevision != identity.BindingRevision {
+		return gateway.ErrChannelBindingSnapshotStale
+	}
+	return nil
+}
+
 func resolveAppConfigFrom(
 	ctx context.Context,
 	db databaseQueryer,
@@ -528,6 +584,8 @@ WHERE tenant_id = $1
 type admissionCommand struct {
 	TenantID           string   `json:"tenant_id"`
 	AppID              string   `json:"app_id"`
+	Channel            string   `json:"channel,omitempty"`
+	BindingID          string   `json:"binding_id,omitempty"`
 	SessionPrincipalID string   `json:"session_principal_id"`
 	SessionID          string   `json:"session_id"`
 	UserID             string   `json:"user_id"`
@@ -542,6 +600,8 @@ func marshalAdmissionCommand(
 	command, err := json.Marshal(admissionCommand{
 		TenantID:           identity.Tenant.TenantID,
 		AppID:              identity.Tenant.AppID,
+		Channel:            identity.Tenant.Channel,
+		BindingID:          identity.Tenant.BindingID,
 		SessionPrincipalID: identity.Tenant.SessionPrincipalID,
 		SessionID:          identity.Tenant.SessionID,
 		UserID:             identity.Tenant.UserID,

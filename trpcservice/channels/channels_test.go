@@ -56,6 +56,50 @@ func TestBindingValidateRejectsIncompleteConfig(t *testing.T) {
 	}
 }
 
+func TestBindingValidateRequiresPublicRouteSnapshot(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*channels.Binding)
+	}{
+		{name: "route", mutate: func(b *channels.Binding) { b.PublicRouteID = "" }},
+		{name: "revision", mutate: func(b *channels.Binding) { b.BindingRevision = 0 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binding := validBinding()
+			tt.mutate(&binding)
+			if err := binding.Validate(); err == nil {
+				t.Fatal("validate binding succeeded without route snapshot")
+			}
+		})
+	}
+}
+
+func TestNewPublicRouteIDIsURLSafeAndUnpredictable(t *testing.T) {
+	first, err := channels.NewPublicRouteID()
+	if err != nil {
+		t.Fatalf("generate first public route: %v", err)
+	}
+	second, err := channels.NewPublicRouteID()
+	if err != nil {
+		t.Fatalf("generate second public route: %v", err)
+	}
+	if first == second {
+		t.Fatal("generated public routes are duplicated")
+	}
+	for _, route := range []string{first, second} {
+		if err := channels.ValidatePublicRouteID(route); err != nil {
+			t.Fatalf("validate generated public route %q: %v", route, err)
+		}
+		if err := channels.ValidateGeneratedPublicRouteID(route); err != nil {
+			t.Fatalf("validate generated public route format %q: %v", route, err)
+		}
+	}
+	if err := channels.ValidateGeneratedPublicRouteID("route-human-readable"); err == nil {
+		t.Fatal("validate generated public route accepted a caller-chosen route")
+	}
+}
+
 func validBinding() channels.Binding {
 	return channels.Binding{
 		TenantID:        "tenant-a",
@@ -72,6 +116,8 @@ func validBinding() channels.Binding {
 			Name:    "wecom-signing-secret",
 			Version: "v1",
 		},
-		Status: channels.BindingActive,
+		PublicRouteID:   "route-binding-1",
+		BindingRevision: 1,
+		Status:          channels.BindingActive,
 	}
 }

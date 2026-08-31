@@ -56,12 +56,69 @@ type ToolPolicyValidator interface {
 	ValidateToolPolicy(context.Context, tenant.ToolPolicy) error
 }
 
+type channelBindingInputError struct {
+	cause error
+}
+
+func (e *channelBindingInputError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *channelBindingInputError) Unwrap() error {
+	return e.cause
+}
+
 // CreateChannelBinding validates and persists an IM account binding owned by
-// one tenant application. It does not enable an IM callback by itself.
+// one tenant application. It is a compatibility convenience that discards the
+// generated route and revision returned by ProvisionChannelBinding. It does
+// not enable an IM callback by itself.
 func (a API) CreateChannelBinding(ctx context.Context, binding channels.Binding) error {
-	if err := binding.Validate(); err != nil {
-		return err
+	_, err := a.ProvisionChannelBinding(ctx, binding)
+	return err
+}
+
+// ProvisionChannelBinding is the canonical channel binding creation path. It
+// generates the opaque public route and initial revision, then persists an IM
+// account binding owned by one tenant application. Callers must not provide
+// either generated field.
+func (a API) ProvisionChannelBinding(
+	ctx context.Context,
+	binding channels.Binding,
+) (channels.Binding, error) {
+	prepared, err := prepareChannelBinding(binding)
+	if err != nil {
+		return channels.Binding{}, err
 	}
+	if err := a.persistChannelBinding(ctx, prepared); err != nil {
+		return channels.Binding{}, err
+	}
+	return prepared, nil
+}
+
+func prepareChannelBinding(binding channels.Binding) (channels.Binding, error) {
+	if binding.PublicRouteID != "" {
+		return channels.Binding{}, &channelBindingInputError{
+			cause: errors.New("public_route_id must be omitted when creating a channel binding"),
+		}
+	}
+	if binding.BindingRevision != 0 {
+		return channels.Binding{}, &channelBindingInputError{
+			cause: errors.New("binding_revision must be omitted when creating a channel binding"),
+		}
+	}
+	publicRouteID, err := channels.NewPublicRouteID()
+	if err != nil {
+		return channels.Binding{}, err
+	}
+	binding.PublicRouteID = publicRouteID
+	binding.BindingRevision = 1
+	if err := binding.Validate(); err != nil {
+		return channels.Binding{}, &channelBindingInputError{cause: err}
+	}
+	return binding, nil
+}
+
+func (a API) persistChannelBinding(ctx context.Context, binding channels.Binding) error {
 	repository, err := a.repository()
 	if err != nil {
 		return err

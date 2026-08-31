@@ -8,7 +8,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
@@ -27,10 +26,11 @@ var (
 )
 
 var (
-	_ auth.CredentialStore = (*Store)(nil)
-	_ auth.Directory       = (*Store)(nil)
-	_ config.Resolver      = (*Store)(nil)
-	_ gateway.Admitter     = (*Store)(nil)
+	_ auth.CredentialStore        = (*Store)(nil)
+	_ auth.Directory              = (*Store)(nil)
+	_ config.Resolver             = (*Store)(nil)
+	_ gateway.PublicRouteResolver = (*Store)(nil)
+	_ gateway.Admitter            = (*Store)(nil)
 )
 
 // Store is the concrete PostgreSQL implementation for platform-owned records.
@@ -347,11 +347,28 @@ func resolveError(entity string, err error) error {
 	return fmt.Errorf("resolve %s: %w", entity, err)
 }
 
-// CreateChannelBinding inserts one verified IM account binding for a tenant
-// application. Secret references are persisted as metadata only.
+// CreateChannelBinding inserts one tenant-owned IM account binding for a tenant
+// application. Missing route metadata is generated for lower-level callers;
+// an explicitly supplied route must have the format emitted by
+// channels.NewPublicRouteID.
 func (s *Store) CreateChannelBinding(ctx context.Context, binding channels.Binding) error {
 	if err := s.validate(); err != nil {
 		return err
+	}
+	if binding.PublicRouteID == "" {
+		publicRouteID, err := channels.NewPublicRouteID()
+		if err != nil {
+			return err
+		}
+		binding.PublicRouteID = publicRouteID
+	} else if err := channels.ValidateGeneratedPublicRouteID(binding.PublicRouteID); err != nil {
+		return fmt.Errorf("channel binding public route: %w", err)
+	}
+	if binding.BindingRevision == 0 {
+		binding.BindingRevision = 1
+	}
+	if binding.BindingRevision != 1 {
+		return errors.New("binding_revision must be 1 when creating a channel binding")
 	}
 	if err := binding.Validate(); err != nil {
 		return fmt.Errorf("channel binding: %w", err)
@@ -372,8 +389,10 @@ func (s *Store) CreateChannelBinding(ctx context.Context, binding channels.Bindi
     token_ref,
     signing_secret_ref,
     secret_ref,
+    public_route_id,
+    binding_revision,
     status
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		binding.TenantID,
 		binding.AppID,
 		binding.BindingID,
@@ -383,6 +402,8 @@ func (s *Store) CreateChannelBinding(ctx context.Context, binding channels.Bindi
 		tokenRef,
 		signingSecretRef,
 		secret,
+		binding.PublicRouteID,
+		binding.BindingRevision,
 		binding.Status,
 	); err != nil {
 		return fmt.Errorf("create channel binding: %w", err)
@@ -407,43 +428,16 @@ func (s *Store) ResolveBinding(
 	if bindingID == "" {
 		return channels.Binding{}, errors.New("binding_id is required")
 	}
-	var binding channels.Binding
-	var tokenRef, signingSecretRef, secret []byte
-	err := s.pool.QueryRow(
+	binding, err := scanChannelBinding(s.pool.QueryRow(
 		ctx,
-		`SELECT
-    tenant_id,
-    app_id,
-    binding_id,
-    channel,
-    external_account,
-    webhook_url,
-    token_ref,
-    signing_secret_ref,
-    secret_ref,
-    status
-FROM platform.channel_binding
+		channelBindingSelect+`
 WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`,
 		tenantID,
 		appID,
 		bindingID,
-	).Scan(
-		&binding.TenantID,
-		&binding.AppID,
-		&binding.BindingID,
-		&binding.Channel,
-		&binding.ExternalAccount,
-		&binding.WebhookURL,
-		&tokenRef,
-		&signingSecretRef,
-		&secret,
-		&binding.Status,
-	)
+	))
 	if err != nil {
 		return channels.Binding{}, resolveError("channel binding", err)
-	}
-	if err := unmarshalBindingSecretRefs(&binding, tokenRef, signingSecretRef, secret); err != nil {
-		return channels.Binding{}, err
 	}
 	if err := binding.Validate(); err != nil {
 		return channels.Binding{}, fmt.Errorf("stored channel binding: %w", err)

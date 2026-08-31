@@ -112,8 +112,13 @@ func TestAPIManagesMinimalControlPlaneWithoutPersistingRawAPIKey(t *testing.T) {
 		t.Fatalf("create agent app: %v", err)
 	}
 	binding := testBinding()
+	binding.PublicRouteID = ""
+	binding.BindingRevision = 0
 	if err := api.CreateChannelBinding(context.Background(), binding); err != nil {
 		t.Fatalf("create channel binding: %v", err)
+	}
+	if repository.binding.PublicRouteID == "" || repository.binding.BindingRevision != 1 {
+		t.Fatalf("provisioned binding route = %#v", repository.binding)
 	}
 	published := initial.Clone()
 	published.Version = "v2"
@@ -149,6 +154,14 @@ func TestAPIManagesMinimalControlPlaneWithoutPersistingRawAPIKey(t *testing.T) {
 		repository.revokedAppID != scope.AppID ||
 		repository.revokedCredentialID != issued.Credential.ID {
 		t.Fatalf("revocation scope = %q %q %q", repository.revokedTenantID, repository.revokedAppID, repository.revokedCredentialID)
+	}
+}
+
+func TestAPIRejectsCallerSuppliedChannelBindingRoute(t *testing.T) {
+	api := admin.API{Repository: &recordingRepository{}}
+	binding := testBinding()
+	if _, err := api.ProvisionChannelBinding(context.Background(), binding); err == nil {
+		t.Fatal("provision channel binding accepted caller-supplied route")
 	}
 }
 
@@ -199,7 +212,9 @@ func testBinding() channels.Binding {
 		SigningSecretRef: tenant.SecretRef{
 			Name: "wecom-signing-secret",
 		},
-		Status: channels.BindingActive,
+		PublicRouteID:   "route-binding-1",
+		BindingRevision: 1,
+		Status:          channels.BindingActive,
 	}
 }
 

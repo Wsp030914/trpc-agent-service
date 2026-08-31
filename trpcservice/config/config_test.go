@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
@@ -181,6 +182,41 @@ func TestStaticBindingResolverRejectsDuplicateBinding(t *testing.T) {
 	}
 }
 
+func TestStaticBindingResolverResolvesPublicRouteInChannelScope(t *testing.T) {
+	binding := testBinding("tenant-a", "support", "binding-1")
+	resolver, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatalf("new static binding resolver: %v", err)
+	}
+
+	snapshot, err := resolver.ResolveBindingByPublicRoute(
+		context.Background(),
+		channels.ChannelWeCom,
+		binding.PublicRouteID,
+	)
+	if err != nil {
+		t.Fatalf("resolve public route: %v", err)
+	}
+	if snapshot.Binding != binding {
+		t.Fatalf("resolved snapshot = %#v, want %#v", snapshot.Binding, binding)
+	}
+
+	if _, err := resolver.ResolveBindingByPublicRoute(
+		context.Background(),
+		channels.ChannelFeishu,
+		binding.PublicRouteID,
+	); !errors.Is(err, channels.ErrBindingChannelMismatch) {
+		t.Fatalf("channel mismatch error = %v, want %v", err, channels.ErrBindingChannelMismatch)
+	}
+	if _, err := resolver.ResolveBindingByPublicRoute(
+		context.Background(),
+		channels.ChannelWeCom,
+		"unknown-route",
+	); !errors.Is(err, channels.ErrBindingNotFound) {
+		t.Fatalf("unknown route error = %v, want %v", err, channels.ErrBindingNotFound)
+	}
+}
+
 func testAppConfig(tenantID, appID, version string) tenant.AppConfig {
 	return tenant.AppConfig{
 		TenantID: tenantID,
@@ -236,6 +272,8 @@ func testBinding(tenantID, appID, bindingID string) channels.Binding {
 			Name:    "wecom-signing-secret",
 			Version: "v1",
 		},
-		Status: channels.BindingActive,
+		PublicRouteID:   "route-" + bindingID,
+		BindingRevision: 1,
+		Status:          channels.BindingActive,
 	}
 }

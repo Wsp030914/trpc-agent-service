@@ -187,15 +187,21 @@ func validAgentAppRequest(api API, r *http.Request, request createAgentAppReques
 
 func (h adminHTTPHandler) createChannelBinding(w http.ResponseWriter, r *http.Request) {
 	var request createChannelBindingRequest
-	if !decodeJSON(w, r, &request) || request.Binding.Validate() != nil {
+	if !decodeJSON(w, r, &request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid channel binding")
 		return
 	}
-	if err := h.api.CreateChannelBinding(r.Context(), request.Binding); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "create channel binding failed")
+	binding, err := h.api.ProvisionChannelBinding(r.Context(), request.Binding)
+	if err != nil {
+		status := http.StatusInternalServerError
+		var inputErr *channelBindingInputError
+		if errors.As(err, &inputErr) {
+			status = http.StatusBadRequest
+		}
+		writeJSONError(w, status, "create channel binding failed")
 		return
 	}
-	writeJSON(w, http.StatusCreated, request.Binding)
+	writeJSON(w, http.StatusCreated, binding)
 }
 
 func (h adminHTTPHandler) publishAppConfig(w http.ResponseWriter, r *http.Request) {

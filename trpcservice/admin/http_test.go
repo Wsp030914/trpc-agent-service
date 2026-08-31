@@ -48,6 +48,8 @@ func TestHTTPHandlerCreatesControlPlaneScopeAndOneTimeCredential(t *testing.T) {
 		InitialConfig tenant.AppConfig `json:"initial_config"`
 	}{App: app, InitialConfig: initial}, http.StatusCreated, nil)
 	binding := httpTestBinding()
+	binding.PublicRouteID = ""
+	binding.BindingRevision = 0
 	postAdminJSON(t, handler, "/admin/v1/channel-bindings", struct {
 		Binding channels.Binding `json:"binding"`
 	}{Binding: binding}, http.StatusCreated, nil)
@@ -133,6 +135,8 @@ func httpTestBinding() channels.Binding {
 		WebhookURL:       "https://example.com/im/wecom/support",
 		TokenRef:         tenant.SecretRef{Name: "wecom-token", Version: "v1"},
 		SigningSecretRef: tenant.SecretRef{Name: "wecom-signing", Version: "v1"},
+		PublicRouteID:    "route-wecom-support",
+		BindingRevision:  1,
 		Status:           channels.BindingActive,
 	}
 }

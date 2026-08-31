@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -17,7 +18,9 @@ type TenantSource string
 const (
 	// TenantSourceAuthenticatedClaims means tenant routing came from authenticated claims.
 	TenantSourceAuthenticatedClaims TenantSource = "authenticated_claims"
-	// TenantSourceVerifiedChannelBinding means tenant routing came from a verified channel binding.
+	// TenantSourceVerifiedChannelBinding means tenant routing came from a channel
+	// binding whose route and tenant scope were validated. Provider protocol
+	// verification remains the adapter's responsibility.
 	TenantSourceVerifiedChannelBinding TenantSource = "verified_channel_binding"
 )
 
@@ -36,6 +39,9 @@ var (
 	// ErrAdmissionDraining means backend migration is draining accepted work and
 	// new requests must be retried after the advertised maintenance window.
 	ErrAdmissionDraining = errors.New("request admission is draining for data migration")
+	// ErrChannelBindingSnapshotStale means a channel binding snapshot no longer
+	// matches the authoritative Binding row.
+	ErrChannelBindingSnapshotStale = errors.New("channel binding snapshot is stale")
 )
 
 // Message is the normalized user input passed from gateway to workers.
@@ -72,6 +78,26 @@ type AdmissionIdentity struct {
 	Source           TenantSource
 	SourceID         string
 	CredentialDigest CredentialDigest
+	// PublicRouteID and BindingRevision identify the Binding snapshot that
+	// supplied a channel-binding identity. They are ignored for authenticated
+	// claims and revalidated by the PostgreSQL admission transaction.
+	PublicRouteID            string
+	BindingRevision          int64
+	channelBindingProvenance *channelBindingProvenance
+}
+
+// channelBindingProvenance is intentionally package-private. A channel
+// binding identity must be produced by the gateway's route-bound constructor;
+// field validation alone is not a trusted provenance check. The provenance
+// binds every exported identity field so copying a valid identity and
+// changing its scope or session cannot reuse it.
+type channelBindingProvenance struct {
+	runtimeContext   tenant.RuntimeContext
+	source           TenantSource
+	sourceID         string
+	credentialDigest CredentialDigest
+	publicRouteID    string
+	bindingRevision  int64
 }
 
 // Validate checks the trusted source and identity fields required for atomic
@@ -90,11 +116,32 @@ func (i AdmissionIdentity) Validate() error {
 		return errors.New("credential digest is required")
 	}
 	if i.Source == TenantSourceVerifiedChannelBinding {
-		if i.Tenant.Channel == "" {
-			return errors.New("channel is required for verified channel binding")
+		provenance := i.channelBindingProvenance
+		if provenance == nil {
+			return errors.New("channel binding provenance is required")
+		}
+		if provenance.runtimeContext != i.Tenant ||
+			provenance.source != i.Source ||
+			provenance.sourceID != i.SourceID ||
+			provenance.credentialDigest != i.CredentialDigest ||
+			provenance.publicRouteID != i.PublicRouteID ||
+			provenance.bindingRevision != i.BindingRevision {
+			return errors.New("channel binding provenance does not match identity")
+		}
+		if err := channels.Channel(i.Tenant.Channel).Validate(); err != nil {
+			return fmt.Errorf("channel binding channel: %w", err)
 		}
 		if i.Tenant.BindingID == "" {
-			return errors.New("binding_id is required for verified channel binding")
+			return errors.New("binding_id is required for channel binding source")
+		}
+		if i.SourceID != i.Tenant.BindingID {
+			return errors.New("source_id must equal binding_id for channel binding source")
+		}
+		if err := channels.ValidatePublicRouteID(i.PublicRouteID); err != nil {
+			return fmt.Errorf("channel binding route: %w", err)
+		}
+		if i.BindingRevision <= 0 {
+			return errors.New("binding_revision must be positive for channel binding source")
 		}
 	}
 	return nil

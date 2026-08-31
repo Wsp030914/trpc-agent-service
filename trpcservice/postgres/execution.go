@@ -343,7 +343,17 @@ func (v storedExecution) executionJob() (execution.Job, error) {
 	if c.TenantID != v.tenantID || c.AppID != v.appID || c.SessionPrincipalID != v.sessionPrincipalID || c.SessionID != v.sessionID || c.UserID != v.userID {
 		return execution.Job{}, errors.New("execution command does not match stored scope")
 	}
-	return execution.NewJob(v.requestID, v.tenantSource, tenant.RuntimeContext{TenantID: v.tenantID, AppID: v.appID, ConfigVersion: v.configVersion, SessionPrincipalID: v.sessionPrincipalID, SessionID: v.sessionID, UserID: v.userID, TraceID: v.traceID}, gateway.Message{Text: c.Text, ArtifactRefs: c.ArtifactRefs})
+	return execution.NewJob(v.requestID, v.tenantSource, tenant.RuntimeContext{
+		TenantID:           v.tenantID,
+		AppID:              v.appID,
+		ConfigVersion:      v.configVersion,
+		Channel:            c.Channel,
+		BindingID:          c.BindingID,
+		SessionPrincipalID: v.sessionPrincipalID,
+		SessionID:          v.sessionID,
+		UserID:             v.userID,
+		TraceID:            v.traceID,
+	}, gateway.Message{Text: c.Text, ArtifactRefs: c.ArtifactRefs})
 }
 func consumeDispatch(ctx context.Context, tx pgx.Tx, dispatch queue.Dispatch) error {
 	if err := dispatch.Validate(); err != nil {

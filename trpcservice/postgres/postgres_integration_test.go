@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -133,8 +134,32 @@ func TestPostgresMigrationAndRepositories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve channel binding: %v", err)
 	}
-	if !reflect.DeepEqual(resolvedBinding, binding) {
-		t.Fatalf("resolved channel binding = %#v, want %#v", resolvedBinding, binding)
+	if resolvedBinding.PublicRouteID == "" || resolvedBinding.BindingRevision != 1 {
+		t.Fatalf("generated channel binding route = %#v", resolvedBinding)
+	}
+	expectedBinding := binding
+	expectedBinding.PublicRouteID = resolvedBinding.PublicRouteID
+	expectedBinding.BindingRevision = resolvedBinding.BindingRevision
+	if !reflect.DeepEqual(resolvedBinding, expectedBinding) {
+		t.Fatalf("resolved channel binding = %#v, want %#v", resolvedBinding, expectedBinding)
+	}
+	binding = resolvedBinding
+	routeSnapshot, err := store.ResolveBindingByPublicRoute(
+		ctx,
+		channels.ChannelWeCom,
+		binding.PublicRouteID,
+	)
+	if err != nil {
+		t.Fatalf("resolve channel binding by public route: %v", err)
+	}
+	if !reflect.DeepEqual(routeSnapshot.Binding, binding) {
+		t.Fatalf("route binding snapshot = %#v, want %#v", routeSnapshot.Binding, binding)
+	}
+	if _, err := store.ResolveBindingByPublicRoute(ctx, channels.ChannelFeishu, binding.PublicRouteID); !errors.Is(err, channels.ErrBindingChannelMismatch) {
+		t.Fatalf("resolve channel binding with mismatched channel error = %v, want channel mismatch", err)
+	}
+	if _, err := store.ResolveBindingByPublicRoute(ctx, channels.ChannelWeCom, "route-does-not-exist"); !errors.Is(err, channels.ErrBindingNotFound) {
+		t.Fatalf("resolve unknown public route error = %v, want not found", err)
 	}
 	resolvedV1, err := store.ResolveAppConfig(ctx, v1.TenantID, v1.AppID, v1.Version)
 	if err != nil {
@@ -191,6 +216,235 @@ func TestPostgresMigrationAndRepositories(t *testing.T) {
 			resolvedApp.ActiveConfigVersion,
 			v2.Version,
 		)
+	}
+
+	route, err := gateway.ResolveChannelBindingRoute(
+		ctx,
+		store,
+		binding.Channel,
+		binding.PublicRouteID,
+	)
+	if err != nil {
+		t.Fatalf("resolve channel binding route: %v", err)
+	}
+	channelBindingResolver, err := gateway.NewChannelBindingIdentityResolver(
+		route,
+		tenant.RuntimeContext{
+			TenantID:           app.TenantID,
+			AppID:              app.AppID,
+			ConfigVersion:      "stale-v1",
+			Channel:            string(binding.Channel),
+			BindingID:          binding.BindingID,
+			SessionID:          "session-im-01",
+			SessionPrincipalID: "principal-im-01",
+			UserID:             "user-im-01",
+			TraceID:            "trace-im-01-1",
+		},
+	)
+	if err != nil {
+		t.Fatalf("create channel binding identity resolver: %v", err)
+	}
+	channelBindingIdentity, err := channelBindingResolver.ResolveAdmissionIdentity(ctx)
+	if err != nil {
+		t.Fatalf("resolve channel binding identity: %v", err)
+	}
+	channelBindingRequest := gateway.AdmissionRequest{
+		RequestID:      "request-im-01-1",
+		IdempotencyKey: "message-im-01-1",
+		Identity:       channelBindingIdentity,
+		Message:        gateway.Message{Text: "channel binding admission"},
+	}
+	channelBindingResult, err := store.Admit(ctx, channelBindingRequest)
+	if err != nil {
+		t.Fatalf("admit channel binding request: %v", err)
+	}
+	if channelBindingResult.ConfigVersion != v2.Version || channelBindingResult.TurnSeq != 1 || channelBindingResult.Replayed {
+		t.Fatalf("channel binding admission result = %#v", channelBindingResult)
+	}
+	channelBindingDispatches, err := store.ClaimDispatches(ctx, "relay-im-01", time.Second, 1)
+	if err != nil || len(channelBindingDispatches) != 1 {
+		t.Fatalf("claim channel binding dispatches = %#v, %v", channelBindingDispatches, err)
+	}
+	if err := store.CompleteDispatch(ctx, channelBindingDispatches[0], "relay-im-01"); err != nil {
+		t.Fatalf("complete channel binding dispatch: %v", err)
+	}
+	channelBindingClaim, found, err := store.Claim(ctx, channelBindingDispatches[0], queue.ClaimRequest{
+		Owner:         "worker-im-01",
+		LeaseDuration: time.Second,
+	})
+	if err != nil || !found {
+		t.Fatalf("claim channel binding execution = %#v, %t, %v", channelBindingClaim, found, err)
+	}
+	if err := store.Complete(ctx, channelBindingClaim, queue.CompletionSucceeded); err != nil {
+		t.Fatalf("complete channel binding execution: %v", err)
+	}
+	channelBindingReplay, err := store.Admit(ctx, channelBindingRequest)
+	if err != nil {
+		t.Fatalf("replay channel binding request: %v", err)
+	}
+	if !channelBindingReplay.Replayed || channelBindingReplay.RequestID != channelBindingResult.RequestID || channelBindingReplay.TurnSeq != channelBindingResult.TurnSeq {
+		t.Fatalf("channel binding replay result = %#v", channelBindingReplay)
+	}
+
+	rotatedBinding, err := store.RotateChannelBindingRoute(
+		ctx,
+		binding.TenantID,
+		binding.AppID,
+		binding.BindingID,
+	)
+	if err != nil {
+		t.Fatalf("rotate channel binding route: %v", err)
+	}
+	if rotatedBinding.PublicRouteID == binding.PublicRouteID || rotatedBinding.BindingRevision <= binding.BindingRevision {
+		t.Fatalf("rotated binding = %#v, want a new route and revision", rotatedBinding)
+	}
+	if _, err := store.ResolveBindingByPublicRoute(ctx, channels.ChannelWeCom, binding.PublicRouteID); !errors.Is(err, channels.ErrBindingNotFound) {
+		t.Fatalf("resolve stale public route error = %v, want not found", err)
+	}
+	rotatedSnapshot, err := store.ResolveBindingByPublicRoute(ctx, channels.ChannelWeCom, rotatedBinding.PublicRouteID)
+	if err != nil {
+		t.Fatalf("resolve rotated public route: %v", err)
+	}
+	if !reflect.DeepEqual(rotatedSnapshot.Binding, rotatedBinding) {
+		t.Fatalf("rotated route snapshot = %#v, want %#v", rotatedSnapshot.Binding, rotatedBinding)
+	}
+	rotatedRoute, err := gateway.ResolveChannelBindingRoute(
+		ctx,
+		store,
+		rotatedBinding.Channel,
+		rotatedBinding.PublicRouteID,
+	)
+	if err != nil {
+		t.Fatalf("resolve rotated channel binding route: %v", err)
+	}
+	rotatedChannelBindingResolver, err := gateway.NewChannelBindingIdentityResolver(
+		rotatedRoute,
+		tenant.RuntimeContext{
+			TenantID:           app.TenantID,
+			AppID:              app.AppID,
+			ConfigVersion:      "stale-v1",
+			Channel:            string(binding.Channel),
+			BindingID:          binding.BindingID,
+			SessionID:          "session-im-01",
+			SessionPrincipalID: "principal-im-01",
+			UserID:             "user-im-01",
+			TraceID:            "trace-im-01-auth-stale",
+		},
+	)
+	if err != nil {
+		t.Fatalf("create rotated channel binding identity resolver: %v", err)
+	}
+	freshIdentity, err := rotatedChannelBindingResolver.ResolveAdmissionIdentity(ctx)
+	if err != nil {
+		t.Fatalf("resolve rotated channel binding identity: %v", err)
+	}
+	authorizationStaleRequest := channelBindingRequest
+	authorizationStaleRequest.RequestID = "request-im-01-auth-stale"
+	authorizationStaleRequest.IdempotencyKey = "message-im-01-auth-stale"
+	authorizationStaleRequest.Identity = freshIdentity
+	if _, err := pool.Exec(
+		ctx,
+		`UPDATE platform.channel_binding
+SET external_account = 'corp-agent-support-rotated'
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`,
+		binding.TenantID,
+		binding.AppID,
+		binding.BindingID,
+	); err != nil {
+		t.Fatalf("rotate channel binding authorization data: %v", err)
+	}
+	if _, err := store.Admit(ctx, authorizationStaleRequest); !errors.Is(err, gateway.ErrChannelBindingSnapshotStale) {
+		t.Fatalf("stale authorization binding admission error = %v, want stale binding", err)
+	}
+	var staleExecutionCount int
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT count(*)
+FROM platform.execution
+WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
+		binding.TenantID,
+		binding.AppID,
+		authorizationStaleRequest.RequestID,
+	).Scan(&staleExecutionCount); err != nil {
+		t.Fatalf("query stale admission execution: %v", err)
+	}
+	if staleExecutionCount != 0 {
+		t.Fatalf("stale admission execution count = %d, want 0", staleExecutionCount)
+	}
+	staleRequest := channelBindingRequest
+	staleRequest.RequestID = "request-im-01-stale"
+	staleRequest.IdempotencyKey = "message-im-01-stale"
+	if _, err := store.Admit(ctx, staleRequest); !errors.Is(err, gateway.ErrChannelBindingSnapshotStale) {
+		t.Fatalf("stale channel binding admission error = %v, want stale binding", err)
+	}
+
+	currentIdentity := freshIdentity
+	suspendedRequest := channelBindingRequest
+	suspendedRequest.RequestID = "request-im-01-suspended"
+	suspendedRequest.IdempotencyKey = "message-im-01-suspended"
+	suspendedRequest.Identity = currentIdentity
+	disableTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin binding disable transaction: %v", err)
+	}
+	if _, err := disableTx.Exec(
+		ctx,
+		`UPDATE platform.channel_binding
+SET status = 'SUSPENDED'
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`,
+		binding.TenantID,
+		binding.AppID,
+		binding.BindingID,
+	); err != nil {
+		_ = disableTx.Rollback(ctx)
+		t.Fatalf("suspend channel binding: %v", err)
+	}
+	admissionDone := make(chan error, 1)
+	go func() {
+		_, admissionErr := store.Admit(ctx, suspendedRequest)
+		admissionDone <- admissionErr
+	}()
+	if err := waitForBindingAdmissionLock(ctx, pool); err != nil {
+		_ = disableTx.Rollback(ctx)
+		t.Fatalf("wait for channel binding admission lock: %v", err)
+	}
+	if err := disableTx.Commit(ctx); err != nil {
+		_ = disableTx.Rollback(ctx)
+		t.Fatalf("commit binding disable transaction: %v", err)
+	}
+	var admissionErr error
+	select {
+	case admissionErr = <-admissionDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel binding admission did not finish after binding disable commit")
+	}
+	if !errors.Is(admissionErr, channels.ErrBindingInactive) {
+		t.Fatalf("suspended channel binding admission error = %v, want inactive binding", admissionErr)
+	}
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT count(*)
+FROM platform.execution
+WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
+		binding.TenantID,
+		binding.AppID,
+		suspendedRequest.RequestID,
+	).Scan(&staleExecutionCount); err != nil {
+		t.Fatalf("query suspended admission execution: %v", err)
+	}
+	if staleExecutionCount != 0 {
+		t.Fatalf("suspended admission execution count = %d, want 0", staleExecutionCount)
+	}
+	if _, err := pool.Exec(
+		ctx,
+		`UPDATE platform.channel_binding
+SET status = 'ACTIVE'
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`,
+		binding.TenantID,
+		binding.AppID,
+		binding.BindingID,
+	); err != nil {
+		t.Fatalf("restore channel binding: %v", err)
 	}
 
 	if _, err := pool.Exec(
@@ -412,6 +666,36 @@ func openIntegrationPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("ping postgres test database: %v", err)
 	}
 	return pool
+}
+
+func waitForBindingAdmissionLock(ctx context.Context, pool *pgxpool.Pool) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		err := pool.QueryRow(waitCtx, `
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_stat_activity
+    WHERE pid <> pg_backend_pid()
+      AND wait_event_type = 'Lock'
+      AND query LIKE '%FROM platform.channel_binding%'
+      AND query LIKE '%FOR UPDATE%'
+)`).Scan(&waiting)
+		if err != nil {
+			return fmt.Errorf("inspect binding admission lock: %w", err)
+		}
+		if waiting {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func integrationAppConfig(version, modelName string) tenant.AppConfig {

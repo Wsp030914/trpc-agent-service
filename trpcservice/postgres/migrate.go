@@ -29,10 +29,12 @@ type schemaMigration struct {
 	checksum [sha256.Size]byte
 }
 
-// Migrate applies embedded PostgreSQL platform-schema migrations in one
-// transaction. It does not move tenant data between backend implementations.
-// A PostgreSQL transaction-level advisory lock serializes concurrent service
-// nodes. Applied migration contents are immutable and verified by checksum.
+// Migrate applies embedded PostgreSQL platform-schema migrations in version
+// order. Each migration has its own transaction so an expand migration can be
+// committed before a later constraint migration. It does not move tenant data
+// between backend implementations. A PostgreSQL transaction-level advisory
+// lock serializes concurrent service nodes for each migration. Applied
+// migration contents are immutable and verified by checksum.
 func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.validate(); err != nil {
 		return err
@@ -42,16 +44,43 @@ func (s *Store) Migrate(ctx context.Context) error {
 		return err
 	}
 
+	if err := s.bootstrapSchemaMigrations(ctx); err != nil {
+		return err
+	}
+
+	known := make(map[int64]schemaMigration, len(schemaMigrations))
+	for _, migration := range schemaMigrations {
+		known[migration.version] = migration
+	}
+
+	for _, migration := range schemaMigrations {
+		tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+		if err != nil {
+			return fmt.Errorf("begin migration %d: %w", migration.version, err)
+		}
+		if err := applySchemaMigration(ctx, tx, migration, known); err != nil {
+			rollback(tx)
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			rollback(tx)
+			return fmt.Errorf("commit migration %d: %w", migration.version, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) bootstrapSchemaMigrations(ctx context.Context) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin migration: %w", err)
+		return fmt.Errorf("begin migration bootstrap: %w", err)
 	}
 	defer func() {
 		rollback(tx)
 	}()
 
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", schemaMigrationLockKey); err != nil {
-		return fmt.Errorf("lock migrations: %w", err)
+		return fmt.Errorf("lock migration bootstrap: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 CREATE SCHEMA IF NOT EXISTS platform;
@@ -62,45 +91,60 @@ CREATE TABLE IF NOT EXISTS platform.schema_migration (
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT schema_migration_checksum_length CHECK (octet_length(checksum) = 32)
 );`); err != nil {
-		return fmt.Errorf("bootstrap migrations: %w", err)
+		return fmt.Errorf("bootstrap migration schema: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit migration bootstrap: %w", err)
+	}
+	return nil
+}
 
+func applySchemaMigration(
+	ctx context.Context,
+	tx pgx.Tx,
+	migration schemaMigration,
+	known map[int64]schemaMigration,
+) error {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", schemaMigrationLockKey); err != nil {
+		return fmt.Errorf("lock migration %d: %w", migration.version, err)
+	}
 	applied, err := readAppliedSchemaMigrations(ctx, tx)
 	if err != nil {
 		return err
 	}
-	known := make(map[int64]schemaMigration, len(schemaMigrations))
-	for _, migration := range schemaMigrations {
-		known[migration.version] = migration
-		if checksum, ok := applied[migration.version]; ok && !bytes.Equal(checksum, migration.checksum[:]) {
-			return fmt.Errorf("schema migration %d checksum does not match", migration.version)
-		}
+	if err := validateAppliedSchemaMigrations(applied, known); err != nil {
+		return err
 	}
-	for version := range applied {
-		if _, ok := known[version]; !ok {
+	if _, ok := applied[migration.version]; ok {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, migration.contents); err != nil {
+		return fmt.Errorf("apply schema migration %d %s: %w", migration.version, migration.name, err)
+	}
+	if _, err := tx.Exec(
+		ctx,
+		`INSERT INTO platform.schema_migration (version, name, checksum) VALUES ($1, $2, $3)`,
+		migration.version,
+		migration.name,
+		migration.checksum[:],
+	); err != nil {
+		return fmt.Errorf("record schema migration %d: %w", migration.version, err)
+	}
+	return nil
+}
+
+func validateAppliedSchemaMigrations(
+	applied map[int64][]byte,
+	known map[int64]schemaMigration,
+) error {
+	for version, checksum := range applied {
+		migration, ok := known[version]
+		if !ok {
 			return fmt.Errorf("database contains unknown schema migration %d", version)
 		}
-	}
-
-	for _, migration := range schemaMigrations {
-		if _, ok := applied[migration.version]; ok {
-			continue
+		if !bytes.Equal(checksum, migration.checksum[:]) {
+			return fmt.Errorf("schema migration %d checksum does not match", version)
 		}
-		if _, err := tx.Exec(ctx, migration.contents); err != nil {
-			return fmt.Errorf("apply schema migration %d %s: %w", migration.version, migration.name, err)
-		}
-		if _, err := tx.Exec(
-			ctx,
-			`INSERT INTO platform.schema_migration (version, name, checksum) VALUES ($1, $2, $3)`,
-			migration.version,
-			migration.name,
-			migration.checksum[:],
-		); err != nil {
-			return fmt.Errorf("record schema migration %d: %w", migration.version, err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit migrations: %w", err)
 	}
 	return nil
 }
