@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -53,15 +55,27 @@ type Message struct {
 	ArtifactRefs []string
 }
 
-// Validate checks whether Message is executable by the current runner boundary.
+// Validate checks whether Message contains a platform-approved user payload.
 func (m Message) Validate() error {
-	if m.Text == "" {
-		return errors.New("message text is required")
+	if m.Text == "" && len(m.ArtifactRefs) == 0 {
+		return errors.New("message content is required")
 	}
-	if len(m.ArtifactRefs) > 0 {
-		return errors.New("artifact refs are not supported by runner boundary")
+	if !utf8.ValidString(m.Text) {
+		return errors.New("message text is not valid utf-8")
+	}
+	for index, ref := range m.ArtifactRefs {
+		if !validArtifactRef(ref) {
+			return fmt.Errorf("artifact ref %d is invalid", index)
+		}
 	}
 	return nil
+}
+
+func validArtifactRef(ref string) bool {
+	return strings.HasPrefix(ref, "artifact://") &&
+		strings.TrimSpace(strings.TrimPrefix(ref, "artifact://")) != "" &&
+		utf8.ValidString(ref) &&
+		!strings.ContainsAny(ref, "\r\n\t")
 }
 
 // TenantResolver supplies tenant routing from an authentication or verification boundary.
@@ -255,7 +269,11 @@ func (r AdmissionRequest) Validate() error {
 		!slices.Equal(r.Message.ArtifactRefs, r.ChannelInput.ArtifactRefs) {
 		return errors.New("channel input message does not match gateway message")
 	}
-	if r.ChannelInput.MessageType == channels.MessageTypeText {
+	// Unsupported provider payloads are durably classified by PostgreSQL so
+	// they can be audited without creating an execution. Validate executable
+	// content here, while allowing an empty normalized payload to reach that
+	// classification path.
+	if r.Message.Text != "" || len(r.Message.ArtifactRefs) > 0 {
 		if err := r.Message.Validate(); err != nil {
 			return fmt.Errorf("message: %w", err)
 		}

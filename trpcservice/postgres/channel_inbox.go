@@ -97,7 +97,8 @@ INSERT INTO platform.channel_inbox (
     tenant_id, app_id, binding_id, external_message_id, payload_hash,
     request_id, status, message_type, reject_reason, provider_reply_target_envelope,
     reply_target_expires_at, provider_timestamp
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+ON CONFLICT (tenant_id, app_id, binding_id, external_message_id) DO NOTHING`,
 		identity.TenantID,
 		identity.AppID,
 		identity.BindingID,
@@ -159,11 +160,15 @@ func channelInputRejectReason(input channels.ChannelInput) (string, error) {
 			return "", errors.New("channel input reject reason is unsupported")
 		}
 	}
-	if len(input.ArtifactRefs) > 0 {
-		return "ATTACHMENT_REJECTED", nil
-	}
-	if input.MessageType != channels.MessageTypeText {
+	switch input.MessageType {
+	case channels.MessageTypeText:
+		return "", nil
+	case channels.MessageTypeImage, channels.MessageTypeFile, channels.MessageTypeMixed:
+		if len(input.ArtifactRefs) == 0 {
+			return "ATTACHMENT_REJECTED", nil
+		}
+		return "", nil
+	default:
 		return "UNSUPPORTED_MESSAGE_TYPE", nil
 	}
-	return "", nil
 }

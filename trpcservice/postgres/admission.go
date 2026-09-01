@@ -178,6 +178,11 @@ func (s *Store) Admit(
 			); err != nil {
 				return gateway.AdmissionResult{}, admissionInsertError("insert rejected channel inbox", err)
 			}
+			if result, replayed, err := admission.reconcileInsertedChannelInbox(); err != nil {
+				return gateway.AdmissionResult{}, err
+			} else if replayed {
+				return result, nil
+			}
 			if err := insertChannelInboxRejectionAudit(ctx, tx, request, rejectReason); err != nil {
 				return gateway.AdmissionResult{}, err
 			}
@@ -210,12 +215,18 @@ func (s *Store) Admit(
 		); err != nil {
 			return gateway.AdmissionResult{}, admissionInsertError("insert channel inbox", err)
 		}
+		if result, replayed, err := admission.reconcileInsertedChannelInbox(); err != nil {
+			return gateway.AdmissionResult{}, err
+		} else if replayed {
+			return result, nil
+		}
 		mapped, err := s.identityMapper.mapInTransaction(ctx, tx, mappingRequest)
 		if err != nil {
 			return gateway.AdmissionResult{}, err
 		}
 		admission.runtimeContext = request.Identity.Tenant
 		admission.runtimeContext.ConfigVersion = app.ActiveConfigVersion
+		admission.runtimeContext.BindingRevision = request.Identity.BindingRevision
 		admission.runtimeContext.SessionPrincipalID = mapped.SessionPrincipalID
 		admission.runtimeContext.SessionID = mapped.SessionID
 		admission.runtimeContext.UserID = mapped.Identity.UserID
@@ -328,6 +339,35 @@ func (a admissionTransaction) reconcileChannelInbox(
 	default:
 		return gateway.AdmissionResult{}, fmt.Errorf("channel inbox status %q is invalid", inbox.Status)
 	}
+}
+
+func (a admissionTransaction) reconcileInsertedChannelInbox() (gateway.AdmissionResult, bool, error) {
+	input := a.request.ChannelInput
+	if input == nil {
+		return gateway.AdmissionResult{}, false, errors.New("channel input is required")
+	}
+	inbox, found, err := findChannelInbox(
+		a.ctx,
+		a.tx,
+		input.TenantID,
+		input.AppID,
+		input.BindingID,
+		input.ExternalMessageID,
+	)
+	if err != nil {
+		return gateway.AdmissionResult{}, false, err
+	}
+	if !found {
+		return gateway.AdmissionResult{}, false, errors.New("channel inbox was not available after insert")
+	}
+	if !bytes.Equal(inbox.PayloadHash, a.payloadHash[:]) {
+		return gateway.AdmissionResult{}, false, gateway.ErrIdempotencyConflict
+	}
+	if inbox.RequestID == a.request.RequestID {
+		return gateway.AdmissionResult{}, false, nil
+	}
+	result, err := a.reconcileChannelInbox(inbox)
+	return result, true, err
 }
 
 func (a admissionTransaction) reconcileExisting(existing admissionExecution) (gateway.AdmissionResult, error) {
@@ -816,6 +856,7 @@ type admissionCommand struct {
 	AppID              string   `json:"app_id"`
 	Channel            string   `json:"channel,omitempty"`
 	BindingID          string   `json:"binding_id,omitempty"`
+	BindingRevision    int64    `json:"binding_revision,omitempty"`
 	SessionPrincipalID string   `json:"session_principal_id"`
 	SessionID          string   `json:"session_id"`
 	UserID             string   `json:"user_id"`
@@ -839,6 +880,7 @@ func marshalAdmissionCommandForRuntimeContext(
 		AppID:              runtimeContext.AppID,
 		Channel:            runtimeContext.Channel,
 		BindingID:          runtimeContext.BindingID,
+		BindingRevision:    runtimeContext.BindingRevision,
 		SessionPrincipalID: runtimeContext.SessionPrincipalID,
 		SessionID:          runtimeContext.SessionID,
 		UserID:             runtimeContext.UserID,

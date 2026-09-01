@@ -32,6 +32,20 @@ type ExecutionStore interface {
 	Retry(context.Context, queue.Claim, error) error
 }
 
+// ExecutionCancellationStore records a recall-driven cancellation while the
+// worker still owns the execution lease.
+type ExecutionCancellationStore interface {
+	Cancel(context.Context, queue.Claim) error
+}
+
+// ExecutionCancellationObserver reports the authoritative recall flag for a
+// currently running execution. A worker must not infer recall from a generic
+// context cancellation because session-lock loss and service shutdown use the
+// same error.
+type ExecutionCancellationObserver interface {
+	CancellationRequested(context.Context, queue.Claim) (bool, error)
+}
+
 // ConsumerOption configures a Consumer.
 type ConsumerOption func(*Consumer)
 
@@ -249,7 +263,38 @@ func (c *Consumer) executeClaim(ctx context.Context, claim queue.Claim) (bool, e
 	}
 	done := make(chan error, 1)
 	go c.renewLease(runCtx, cancelRun, claim, done)
+	observer, observesCancellation := c.jobs.(ExecutionCancellationObserver)
+	var cancelObserve context.CancelFunc
+	var cancellationDone <-chan cancellationObservation
+	if observesCancellation {
+		var observeDone chan cancellationObservation
+		observeCtx, cancel := context.WithCancel(runCtx)
+		cancelObserve = cancel
+		observeDone = make(chan cancellationObservation, 1)
+		cancellationDone = observeDone
+		go c.observeCancellation(observeCtx, observer, claim, cancelRun, observeDone)
+	}
 	result, runErr := c.executor.Run(runCtx, claim.Job)
+	var cancellationRequested bool
+	var observationErr error
+	if cancelObserve != nil {
+		cancelObserve()
+		select {
+		case observation, ok := <-cancellationDone:
+			if ok {
+				cancellationRequested = observation.requested
+				observationErr = observation.err
+			}
+		case <-time.After(consumerCompletionTimeout):
+			cancelRun()
+			select {
+			case <-done:
+				return false, errors.New("execution cancellation observer did not stop")
+			default:
+				return false, errors.New("execution cancellation observer did not stop")
+			}
+		}
+	}
 	cancelRun()
 	leaseErr := <-done
 	if errors.Is(leaseErr, queue.ErrLeaseLost) {
@@ -258,9 +303,40 @@ func (c *Consumer) executeClaim(ctx context.Context, claim queue.Claim) (bool, e
 	if leaseErr != nil {
 		return false, fmt.Errorf("renew execution lease: %w", leaseErr)
 	}
+	if observationErr != nil && !errors.Is(observationErr, queue.ErrLeaseLost) {
+		return false, fmt.Errorf("observe execution cancellation: %w", observationErr)
+	}
+	if errors.Is(observationErr, queue.ErrLeaseLost) {
+		return true, nil
+	}
+	if !cancellationRequested && errors.Is(runErr, context.Canceled) && ctx.Err() == nil && observesCancellation {
+		requested, err := observer.CancellationRequested(context.WithoutCancel(ctx), claim)
+		if errors.Is(err, queue.ErrLeaseLost) {
+			return true, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("check execution cancellation: %w", err)
+		}
+		cancellationRequested = requested
+	}
+	if cancellationRequested && ctx.Err() == nil &&
+		(errors.Is(runErr, context.Canceled) || !result.RunnerCompleted) {
+		if canceller, ok := c.jobs.(ExecutionCancellationStore); ok {
+			completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), consumerCompletionTimeout)
+			cancelErr := canceller.Cancel(completeCtx, claim)
+			cancel()
+			if errors.Is(cancelErr, queue.ErrLeaseLost) {
+				return true, nil
+			}
+			if cancelErr != nil {
+				return false, fmt.Errorf("cancel execution: %w", cancelErr)
+			}
+		}
+		return true, nil
+	}
 	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), consumerCompletionTimeout)
 	defer cancel()
-	if ctx.Err() != nil || errors.Is(runErr, context.Canceled) {
+	if ctx.Err() != nil {
 		return true, nil
 	}
 	if runErr != nil || !result.RunnerCompleted {
@@ -277,6 +353,58 @@ func (c *Consumer) executeClaim(ctx context.Context, claim queue.Claim) (bool, e
 		return false, fmt.Errorf("complete execution: %w", err)
 	}
 	return true, nil
+}
+
+type cancellationObservation struct {
+	requested bool
+	err       error
+}
+
+func (c *Consumer) observeCancellation(
+	ctx context.Context,
+	observer ExecutionCancellationObserver,
+	claim queue.Claim,
+	cancelRun context.CancelFunc,
+	done chan<- cancellationObservation,
+) {
+	defer close(done)
+	interval := c.pollInterval
+	maxInterval := c.leaseDuration / 3
+	if maxInterval > 0 && interval > maxInterval {
+		interval = maxInterval
+	}
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
+	check := func() bool {
+		requested, err := observer.CancellationRequested(ctx, claim)
+		if err != nil {
+			done <- cancellationObservation{err: err}
+			cancelRun()
+			return true
+		}
+		if requested {
+			done <- cancellationObservation{requested: true}
+			cancelRun()
+			return true
+		}
+		return false
+	}
+	if check() {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if check() {
+				return
+			}
+		}
+	}
 }
 func executionFailure(err error, result RunResult) error {
 	if err != nil {

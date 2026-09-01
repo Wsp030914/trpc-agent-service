@@ -62,18 +62,19 @@ const (
 
 // Binding maps one tenant-owned external IM account to an application.
 type Binding struct {
-	TenantID         string           `json:"tenant_id"`
-	AppID            string           `json:"app_id"`
-	BindingID        string           `json:"binding_id"`
-	Channel          Channel          `json:"channel"`
-	ExternalAccount  string           `json:"external_account"`
-	WebhookURL       string           `json:"webhook_url"`
-	TokenRef         tenant.SecretRef `json:"token_ref"`
-	SigningSecretRef tenant.SecretRef `json:"signing_secret_ref"`
-	Secret           tenant.SecretRef `json:"secret_ref"`
-	PublicRouteID    string           `json:"public_route_id"`
-	BindingRevision  int64            `json:"binding_revision"`
-	Status           BindingStatus    `json:"status"`
+	TenantID             string           `json:"tenant_id"`
+	AppID                string           `json:"app_id"`
+	BindingID            string           `json:"binding_id"`
+	Channel              Channel          `json:"channel"`
+	ExternalAccount      string           `json:"external_account"`
+	ExternalAccountScope string           `json:"external_account_scope"`
+	WebhookURL           string           `json:"webhook_url"`
+	TokenRef             tenant.SecretRef `json:"token_ref"`
+	SigningSecretRef     tenant.SecretRef `json:"signing_secret_ref"`
+	Secret               tenant.SecretRef `json:"secret_ref"`
+	PublicRouteID        string           `json:"public_route_id"`
+	BindingRevision      int64            `json:"binding_revision"`
+	Status               BindingStatus    `json:"status"`
 }
 
 // BindingSnapshot is a value copy of a binding captured for one ingress
@@ -171,6 +172,9 @@ func (b Binding) Validate() error {
 	}
 	if b.ExternalAccount == "" {
 		return errors.New("external_account is required")
+	}
+	if b.Channel == ChannelFeishu && strings.TrimSpace(b.ExternalAccountScope) == "" {
+		return errors.New("external_account_scope is required for feishu")
 	}
 	if b.WebhookURL == "" {
 		return errors.New("webhook_url is required")

@@ -102,7 +102,7 @@ PostgreSQL 拆分仍有未提交变更。
 
 | Capability | Status | Current Implementation | Required Change | Target IM Task |
 | --- | --- | --- | --- | --- |
-| channels.Binding | PARTIAL | trpcservice/channels/channels.go 已有 TenantID、AppID、BindingID、Channel、ExternalAccount、WebhookURL、TokenRef、SigningSecretRef、Secret、Status；Validate 支持 ACTIVE/SUSPENDED | 增加 public_route_id、binding_revision；定义授权属性变更递增规则、路由轮换和 provider secret 的使用边界；保留现有 scoped binding_id | IM-01 |
+| channels.Binding | PARTIAL | trpcservice/channels/channels.go 已有 TenantID、AppID、BindingID、Channel、ExternalAccount、ExternalAccountScope、WebhookURL、TokenRef、SigningSecretRef、Secret、Status；Validate 支持 ACTIVE/SUSPENDED，并要求 Feishu Binding 有 ExternalAccountScope | 为数据库存量和读写补齐 ExternalAccountScope、public_route_id、binding_revision；定义授权属性变更递增规则、路由轮换和 provider secret 的使用边界；保留现有 scoped binding_id | IM-01、IM-03 |
 | channels.Identity | PARTIAL | 已有 TenantID、AppID、BindingID、Channel、ExternalUserKeyHash、UserID、Status、KeyVersion | 增加持久化 Repository、唯一约束、并发首次创建、加密 provider target 引用 | IM-04 |
 | channels.Conversation | PARTIAL | 已有 TenantID、AppID、BindingID、Channel、ExternalChatKeyHash、ThreadKeyHash、ConversationID、SessionPrincipalID、Scope | 增加群聊/话题持久化、唯一约束、成员映射和 provider target 引用 | IM-04 |
 | gateway.Message | PARTIAL | 只有 Text 和 ArtifactRefs；Validate 要求 Text 非空，并明确拒绝非空 ArtifactRefs | 扩展为“文本或受控 ArtifactRef 至少一种”的平台输入契约，并完成 Worker 到 tRPC-Agent-Go model.Message 的真实转换、权限和失败语义 | IM-05、IM-07 |
@@ -114,7 +114,7 @@ PostgreSQL 拆分仍有未提交变更。
 | ResolveBinding | PARTIAL | config.BindingResolver 和 postgres.Store.ResolveBinding 都要求 tenant_id + app_id + binding_id，SQL 按三列精确查找 | 新增按 public_route_id 定位的窄接口；保留现有 exact-scope API | IM-01 |
 | postgres.Store.Admit | CONFLICT | 在事务内校验 credential、Tenant、App、Config、幂等 Execution、Session Lane、Execution、Dispatch Outbox；但非 authenticated_claims 直接返回 ErrUnsupportedAdmissionSource | IM-01 增加 verified channel trusted source、BindingRevision/授权快照重校验；IM-05 在该分支内扩展 Inbox 幂等及 Inbox/Identity/Execution/Dispatch 原子写入 | IM-01、IM-05 |
 | WeCom Adapter | MISSING | trpcservice/channels/wecom/doc.go 只有包说明，没有 HTTP、验签、解密、标准化或发送实现 | IM-02 实现企业微信 AI Bot URL 回调协议、标准化、provider media reference 提取、Gateway submission、ACK，并提供供 IM-06 使用的一次出站 codec/client contract 和 fake；媒体下载/解密及 Artifact ingest 由 IM-07 编排；完整 Reply Sender lifecycle 在 IM-06 | IM-02 |
-| Feishu Adapter | MISSING | trpcservice/channels/feishu/doc.go 只有包说明，没有事件订阅、验证、标准化或发送实现 | IM-03 使用官方 `oapi-sdk-go/v3` 完成 HTTP 事件、challenge、验证、provider media reference 提取、标准化、Gateway submission、ACK，并提供供 IM-06 使用的一次出站 codec/client contract 和 fake；媒体下载及 Artifact ingest 由 IM-07 编排；完整 Reply Sender lifecycle 在 IM-06 | IM-03 |
+| Feishu Adapter | MISSING | trpcservice/channels/feishu/doc.go 只有包说明，没有事件订阅、验证、标准化或发送实现 | IM-03 使用官方 `oapi-sdk-go/v3` 完成 HTTP 事件、challenge、时间窗口、验证、provider media reference 提取、标准化、Gateway submission、ACK，并校验 `app_id + tenant_key`；交互卡片入站在当前共享 Channel Input 没有事件契约时只能识别并持久化为 `UNSUPPORTED_MESSAGE_TYPE`，不能伪造空消息；同时提供供 IM-06 使用的一次出站 codec/client contract 和 fake；媒体下载及 Artifact ingest 由 IM-07 编排；完整 Reply Sender lifecycle 在 IM-06 | IM-03 |
 | channel_inbox | MISSING | migrations/000001_platform.sql 没有表，仓库没有 Inbox Repository | 新增 tenant/app/binding/external_message_id 唯一键、payload hash、request_id、消息级 reply target envelope，以及 ADMITTED/已验签不支持类型或永久不支持媒体的 REJECTED 语义 | IM-05、IM-07 |
 | channel_recall_inbox | MISSING | 当前没有撤回事件的持久化幂等记录 | 新增 tenant/app/binding/external_event_id 唯一键，与取消/审计动作同事务提交；不引入通用事件恢复框架 | IM-07 |
 | reply_outbox | MISSING | 当前只有 Dispatch Outbox，没有回复投递记录、Claim、Lease 或 Sender | 新增独立 Reply Outbox、source event 幂等键、logical reply/revision、有限 Claim/Lease/Retry | IM-06 |
@@ -289,11 +289,21 @@ Agent 的检查职责，只针对当前 diff 提出最小清理建议，不把�
    - 必须处理的问题：阻塞项、重要问题和会影响安全/事务/验收的问题；
    - 独立清理建议：过度设计、重复抽象、无必要的提前扩展、兼容性收口和可维护性
      改进。
-3. 审查 Agent 可以一并指出清理项，但清理项默认不自动变成当前任务的实现范围，
+3. 主线程收到审查反馈后必须逐条独立判定，不得把审查意见直接等同于缺陷或修复
+   指令。每条意见必须归类为：
+   - `VALID`：与当前 Repo Facts、冻结 Spec、安全/事务不变量或当前任务
+     Done criteria 冲突，进入本轮修复；
+   - `BOUNDARY`：问题真实存在，但需要修改共享契约、Schema 或任务边界，先回写
+     并冻结 Spec，再决定是否进入本轮；
+   - `REJECTED`：与当前契约不冲突、属于个人风格偏好、重复已有保护，或会引入
+     未授权的过度设计，不修改代码并记录判定理由。
+   主线程必须在交接记录中保留每条意见的分类和依据；只有 `VALID`，以及已经
+   回写 Spec 并明确纳入当前任务的 `BOUNDARY`，才允许进入修复清单。
+4. 审查 Agent 可以一并指出清理项，但清理项默认不自动变成当前任务的实现范围，
    不得以“建议未实现”为理由阻塞当前交付；主线程在当前任务完成后决定立即处理
    或记录到后续任务。只有实际涉及安全、数据一致性、兼容性破坏或已冻结验收
    条件时，才升级为必须修复项。
-4. QA Agent 在主线程修复完成后只读验收，不修改代码或 Spec；若失败，只返回可
+5. QA Agent 在主线程修复完成后只读验收，不修改代码或 Spec；若失败，只返回可
    复现的命令、错误和对应验收项，由主线程修复后重新交给同一个 QA 流程复验。
 
 审查 Agent 不设置人为超时；在其返回最终反馈前保持等待。超时、关闭或没有
@@ -580,7 +590,8 @@ route_key 查询是路由定位，不是最终授权。最终授权由以下组�
 2. URL channel 与 Binding.Channel 一致；
 3. IM-02/IM-03 的 Provider 签名/解密成功；
 4. IM-02/IM-03 从已验证内容提取的 external_account 与 Binding.ExternalAccount
-   一致；
+   一致；对于 Feishu，还必须同时校验事件头 `tenant_key` 与
+   Binding.ExternalAccountScope 一致；
 5. Gateway 使用 verified_channel_binding；
 6. PostgreSQL 事务重新读取并锁定正确 scope 的 Binding、Tenant、App。
 
@@ -603,6 +614,7 @@ IM-02 和 IM-03。
 
 目标字段：
 
+    platform.channel_binding.external_account_scope TEXT NOT NULL DEFAULT ''
     platform.channel_binding.public_route_id TEXT NOT NULL
     platform.channel_binding.binding_revision BIGINT NOT NULL
 
@@ -612,9 +624,11 @@ IM-02 和 IM-03。
     CHECK (public_route_id <> '')
 
 `binding_revision` 从 1 开始单调递增。任何会影响入站授权或出站目标的 Binding
-变更都必须递增它，至少包括 Channel、ExternalAccount、TokenRef、
-SigningSecretRef、Secret、Status 和 public_route_id；Tenant/App/Binding 主体
-标识不可变。
+变更都必须递增它，至少包括 Channel、ExternalAccount、ExternalAccountScope、
+TokenRef、SigningSecretRef、Secret、Status 和 public_route_id；Tenant/App/Binding
+主体标识不可变。Feishu 使用 ExternalAccount 保存 `app_id`，使用
+ExternalAccountScope 保存 `tenant_key`；其他 Provider 可将该字段留空或按自身
+账号范围语义使用，不能把外部字段直接当作内部 tenant_id。
 
 迁移分两步，避免在回填期间阻塞存量数据：
 
@@ -673,10 +687,10 @@ Binding 生命周期：
 Provider verification/extraction；测试 fake 不得进入可部署 wiring。
 
 `BindingSnapshot` 至少包含 tenant_id、app_id、binding_id、channel、
-public_route_id、binding_revision、ExternalAccount、TokenRef、SigningSecretRef
-和其他用于 Provider verification 的 SecretRef；只携带 SecretRef，不携带 secret
-明文。Adapter 使用该快照完成 Provider 验证，Admission transaction 以
-binding_revision 和授权属性的原子更新规则判断快照是否过期。
+public_route_id、binding_revision、ExternalAccount、ExternalAccountScope、
+TokenRef、SigningSecretRef 和其他用于 Provider verification 的 SecretRef；只携带
+SecretRef，不携带 secret 明文。Adapter 使用该快照完成 Provider 验证，Admission
+transaction 以 binding_revision 和授权属性的原子更新规则判断快照是否过期。
 
 现有 Gateway.AdmissionIdentity 的 SourceID 建议使用稳定的内部 binding_id，
 而不是 route_key。这样 route 轮换不会改变同一 Binding 的 Execution 幂等范围。
@@ -1397,8 +1411,9 @@ IM-03 入站：
    message type、text、image/file key 和 provider timestamp；
 6. 转成与 WeCom 相同的 `VerifiedProviderEnvelope`，并原样携带 IM-01 提供的
    public_route_id/binding_revision 快照；Adapter 不得从 payload 覆盖它们；
-7. 提取并校验 image/file 的 provider media reference；对 interactive/card/action
-   只保留平台级 action metadata，不在本任务写 Artifact；
+7. 提取并校验 image/file 的 provider media reference；当前共享 Channel Input
+   没有 interactive/card/action 事件契约，因此这类已验证事件只分类为
+   `UNSUPPORTED_MESSAGE_TYPE`，不把卡片内容丢成空消息，也不在本任务写 Artifact；
 8. 通过共享 ingress orchestrator 完成 IM-07 预入站媒体处理和 ChannelInput
    构造，再调用 Gateway；不调用 Runner；
 9. commit 后按事件订阅协议返回 ACK；
@@ -1408,16 +1423,18 @@ IM-03 入站：
 ### 10.2 支持范围和拒绝
 
 - url_verification：只做 webhook 配置验证，不创建 Execution；
-- `im.message.receive_v1` 的 text、image、file、post、interactive/card 和
-  thread/reply：验证成功且有稳定 message_id 时进入标准化流程；媒体必须完成
-  IM-07 完成 Open API 下载和 Artifact ingest 后才能进入 Runner；
+- `im.message.receive_v1` 的 text、image、file、post 和 thread/reply：验证成功且有
+  稳定 message_id 时进入标准化流程；媒体必须完成 IM-07 的 Open API 下载和
+  Artifact ingest 后才能进入 Runner；
 - direct/group/topic：按 Identity/Conversation 规则映射；缺少 thread/topic
   时按 conversation 维度处理；
 - open_id/chat_id/message_id：只用于 Adapter 映射和 Reply target，不进入
   Gateway/Worker/Session 的 provider DTO；
-- interactive/card action：保留受控动作信息并按平台级事件进入 Session；原始
-  card JSON 不穿过 Gateway；
-- Provider 明确不支持或当前平台 Reply 无法表达的类型，验证成功且有稳定消息
+- interactive/card/action：当前不属于共享 Channel Input 的入站事件契约；Adapter
+  必须验证其内容是合法对象后，将消息标记为 `UNSUPPORTED_MESSAGE_TYPE`，由
+  IM-05 在 Inbox 中持久化拒绝，不创建 Execution/Dispatch；不得转成空文本或空
+  `MessageTypeCard`。IM-06 的出站卡片仍然是本需求必须实现的能力；
+- Provider 明确不支持、当前入站 Channel Input 无法表达，或当前平台 Reply 无法表达的类型，验证成功且有稳定消息
   ID 时写入 `channel_inbox(REJECTED, UNSUPPORTED_MESSAGE_TYPE)` 和脱敏审计，
   不创建 Execution/Dispatch，commit 后返回协议成功 ACK；不能因此拒绝本需求
   已明确要求的文本、图片、文件、卡片和异步回复；
@@ -1434,11 +1451,12 @@ typed API 和事件 dispatcher，不以社区 SDK 作为安全边界。
 
 - url_verification challenge 成功/失败；
 - token、签名、加密配置错误；
-- `im.message.receive_v1` direct/group text、image、file、post、interactive；
+- `im.message.receive_v1` direct/group text、image、file、post；interactive/card
+  合法对象应被明确分类为 `UNSUPPORTED_MESSAGE_TYPE`，不生成空消息；
 - open_id、chat_id、message_id 缺失；
 - thread/topic 有/无；
-- provider media reference 提取、卡片动作和回复更新边界；媒体下载和 Artifact
-  ingest 在 IM-07 验收；
+- provider media reference 提取、入站 unsupported 分类和出站卡片 codec 边界；媒体
+  下载和 Artifact ingest 在 IM-07 验收；
 - body 上限、非法 JSON、重复和乱序事件；
 - Open API request codec/client 的成功和错误样本；
 - 不在 IM-03 验证 Reply Sender retry、lease 或 Runner invocation 不增加；
@@ -1909,7 +1927,9 @@ envelope；不得自行引入 KMS、Vault 或通用 Secret 系统。
 
 **Schema changes**
 
-- 无新增专属 Schema；依赖公共 Inbox/identity/conversation。
+- 为 `channel_binding.external_account_scope` 提供共享字段和迁移；Feishu 将其
+  作为 `tenant_key` 的预期外部账号范围，`ExternalAccount` 仍保存 `app_id`。
+  其余不新增 Feishu 专属表，依赖公共 Inbox/identity/conversation。
 
 **APIs introduced/extended**
 
@@ -1920,11 +1940,12 @@ envelope；不得自行引入 KMS、Vault 或通用 Secret 系统。
 
 **Tests**
 
-- challenge、token/signature/encryption；
-- `im.message.receive_v1` 的 open_id/chat_id/message_id；
-- direct/group/thread 的 text/image/file/post/interactive；
-- provider media reference 提取、卡片动作和消息更新；媒体下载和 Artifact ingest
-  在 IM-07 验收；
+- challenge、token/signature/encryption、请求时间窗口；
+- `im.message.receive_v1` 的 app_id、tenant_key、open_id/chat_id/message_id；
+- direct/group/thread 的 text/image/file/post；
+- interactive/card 合法对象被分类为 `UNSUPPORTED_MESSAGE_TYPE`，不会生成空消息；
+- provider media reference 提取和消息更新边界；媒体下载和 Artifact ingest 在
+  IM-07 验收；
 - malformed/oversized/duplicate event；
 - Open API request encoding、target binding 和 fake client contract；
 - 不在本任务验证 Reply retry/lease 或完整 error classification。
@@ -1932,7 +1953,9 @@ envelope；不得自行引入 KMS、Vault 或通用 Secret 系统。
 **Done criteria**
 
 - challenge 不创建 Execution；
-- 合法事件和媒体 reference 事件走同一 Gateway/Inbox 入口；
+- 合法文本/post 事件和媒体 reference 事件走同一 Gateway/Inbox 入口；
+- `app_id + tenant_key` 必须同时匹配 Binding；interactive/card 事件只进入
+  `UNSUPPORTED_MESSAGE_TYPE` 的持久化拒绝路径，不伪造可执行消息；
 - Provider JSON 不进入 Gateway/Worker/Session；
 - provider media reference 能交给 IM-07 完成租户作用域 Artifact ingest；
 - 只提供 IM-06 使用的 outbound codec/client contract；
@@ -2166,7 +2189,7 @@ Feishu 协议解析已经完成。
 | platform.tenant | Admission 锁定并验证 ACTIVE |
 | platform.agent_app | Admission 锁定并验证 ACTIVE、读取 active_config_version |
 | platform.app_config_version | 校验 published config 和 binding scope |
-| platform.channel_binding | 绑定资源；增加 public_route_id |
+| platform.channel_binding | 绑定资源；增加 external_account_scope、public_route_id |
 | platform.session_lane | 按 session principal 分配 turn_seq |
 | platform.execution | IM request 的唯一执行记录 |
 | platform.dispatch_outbox | Execution 到 Worker 的分发 |
@@ -2180,6 +2203,8 @@ Dispatch Outbox 不改成 Reply Outbox。两者只能共享 claim/lease 的实�
 
 #### channel_binding extension
 
+- external_account_scope：NOT NULL、默认空字符串；Feishu 用于保存与
+  `ExternalAccount`（app_id）配对校验的 `tenant_key`；不表示内部 tenant_id；
 - public_route_id：NOT NULL、全局 UNIQUE、非空；
 - binding_revision：NOT NULL，从 1 开始；所有授权相关变更单调递增；
 - 不改变现有主键 tenant_id/app_id/binding_id；
@@ -2311,14 +2336,17 @@ Session 或 Execution。重复撤回只返回原 request_id，不重复发送取
    递增 `binding_revision` 的触发器；
 3. 建立 Identity/Conversation/Membership 表；
 4. 建立 channel_inbox；
-5. 建立 channel_recall_inbox；
-6. 建立 reply_projection_state；
-7. 建立 reply_outbox；
-8. 最后启用 IM Admission/Reply 代码。
+5. `000014_channel_binding_account_scope.sql` 为存量 Binding 增加
+   `external_account_scope` 默认空值，并将其纳入授权 revision 触发器；Feishu
+   Binding 在启用前必须填充该字段；
+6. 建立 channel_recall_inbox；
+7. 建立 reply_projection_state；
+8. 建立 reply_outbox；
+9. 最后启用 IM Admission/Reply 代码。
 
 迁移执行器按版本顺序为每个 migration 建立独立事务；发布时必须先完成
-`000010`/`000011`，再启动读取新列的新二进制，不允许新二进制连接到未执行
-`000010` 的旧 Schema。
+`000010` 至 `000014` 以及其间的 Identity/Conversation/Inbox migration，再启动
+读取新列的新二进制；不允许新二进制连接到未执行所需 migration 的旧 Schema。
 
 ## 15. API Changes
 
@@ -2337,7 +2365,7 @@ Session 或 Execution。重复撤回只返回原 request_id，不重复发送取
 | Contract | 设计 |
 | --- | --- |
 | Public route resolver | 独立窄接口 ResolveBindingByPublicRoute(ctx, channel, routeKey)，返回包含 public_route_id、binding_revision 和授权属性快照的 BindingSnapshot；Gateway 的 ResolveChannelBindingRoute 将其封装成带包内 provenance marker 的 LocatedChannelBinding；不修改现有 BindingResolver，避免破坏外部实现 |
-| Binding | 增加 PublicRouteID、BindingRevision；Binding.Validate 检查非空/正数，唯一性和单调递增由 DB/更新事务保证 |
+| Binding | 增加 ExternalAccountScope、PublicRouteID、BindingRevision；Binding.Validate 对 Feishu 检查外部账号范围，PublicRouteID 检查非空/格式；唯一性和 revision 单调递增由 DB/更新事务保证 |
 | Channel binding identity | Provider 验证完成后，只有由 ResolveChannelBindingRoute 返回的、带包内 provenance marker 的 LocatedChannelBinding 才能传入 NewChannelBindingIdentityResolver；它生成 Source=verified_channel_binding、SourceID=内部 binding_id 的 AdmissionIdentity；AdmissionIdentity 对外保留字段兼容性，但 direct channel-binding literal 无 provenance 时必须拒绝；PublicRouteID 和 BindingRevision 只用于 transaction stale snapshot 检查 |
 | Binding provisioning | 管理面创建 Binding 时不接受调用方提供的 public_route_id/binding_revision，由 admin API 生成 route 并使用 revision=1；Store 对低层缺省调用生成 route，对显式 route 要求通过与 NewPublicRouteID 一致的生成格式校验 |
 | Channel Input | 放在 channels/channel domain；只含平台级字段和受控引用，不含 XML/JSON DTO |
@@ -2535,13 +2563,26 @@ Scenario: Feishu url_verification returns challenge
   Then it returns the challenge response required by the provider
   And no Inbox or Execution is created
 
-Scenario: Feishu text event uses open_id chat_id and message_id only inside adapter mapping
-  Given a verified Feishu text event
+Scenario: Feishu text event requires both external account fields
+  Given a verified Feishu text event whose header app_id and tenant_key match Binding
   When the Adapter normalizes it
   Then it maps open_id to an internal Identity
   And it maps chat_id to an internal Conversation when present
   And message_id becomes external_message_id
   And raw Feishu JSON does not enter Gateway, Worker or Session
+
+Scenario: Feishu tenant_key mismatch is rejected
+  Given a verified Feishu event whose header tenant_key differs from Binding.ExternalAccountScope
+  When the Adapter handles it
+  Then Gateway is not called
+  And no Inbox row is created
+
+Scenario: Feishu interactive input is durably rejected under the current input contract
+  Given a verified Feishu interactive message with a valid object content and stable message_id
+  When the Adapter normalizes it
+  Then it marks the input as UNSUPPORTED_MESSAGE_TYPE
+  And it does not create an empty text or empty card message
+  And IM-05 may commit a REJECTED Inbox without Execution or Dispatch Outbox
 
 Scenario: Feishu adapter hands media reference to IM-07
   Given a verified Feishu message event contains an image or file resource key
@@ -2968,7 +3009,8 @@ goimports -l .
 
 1. tenant_id/app_id 永远由 verified Binding 得到，不信任外部 payload。
 2. route_key 不包含可推断租户信息；路由命中不等于授权。
-3. URL channel、Binding.Channel、external_account 必须一致。
+3. URL channel、Binding.Channel、external_account 必须一致；Feishu 还必须同时
+   校验 `tenant_key` 与 Binding.ExternalAccountScope。
 4. secret 只能通过 Binding 的 TokenRef/SigningSecretRef/SecretRef 解析；原值
    不进日志、trace、错误报告或测试输出。
 5. Admission transaction 必须按 tenant/app/binding scope 查询和锁定，并比较
@@ -2976,7 +3018,8 @@ goimports -l .
 6. Identity/Conversation 的外部 ID 使用 binding-scoped HMAC hash；回复所需
    target 只能使用 6.2.1 的 AES-256-GCM envelope 和内部 target_ref。
 7. Inbox 和 Execution 的幂等键包含 tenant/app/binding；不能使用单独外部 ID。
-8. raw provider XML/JSON、签名、加密 envelope 不进入 Gateway、Worker、Runner
+8. raw provider XML/JSON、签名、加密 envelope、无法由共享契约表达的 interactive
+   card action 不进入 Gateway、Worker、Runner
    或 Session。
 9. 回复 target 必须属于原 Binding；禁止仅凭用户输入的 target 发送。
 10. 不记录完整 PII、模型 API key、IM token、数据库凭据或完整 Tool 参数。

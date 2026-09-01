@@ -153,7 +153,7 @@ func TestGatewayRejectsInvalidAdmissionRequestBeforeBackend(t *testing.T) {
 	}
 }
 
-func TestGatewayRejectsUnsupportedMessageBeforeBackend(t *testing.T) {
+func TestGatewayAcceptsValidatedArtifactReference(t *testing.T) {
 	admitter := &captureAdmitter{
 		result: gateway.AdmissionResult{
 			RequestID:     "request-1",
@@ -176,11 +176,11 @@ func TestGatewayRejectsUnsupportedMessageBeforeBackend(t *testing.T) {
 			ArtifactRefs: []string{"artifact://file@1"},
 		},
 	}
-	if _, err := gateway.New(gateway.WithAdmitter(admitter)).Handle(context.Background(), request); err == nil {
-		t.Fatal("handle request succeeded with unsupported artifact refs")
+	if _, err := gateway.New(gateway.WithAdmitter(admitter)).Handle(context.Background(), request); err != nil {
+		t.Fatalf("handle request: %v", err)
 	}
-	if admitter.request.RequestID != "" {
-		t.Fatal("unsupported message reached admitter")
+	if admitter.request.RequestID == "" || len(admitter.request.Message.ArtifactRefs) != 1 {
+		t.Fatalf("admission request = %#v", admitter.request)
 	}
 }
 

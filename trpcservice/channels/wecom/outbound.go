@@ -60,10 +60,17 @@ func (e *ProviderSendError) Unwrap() error {
 	return e.cause
 }
 
+// IsRetryable reports whether the provider or transport indicated a temporary
+// failure. ReplySender owns the actual retry decision and attempt limit.
+func (e *ProviderSendError) IsRetryable() bool {
+	return e != nil && e.Retryable
+}
+
 // OutboundClient performs exactly one WeCom AI Bot active response_url call.
 // It does not claim, persist, retry, or otherwise manage Reply Outbox state.
 type OutboundClient struct {
-	httpClient *http.Client
+	httpClient      *http.Client
+	targetValidator func(string) error
 }
 
 // NewOutboundClient creates a one-call WeCom provider client. A nil HTTP
@@ -72,7 +79,31 @@ func NewOutboundClient(httpClient *http.Client) *OutboundClient {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	return &OutboundClient{httpClient: httpClient}
+	client := *httpClient
+	// A response_url is an external capability, not a redirect permission.
+	// Refuse redirects even when a caller supplied a client with a permissive
+	// redirect policy.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &OutboundClient{
+		httpClient:      &client,
+		targetValidator: validateResponseURL,
+	}
+}
+
+// Capability reports the WeCom AI Bot features exposed to IM-06.
+func (*OutboundClient) Capability() channels.ProviderCapability {
+	return channels.ProviderCapability{
+		SupportsUpdate:                true,
+		SupportsCard:                  true,
+		SupportsArtifact:              false,
+		SupportsStreaming:             true,
+		RequiresInitialStreamResponse: true,
+		SupportsFinalize:              true,
+		MaxTextSize:                   maxWeComReplyBytes,
+		TargetTTL:                     wecomMessageTargetTTL,
+	}
 }
 
 // SendOnce encodes and sends one platform Reply to a resolved WeCom target.
@@ -94,10 +125,11 @@ func (c *OutboundClient) SendOnce(
 	if reply.Channel != channels.ChannelWeCom {
 		return channels.ProviderReceipt{}, errors.New("wecom outbound client received another channel")
 	}
-	if reply.Operation != channels.ReplyOperationSend || outboundContext.StreamContext != "" {
-		return channels.ProviderReceipt{}, errWeComPassiveReplyRequired
+	validator := c.targetValidator
+	if validator == nil {
+		validator = validateResponseURL
 	}
-	if err := validateProviderURL(providerTarget); err != nil {
+	if err := validator(providerTarget); err != nil {
 		return channels.ProviderReceipt{}, &ProviderSendError{cause: err}
 	}
 	payload, err := encodeReply(reply, outboundContext)

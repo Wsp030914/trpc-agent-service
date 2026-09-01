@@ -11,6 +11,9 @@ import (
 
 	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
 	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/feishu"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
 	knowledgecos "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/cos"
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
@@ -43,6 +46,7 @@ type workerRuntime struct {
 	knowledgeSources *knowledgecos.Resolver
 	knowledge        *knowledgeqdrant.Resolver
 	artifactServices artifactCleanupExecutor
+	replySender      *worker.ReplySender
 	store            *postgres.Store
 	owner            string
 }
@@ -144,11 +148,24 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	if err != nil {
 		return nil, joinCloseError(err, runners.Close, knowledge.Close, knowledgeSources.Close, artifacts.Close, memories.Close, sessionRouter.Close)
 	}
-	events, err := postgres.NewExecutionEventJournal(deps.store)
+	replyBuilder, err := worker.NewReplyEventBuilder(runtimeReplyCapabilityResolver{})
+	if err != nil {
+		return nil, joinCloseError(err, runners.Close, knowledge.Close, knowledgeSources.Close, artifacts.Close, memories.Close, sessionRouter.Close)
+	}
+	events, err := postgres.NewExecutionEventJournal(deps.store, postgres.WithReplyEventBuilder(replyBuilder))
 	if err != nil {
 		return nil, joinCloseError(err, runners.Close, knowledge.Close, knowledgeSources.Close, artifacts.Close, memories.Close, sessionRouter.Close)
 	}
 	audit, err := postgres.NewAuditStore(deps.store)
+	if err != nil {
+		return nil, joinCloseError(err, runners.Close, knowledge.Close, knowledgeSources.Close, artifacts.Close, memories.Close, sessionRouter.Close)
+	}
+	replySender, err := worker.NewReplySender(
+		deps.store,
+		deps.store,
+		runtimeReplyProviderResolver{store: deps.store, secrets: secrets},
+		worker.ReplySenderOptions{Owner: deps.owner},
+	)
 	if err != nil {
 		return nil, joinCloseError(err, runners.Close, knowledge.Close, knowledgeSources.Close, artifacts.Close, memories.Close, sessionRouter.Close)
 	}
@@ -174,9 +191,68 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		knowledgeSources: knowledgeSources,
 		knowledge:        knowledge,
 		artifactServices: artifactServices,
+		replySender:      replySender,
 		store:            deps.store,
 		owner:            deps.owner,
 	}, nil
+}
+
+type runtimeReplyCapabilityResolver struct{}
+
+func (runtimeReplyCapabilityResolver) ResolveReplyCapability(
+	_ context.Context,
+	exec worker.Execution,
+) (channels.ProviderCapability, error) {
+	switch channels.Channel(exec.Tenant.Channel) {
+	case channels.ChannelWeCom:
+		return (&wecom.OutboundClient{}).Capability(), nil
+	case channels.ChannelFeishu:
+		return (&feishu.OutboundClient{}).Capability(), nil
+	default:
+		return channels.ProviderCapability{}, fmt.Errorf("unsupported reply channel %q", exec.Tenant.Channel)
+	}
+}
+
+type runtimeReplyProviderResolver struct {
+	store   *postgres.Store
+	secrets secret.SecretProvider
+}
+
+func (r runtimeReplyProviderResolver) ResolveReplyProvider(
+	ctx context.Context,
+	delivery worker.ReplyDelivery,
+) (worker.ReplyProvider, error) {
+	if r.store == nil || r.secrets == nil {
+		return worker.ReplyProvider{}, errors.New("reply provider resolver is not initialized")
+	}
+	binding, err := r.store.ResolveBinding(
+		ctx,
+		delivery.Reply.TenantID,
+		delivery.Reply.AppID,
+		delivery.Reply.BindingID,
+	)
+	if err != nil {
+		return worker.ReplyProvider{}, err
+	}
+	if binding.Status != channels.BindingActive {
+		return worker.ReplyProvider{}, worker.ErrReplyBindingInactive
+	}
+	if binding.Channel != delivery.Reply.Channel || binding.BindingRevision != delivery.Reply.BindingRevision {
+		return worker.ReplyProvider{}, worker.ErrReplyBindingChanged
+	}
+	switch binding.Channel {
+	case channels.ChannelWeCom:
+		client := wecom.NewOutboundClient(nil)
+		return worker.ReplyProvider{Capability: client.Capability(), Client: client}, nil
+	case channels.ChannelFeishu:
+		client, err := feishu.NewOutboundClient(ctx, r.secrets, binding.Snapshot())
+		if err != nil {
+			return worker.ReplyProvider{}, err
+		}
+		return worker.ReplyProvider{Capability: client.Capability(), Client: client}, nil
+	default:
+		return worker.ReplyProvider{}, fmt.Errorf("unsupported reply channel %q", binding.Channel)
+	}
 }
 
 type noToolsResolver struct{}

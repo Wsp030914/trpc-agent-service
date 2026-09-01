@@ -21,19 +21,44 @@ const executionEventPollInterval = 200 * time.Millisecond
 // ExecutionEventJournal persists runner events and exposes them as a durable,
 // tenant-scoped stream for protocol adapters.
 type ExecutionEventJournal struct {
-	store *Store
+	store        *Store
+	replyBuilder worker.ReplyEventBuilderSource
+}
+
+// ExecutionEventJournalOption configures optional durable event projections.
+type ExecutionEventJournalOption func(*ExecutionEventJournal) error
+
+// WithReplyEventBuilder enables the IM Reply Projection inside the same
+// PostgreSQL transaction as execution_event insertion.
+func WithReplyEventBuilder(builder worker.ReplyEventBuilderSource) ExecutionEventJournalOption {
+	return func(journal *ExecutionEventJournal) error {
+		if builder == nil {
+			return errors.New("reply event builder is required")
+		}
+		journal.replyBuilder = builder
+		return nil
+	}
 }
 
 // NewExecutionEventJournal creates a journal backed by Store's PostgreSQL
 // database. The store remains owned by the caller.
-func NewExecutionEventJournal(store *Store) (*ExecutionEventJournal, error) {
+func NewExecutionEventJournal(store *Store, options ...ExecutionEventJournalOption) (*ExecutionEventJournal, error) {
 	if store == nil {
 		return nil, errors.New("postgres store is required")
 	}
 	if err := store.validate(); err != nil {
 		return nil, err
 	}
-	return &ExecutionEventJournal{store: store}, nil
+	journal := &ExecutionEventJournal{store: store}
+	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("execution event journal option is required")
+		}
+		if err := option(journal); err != nil {
+			return nil, fmt.Errorf("configure execution event journal: %w", err)
+		}
+	}
+	return journal, nil
 }
 
 // HandleRunnerEvent appends one real Runner event. It serializes concurrent
@@ -131,6 +156,24 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
 		payload,
 	); err != nil {
 		return fmt.Errorf("insert execution event: %w", err)
+	}
+	if j.replyBuilder != nil {
+		replies, err := j.replyBuilder.Build(ctx, exec, sequence, evt)
+		if err != nil {
+			return fmt.Errorf("build reply projection: %w", err)
+		}
+		if err := applyReplyProjectionTx(
+			ctx,
+			tx,
+			exec.Tenant.TenantID,
+			exec.Tenant.AppID,
+			exec.Tenant.BindingID,
+			exec.RequestID,
+			sequence,
+			replies,
+		); err != nil {
+			return fmt.Errorf("apply reply projection: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit execution event append: %w", err)

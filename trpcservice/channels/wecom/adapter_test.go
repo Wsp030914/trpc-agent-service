@@ -128,7 +128,7 @@ func TestAdapterSubmitsDirectMessageWithBindingScope(t *testing.T) {
 
 func TestAdapterSubmitsGroupMessageWithGroupMapping(t *testing.T) {
 	adapter, _, admitter, _ := newTestAdapter(t)
-	body := []byte(`{"msgid":"msg-group","aibotid":"aibot-test","chatid":"chat-1","chattype":"group","from":{"userid":"user-2"},"response_url":"https://example.test/reply","msgtype":"text","text":{"content":"group hello"}}`)
+	body := []byte(`{"msgid":"msg-group","aibotid":"aibot-test","chatid":"chat-1","chattype":"group","from":{"userid":"user-2"},"response_url":"https://qyapi.weixin.qq.com/cgi-bin/bot/get?msgid=msg-group","msgtype":"text","text":{"content":"group hello"}}`)
 	request := callbackRequest(t, body)
 	response := httptest.NewRecorder()
 	adapter.ServeHTTP(response, request)
@@ -416,13 +416,12 @@ func TestNormalizeCallbackSupportsDirectMediaAndGroupMixed(t *testing.T) {
 			wantType: channels.MessageTypeFile, wantMediaCount: 1,
 		},
 		{
-			name: "direct voice",
+			name: "direct voice is unsupported",
 			callback: callbackMessage{
 				MessageID: "voice-1", AIBotID: testExternalBot, ChatType: "single",
 				From: callbackFrom{UserID: "user-1"}, MessageType: "voice",
-				Voice: callbackText{Content: "transcribed voice"},
 			},
-			wantType: channels.MessageTypeText, wantText: "transcribed voice",
+			wantType: channels.MessageTypeUnsupported,
 		},
 		{
 			name: "group mixed",
@@ -461,7 +460,9 @@ func TestOutboundClientUsesOneActiveResponseCall(t *testing.T) {
 	}))
 	defer server.Close()
 	reply := testReply(channels.ReplyOperationSend, channels.ReplyKindText)
-	receipt, err := NewOutboundClient(server.Client()).SendOnce(context.Background(), reply, server.URL, channels.OutboundContext{})
+	client := NewOutboundClient(server.Client())
+	client.targetValidator = func(string) error { return nil }
+	receipt, err := client.SendOnce(context.Background(), reply, server.URL, channels.OutboundContext{})
 	if err != nil {
 		t.Fatalf("send reply: %v", err)
 	}
@@ -482,14 +483,15 @@ func TestOutboundClientUsesOneActiveResponseCall(t *testing.T) {
 	}
 }
 
-func TestOutboundClientDoesNotSendPassiveStreamUpdates(t *testing.T) {
+func TestOutboundClientSendsActiveStreamUpdates(t *testing.T) {
 	var calls int
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"errcode":0}`))
 	}))
 	defer server.Close()
 	client := NewOutboundClient(server.Client())
+	client.targetValidator = func(string) error { return nil }
 	for _, operation := range []channels.ReplyOperation{
 		channels.ReplyOperationUpdate,
 		channels.ReplyOperationFinalize,
@@ -500,12 +502,12 @@ func TestOutboundClientDoesNotSendPassiveStreamUpdates(t *testing.T) {
 			server.URL,
 			channels.OutboundContext{StreamContext: "stream-1"},
 		)
-		if !errors.Is(err, errWeComPassiveReplyRequired) {
-			t.Fatalf("operation %s error=%v, want passive response error", operation, err)
+		if err != nil {
+			t.Fatalf("operation %s error=%v", operation, err)
 		}
 	}
-	if calls != 0 {
-		t.Fatalf("active response_url calls=%d, want 0", calls)
+	if calls != 2 {
+		t.Fatalf("active response_url calls=%d, want 2", calls)
 	}
 }
 
@@ -895,18 +897,19 @@ func eventPayload(t *testing.T) []byte {
 
 func testReply(operation channels.ReplyOperation, kind channels.ReplyKind) channels.Reply {
 	return channels.Reply{
-		TenantID:       "tenant-a",
-		AppID:          "app-a",
-		RequestID:      "request-1",
-		SourceEventID:  "event-1",
-		Channel:        channels.ChannelWeCom,
-		BindingID:      testBindingID,
-		ReplyID:        "reply-1",
-		LogicalReplyID: "logical-1",
-		PartNo:         1,
-		Revision:       1,
-		Operation:      operation,
-		Kind:           kind,
+		TenantID:        "tenant-a",
+		AppID:           "app-a",
+		RequestID:       "request-1",
+		SourceEventID:   "event-1",
+		Channel:         channels.ChannelWeCom,
+		BindingID:       testBindingID,
+		BindingRevision: 3,
+		ReplyID:         "reply-1",
+		LogicalReplyID:  "logical-1",
+		PartNo:          1,
+		Revision:        1,
+		Operation:       operation,
+		Kind:            kind,
 		Target: channels.ReplyTarget{
 			Kind:             channels.TargetKindMessage,
 			InternalEntityID: "request-1",

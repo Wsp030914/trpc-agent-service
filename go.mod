@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.2
+	github.com/larksuite/oapi-sdk-go/v3 v3.11.0
 	github.com/qdrant/go-client v1.19.0
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/tencentyun/cos-go-sdk-v5 v0.7.69

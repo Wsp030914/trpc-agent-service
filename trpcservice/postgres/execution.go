@@ -46,7 +46,7 @@ func (s *Store) Claim(ctx context.Context, dispatch queue.Dispatch, request queu
 	if err != nil {
 		return queue.Claim{}, false, err
 	}
-	if !active || stored.status == "SUCCEEDED" || stored.status == "FAILED" {
+	if !active || stored.status == "SUCCEEDED" || stored.status == "FAILED" || stored.status == "CANCELED" {
 		if err := consumeDispatch(ctx, tx, dispatch); err != nil {
 			return queue.Claim{}, false, err
 		}
@@ -349,6 +349,7 @@ func (v storedExecution) executionJob() (execution.Job, error) {
 		ConfigVersion:      v.configVersion,
 		Channel:            c.Channel,
 		BindingID:          c.BindingID,
+		BindingRevision:    c.BindingRevision,
 		SessionPrincipalID: v.sessionPrincipalID,
 		SessionID:          v.sessionID,
 		UserID:             v.userID,

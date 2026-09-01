@@ -56,22 +56,27 @@ func (t ReplyTarget) Validate() error {
 // provider outbound call. Claiming, persistence, and retry are owned by
 // IM-06, not by this value or a ProviderOutboundClient.
 type Reply struct {
-	TenantID       string
-	AppID          string
-	RequestID      string
-	SourceEventID  string
-	Channel        Channel
-	BindingID      string
-	ReplyID        string
-	LogicalReplyID string
-	PartNo         int64
-	Revision       int64
-	Operation      ReplyOperation
-	Kind           ReplyKind
-	Target         ReplyTarget
-	Text           string
-	Card           json.RawMessage
-	ArtifactRef    string
+	TenantID        string
+	AppID           string
+	RequestID       string
+	SourceEventID   string
+	Channel         Channel
+	BindingID       string
+	BindingRevision int64
+	ReplyID         string
+	LogicalReplyID  string
+	PartNo          int64
+	Revision        int64
+	Operation       ReplyOperation
+	Kind            ReplyKind
+	Target          ReplyTarget
+	Text            string
+	// ContentDelta marks Text as an incremental Runner response. The durable
+	// projection combines it with the previous visible content before it is
+	// persisted for provider update/finalize operations.
+	ContentDelta bool
+	Card         json.RawMessage
+	ArtifactRef  string
 }
 
 // Validate checks the stable platform-level fields required by an outbound
@@ -89,7 +94,7 @@ func (r Reply) Validate() error {
 	if r.BindingID == "" {
 		return errors.New("reply binding_id is required")
 	}
-	if r.PartNo <= 0 || r.Revision <= 0 {
+	if r.PartNo <= 0 || r.Revision <= 0 || r.BindingRevision <= 0 {
 		return errors.New("reply part and revision must be positive")
 	}
 	switch r.Operation {

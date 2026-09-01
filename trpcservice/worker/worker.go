@@ -508,7 +508,16 @@ func runnerMessage(message gateway.Message) (model.Message, error) {
 	if err := message.Validate(); err != nil {
 		return model.Message{}, err
 	}
-	return model.NewUserMessage(message.Text), nil
+	result := model.NewUserMessage(message.Text)
+	for _, ref := range message.ArtifactRefs {
+		result.ContentParts = append(result.ContentParts, model.ContentPart{
+			Type: model.ContentTypeFile,
+			ContentRef: &model.ContentRef{
+				ArtifactRef: ref,
+			},
+		})
+	}
+	return result, nil
 }
 
 func runnerAppName(tc tenant.RuntimeContext) (string, error) {

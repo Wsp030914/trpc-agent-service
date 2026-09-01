@@ -144,6 +144,9 @@ func newChannelBindingIdentityResolver(
 		runtimeContext.BindingID != snapshot.BindingID {
 		return nil, ErrChannelBindingScopeMismatch
 	}
+	// The route snapshot is authoritative for the binding generation. Do not
+	// let a caller-supplied or stale runtime value become the execution scope.
+	runtimeContext.BindingRevision = snapshot.BindingRevision
 	if mappingPending {
 		if err := validatePendingRuntimeContext(runtimeContext); err != nil {
 			return nil, fmt.Errorf("pending channel binding context: %w", err)

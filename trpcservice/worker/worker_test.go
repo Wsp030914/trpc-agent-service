@@ -665,15 +665,18 @@ func TestExecutionJobRejectsMissingUserID(t *testing.T) {
 	}
 }
 
-func TestExecutionJobRejectsUnsupportedArtifactRefs(t *testing.T) {
-	_, err := execution.NewJob(
+func TestExecutionJobAcceptsArtifactRefs(t *testing.T) {
+	job, err := execution.NewJob(
 		"request-1",
 		gateway.TenantSourceAuthenticatedClaims,
 		testJob("request-1", "tenant-a", "session-1").Tenant(),
 		gateway.Message{Text: "hello", ArtifactRefs: []string{"artifact://file@1"}},
 	)
-	if err == nil {
-		t.Fatal("new execution job succeeded with unsupported artifact refs")
+	if err != nil {
+		t.Fatalf("new execution job: %v", err)
+	}
+	if len(job.Message().ArtifactRefs) != 1 {
+		t.Fatalf("job message = %#v", job.Message())
 	}
 }
 

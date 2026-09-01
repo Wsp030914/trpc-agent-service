@@ -713,14 +713,15 @@ func integrationAppConfig(version, modelName string) tenant.AppConfig {
 
 func integrationBinding() channels.Binding {
 	return channels.Binding{
-		TenantID:         "tenant-a",
-		AppID:            "support",
-		BindingID:        "wecom-support",
-		Channel:          channels.ChannelWeCom,
-		ExternalAccount:  "corp-agent-support",
-		WebhookURL:       "https://example.com/im/wecom/support",
-		TokenRef:         tenant.SecretRef{Name: "wecom-token", Version: "1"},
-		SigningSecretRef: tenant.SecretRef{Name: "wecom-signing", Version: "1"},
-		Status:           channels.BindingActive,
+		TenantID:             "tenant-a",
+		AppID:                "support",
+		BindingID:            "wecom-support",
+		Channel:              channels.ChannelWeCom,
+		ExternalAccount:      "corp-agent-support",
+		ExternalAccountScope: "corp-account-scope",
+		WebhookURL:           "https://example.com/im/wecom/support",
+		TokenRef:             tenant.SecretRef{Name: "wecom-token", Version: "1"},
+		SigningSecretRef:     tenant.SecretRef{Name: "wecom-signing", Version: "1"},
+		Status:               channels.BindingActive,
 	}
 }

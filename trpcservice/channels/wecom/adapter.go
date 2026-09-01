@@ -3,6 +3,7 @@ package wecom
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,6 +95,15 @@ func WithAttachmentIngestor(ingestor channels.AttachmentIngestor) AdapterOption 
 	}
 }
 
+// WithRecallAdmitter registers the durable recall boundary. Authenticated
+// recall events are rejected for retry when no admitter is configured.
+func WithRecallAdmitter(admitter channels.RecallAdmitter) AdapterOption {
+	return func(adapter *Adapter) error {
+		adapter.recallAdmitter = admitter
+		return nil
+	}
+}
+
 // Adapter verifies Enterprise WeChat AI Bot callbacks and submits normalized
 // channel inputs to the tenant-aware Gateway. It does not call Runner or own
 // reply outbox delivery.
@@ -102,6 +112,7 @@ type Adapter struct {
 	admissionGateway   *gateway.Gateway
 	secrets            platformsecret.SecretProvider
 	attachmentIngestor channels.AttachmentIngestor
+	recallAdmitter     channels.RecallAdmitter
 	maxCallbackBytes   int64
 	clockSkew          time.Duration
 	now                func() time.Time
@@ -275,7 +286,7 @@ func (e VerifiedProviderEnvelope) Validate() error {
 		return errCallbackMessage
 	}
 	if e.responseURL != "" {
-		if err := validateProviderURL(e.responseURL); err != nil {
+		if err := validateResponseURL(e.responseURL); err != nil {
 			return errWeComResponseTargetInvalid
 		}
 	}
@@ -363,6 +374,22 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 	var callback callbackMessage
 	if err := json.Unmarshal(decrypted, &callback); err != nil {
 		writeProtocolError(w, r, fmt.Errorf("%w: json", errCallbackMessage))
+		return
+	}
+	if recall, ok, err := normalizeRecallCallback(binding, callback, decrypted); ok {
+		if err != nil {
+			writeProtocolError(w, r, err)
+			return
+		}
+		if a.recallAdmitter == nil {
+			http.Error(w, "recall processing unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if _, err := a.recallAdmitter.AdmitRecall(r.Context(), recall); err != nil {
+			writeAdmissionError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	envelope, err := normalizeCallback(binding, callback)
@@ -608,7 +635,6 @@ type callbackMessage struct {
 	Text        callbackText    `json:"text"`
 	Image       callbackMedia   `json:"image"`
 	File        callbackMedia   `json:"file"`
-	Voice       callbackText    `json:"voice"`
 	Mixed       callbackMixed   `json:"mixed"`
 	Stream      callbackStream  `json:"stream"`
 	Event       json.RawMessage `json:"event"`
@@ -667,7 +693,7 @@ func normalizeCallback(binding channels.BindingSnapshot, callback callbackMessag
 	}
 	responseURL := strings.TrimSpace(callback.ResponseURL)
 	if responseURL != "" {
-		if err := validateProviderURL(responseURL); err != nil {
+		if err := validateResponseURL(responseURL); err != nil {
 			return VerifiedProviderEnvelope{}, errWeComResponseTargetInvalid
 		}
 	}
@@ -726,7 +752,7 @@ func normalizeMessage(
 	conversationKind channels.ConversationKind,
 ) (channels.MessageType, string, []channels.ProviderMediaRef, ProviderCallbackContext, error) {
 	var emptyContext ProviderCallbackContext
-	if callback.MessageType == "image" || callback.MessageType == "voice" || callback.MessageType == "file" {
+	if callback.MessageType == "image" || callback.MessageType == "file" {
 		if conversationKind != channels.ConversationDirect {
 			return "", "", nil, emptyContext, errWeComMessageConversation
 		}
@@ -737,11 +763,6 @@ func normalizeMessage(
 			return "", "", nil, emptyContext, errCallbackMessage
 		}
 		return channels.MessageTypeText, callback.Text.Content, nil, emptyContext, nil
-	case "voice":
-		if callback.Voice.Content == "" {
-			return "", "", nil, emptyContext, errCallbackMessage
-		}
-		return channels.MessageTypeText, callback.Voice.Content, nil, emptyContext, nil
 	case "image":
 		kind, text, media, err := singleMedia(channels.MessageTypeImage, callback.Image.URL)
 		return kind, text, media, emptyContext, err
@@ -774,7 +795,7 @@ func normalizeMessage(
 }
 
 func singleMedia(kind channels.MessageType, reference string) (channels.MessageType, string, []channels.ProviderMediaRef, error) {
-	if err := validateProviderURL(reference); err != nil {
+	if err := validateMediaURL(reference); err != nil {
 		return "", "", nil, errWeComUnsupportedMediaPayload
 	}
 	return kind, "", []channels.ProviderMediaRef{{Kind: kind, Reference: reference}}, nil
@@ -794,12 +815,12 @@ func normalizeMixed(items []callbackMixedItem) (channels.MessageType, string, []
 			}
 			texts = append(texts, item.Text.Content)
 		case "image":
-			if err := validateProviderURL(item.Image.URL); err != nil {
+			if err := validateMediaURL(item.Image.URL); err != nil {
 				return "", "", nil, errWeComUnsupportedMediaPayload
 			}
 			media = append(media, channels.ProviderMediaRef{Kind: channels.MessageTypeImage, Reference: item.Image.URL})
 		case "file":
-			if err := validateProviderURL(item.File.URL); err != nil {
+			if err := validateMediaURL(item.File.URL); err != nil {
 				return "", "", nil, errWeComUnsupportedMediaPayload
 			}
 			media = append(media, channels.ProviderMediaRef{Kind: channels.MessageTypeFile, Reference: item.File.URL})
@@ -834,12 +855,110 @@ func normalizeEvent(raw json.RawMessage) (string, []byte, error) {
 	return eventType, slices.Clone(raw), nil
 }
 
-func validateProviderURL(value string) error {
+func normalizeRecallCallback(
+	binding channels.BindingSnapshot,
+	callback callbackMessage,
+	decrypted []byte,
+) (channels.RecallRequest, bool, error) {
+	if callback.MessageType != "event" {
+		return channels.RecallRequest{}, false, nil
+	}
+	eventType, raw, err := normalizeEvent(callback.Event)
+	if err != nil {
+		return channels.RecallRequest{}, true, err
+	}
+	if !strings.Contains(strings.ToLower(eventType), "recall") {
+		return channels.RecallRequest{}, false, nil
+	}
+	if callback.AIBotID == "" || callback.AIBotID != binding.ExternalAccount {
+		return channels.RecallRequest{}, true, errWeComBindingAccountMismatch
+	}
+	messageID, err := recallMessageID(callback.MessageID, raw)
+	if err != nil {
+		return channels.RecallRequest{}, true, err
+	}
+	eventID := recallEventID(raw, messageID)
+	digest := sha256.Sum256(decrypted)
+	request := channels.RecallRequest{
+		TenantID:          binding.TenantID,
+		AppID:             binding.AppID,
+		BindingID:         binding.BindingID,
+		Channel:           channels.ChannelWeCom,
+		ExternalEventID:   eventID,
+		ExternalMessageID: messageID,
+		PayloadHash:       digest[:],
+	}
+	if err := request.Validate(); err != nil {
+		return channels.RecallRequest{}, true, err
+	}
+	return request, true, nil
+}
+
+func recallMessageID(callbackMessageID string, raw json.RawMessage) (string, error) {
+	var payload struct {
+		MessageID         string `json:"message_id"`
+		RecallMessageID   string `json:"recall_msgid"`
+		ProviderMessageID string `json:"msgid"`
+		Recall            *struct {
+			MessageID string `json:"message_id"`
+			MsgID     string `json:"msgid"`
+		} `json:"recall"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", errCallbackMessage
+	}
+	for _, candidate := range []string{
+		payload.RecallMessageID,
+		payload.MessageID,
+		payload.ProviderMessageID,
+		callbackMessageID,
+	} {
+		if normalized, err := channels.NormalizeExternalID(candidate); err == nil {
+			return normalized, nil
+		}
+	}
+	if payload.Recall != nil {
+		for _, candidate := range []string{payload.Recall.MessageID, payload.Recall.MsgID} {
+			if normalized, err := channels.NormalizeExternalID(candidate); err == nil {
+				return normalized, nil
+			}
+		}
+	}
+	return "", errWeComMessageIDRequired
+}
+
+func recallEventID(raw json.RawMessage, messageID string) string {
+	var payload struct {
+		EventID string `json:"event_id"`
+		ID      string `json:"eventid"`
+	}
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		for _, candidate := range []string{payload.EventID, payload.ID} {
+			if normalized, err := channels.NormalizeExternalID(candidate); err == nil {
+				return normalized
+			}
+		}
+	}
+	return "recall:" + messageID
+}
+
+func validateResponseURL(value string) error {
 	if value == "" || len(value) > maxProviderURLLength {
 		return errWeComResponseTargetInvalid
 	}
 	parsed, err := url.ParseRequestURI(value)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Port() != "" || !strings.EqualFold(parsed.Hostname(), "qyapi.weixin.qq.com") {
+		return errWeComResponseTargetInvalid
+	}
+	return nil
+}
+
+func validateMediaURL(value string) error {
+	if value == "" || len(value) > maxProviderURLLength {
+		return errWeComResponseTargetInvalid
+	}
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Port() != "" {
 		return errWeComResponseTargetInvalid
 	}
 	return nil

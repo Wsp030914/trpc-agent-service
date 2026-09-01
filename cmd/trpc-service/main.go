@@ -15,12 +15,15 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/feishu"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/ingress"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	platformredis "github.com/liuzengh/trpc-agent-service/trpcservice/redis"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/relay"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 )
 
 const (
@@ -185,7 +188,19 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	if err := pool.Ping(ctx); err != nil {
 		return fmt.Errorf("ping postgres: %w", err)
 	}
-	store, err := postgres.New(pool)
+	secrets := environmentSecretProvider{getenv: os.Getenv}
+	hasher, err := platformsecret.NewExternalIDHasher(secrets, "v1")
+	if err != nil {
+		return err
+	}
+	protector, err := platformsecret.NewAEADTargetProtector(secrets, "v1")
+	if err != nil {
+		return err
+	}
+	store, err := postgres.New(
+		pool,
+		postgres.WithChannelIdentityMapping(hasher, protector, []string{"v1"}),
+	)
 	if err != nil {
 		return err
 	}
@@ -286,10 +301,35 @@ func newGatewayHandler(store *postgres.Store) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ingress.NewOpenAIHandler(auth.HTTPAPIKeyResolver{
+	openAIHandler, err := ingress.NewOpenAIHandler(auth.HTTPAPIKeyResolver{
 		Credentials: store,
 		Directory:   store,
 	}, queued)
+	if err != nil {
+		return nil, err
+	}
+	secrets := environmentSecretProvider{getenv: os.Getenv}
+	wecomAdapter, err := wecom.NewAdapter(
+		store,
+		gateway.New(gateway.WithAdmitter(store)),
+		secrets,
+	)
+	if err != nil {
+		return nil, err
+	}
+	feishuAdapter, err := feishu.NewAdapter(
+		store,
+		gateway.New(gateway.WithAdmitter(store)),
+		secrets,
+	)
+	if err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/im/wecom/", wecomAdapter)
+	mux.Handle("/im/feishu/", feishuAdapter)
+	mux.Handle("/", openAIHandler)
+	return mux, nil
 }
 
 func newAdminHandler(store *postgres.Store, token string) (http.Handler, error) {
@@ -342,6 +382,12 @@ func runWorkerUntilShutdown(
 	go func() {
 		migrationDone <- runtime.runDataMigrations(runCtx)
 	}()
+	var replyDone <-chan error
+	if runtime.replySender != nil {
+		done := make(chan error, 1)
+		go func() { done <- runtime.replySender.Run(runCtx) }()
+		replyDone = done
+	}
 
 	select {
 	case err := <-relayDone:
@@ -355,18 +401,34 @@ func runWorkerUntilShutdown(
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancelShutdown()
 		migrationErr, stopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
-		return dataMigrationShutdownResult(err, migrationErr, stopped)
-	case err := <-migrationDone:
-		if err == nil || errors.Is(err, context.Canceled) {
-			return nil
-		}
+		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
+		return dataMigrationShutdownResult(errors.Join(err, replyShutdownError(replyErr, replyStopped)), migrationErr, stopped)
+	case err := <-replyDone:
 		state.ready.Store(false)
 		runtime.consumer.StopClaiming()
 		cancelRun()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancelShutdown()
 		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
-		return workerShutdownResult(err, workerErr, stopped)
+		migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
+		return dataMigrationShutdownResult(
+			workerShutdownResult(errors.Join(err), workerErr, stopped),
+			migrationErr,
+			migrationStopped,
+		)
+	case err := <-migrationDone:
+		state.ready.Store(false)
+		runtime.consumer.StopClaiming()
+		cancelRun()
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancelShutdown()
+		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
+		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
+		return dataMigrationShutdownResult(
+			workerShutdownResult(errors.Join(nonCancellationError(err), replyShutdownError(replyErr, replyStopped)), workerErr, stopped),
+			err,
+			true,
+		)
 	case <-health.done:
 		state.ready.Store(false)
 		runtime.consumer.StopClaiming()
@@ -375,7 +437,8 @@ func runWorkerUntilShutdown(
 		defer cancelShutdown()
 		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
 		migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
-		return dataMigrationShutdownResult(workerShutdownResult(health.wait(), workerErr, stopped), migrationErr, migrationStopped)
+		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
+		return dataMigrationShutdownResult(workerShutdownResult(errors.Join(health.wait(), replyShutdownError(replyErr, replyStopped)), workerErr, stopped), migrationErr, migrationStopped)
 	case <-ctx.Done():
 		state.ready.Store(false)
 		runtime.consumer.StopClaiming()
@@ -389,7 +452,8 @@ func runWorkerUntilShutdown(
 	}
 	workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
 	migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
-	return dataMigrationShutdownResult(workerShutdownResult(healthErr, workerErr, stopped), migrationErr, migrationStopped)
+	replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
+	return dataMigrationShutdownResult(workerShutdownResult(errors.Join(healthErr, replyShutdownError(replyErr, replyStopped)), workerErr, stopped), migrationErr, migrationStopped)
 }
 
 func awaitWorkerExit(ctx context.Context, done <-chan error, cancel context.CancelFunc) (error, bool) {
@@ -419,6 +483,38 @@ func awaitDataMigrationExit(ctx context.Context, done <-chan error) (error, bool
 			return ctx.Err(), false
 		}
 	}
+}
+
+func awaitReplyExit(ctx context.Context, done <-chan error, cancel context.CancelFunc) (error, bool) {
+	if done == nil {
+		return nil, true
+	}
+	select {
+	case err := <-done:
+		return err, true
+	case <-ctx.Done():
+		cancel()
+		select {
+		case err := <-done:
+			return err, true
+		default:
+			return ctx.Err(), false
+		}
+	}
+}
+
+func replyShutdownError(err error, stopped bool) error {
+	if !stopped || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func nonCancellationError(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 func workerShutdownResult(healthErr, workerErr error, stopped bool) error {

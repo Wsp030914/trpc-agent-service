@@ -374,7 +374,10 @@ type RuntimeContext struct {
 	ConfigVersion string `json:"config_version"`
 	Channel       string `json:"channel"`
 	BindingID     string `json:"binding_id"`
-	SessionID     string `json:"session_id"`
+	// BindingRevision identifies the authorization snapshot for a channel
+	// execution. It is zero for non-channel contexts.
+	BindingRevision int64  `json:"binding_revision,omitempty"`
+	SessionID       string `json:"session_id"`
 	// SessionPrincipalID identifies the owner of the conversation session. It
 	// equals UserID for a private conversation and identifies the group or
 	// thread for a shared conversation.
