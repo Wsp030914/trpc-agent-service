@@ -48,7 +48,7 @@ func (s *Store) Admit(
 	var payloadHash [sha256.Size]byte
 	var err error
 	if request.ChannelInput == nil {
-		command, payloadHash, err = marshalAdmissionCommand(request.Identity, request.Message)
+		command, payloadHash, err = marshalAdmissionCommand(request.Identity.Tenant, request.Message)
 		if err != nil {
 			return gateway.AdmissionResult{}, err
 		}
@@ -183,9 +183,6 @@ func (s *Store) Admit(
 			} else if replayed {
 				return result, nil
 			}
-			if err := insertChannelInboxRejectionAudit(ctx, tx, request, rejectReason); err != nil {
-				return gateway.AdmissionResult{}, err
-			}
 			if err := tx.Commit(ctx); err != nil {
 				return gateway.AdmissionResult{}, fmt.Errorf("commit rejected channel admission: %w", err)
 			}
@@ -230,7 +227,7 @@ func (s *Store) Admit(
 		admission.runtimeContext.SessionPrincipalID = mapped.SessionPrincipalID
 		admission.runtimeContext.SessionID = mapped.SessionID
 		admission.runtimeContext.UserID = mapped.Identity.UserID
-		admission.command, _, err = marshalAdmissionCommandForRuntimeContext(
+		admission.command, _, err = marshalAdmissionCommand(
 			admission.runtimeContext,
 			request.Message,
 		)
@@ -476,6 +473,18 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 	)
 	if err != nil {
 		return gateway.AdmissionResult{}, err
+	}
+	if a.request.ChannelInput != nil {
+		if err := attachStagedInboundArtifacts(
+			a.ctx,
+			a.tx,
+			*a.request.ChannelInput,
+			a.app.ActiveConfigVersion,
+			runtimeContext.SessionPrincipalID,
+			runtimeContext.SessionID,
+		); err != nil {
+			return gateway.AdmissionResult{}, err
+		}
 	}
 	if _, err := a.tx.Exec(
 		a.ctx,
@@ -865,13 +874,6 @@ type admissionCommand struct {
 }
 
 func marshalAdmissionCommand(
-	identity gateway.AdmissionIdentity,
-	message gateway.Message,
-) ([]byte, [sha256.Size]byte, error) {
-	return marshalAdmissionCommandForRuntimeContext(identity.Tenant, message)
-}
-
-func marshalAdmissionCommandForRuntimeContext(
 	runtimeContext tenant.RuntimeContext,
 	message gateway.Message,
 ) ([]byte, [sha256.Size]byte, error) {

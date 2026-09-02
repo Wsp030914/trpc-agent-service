@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -108,7 +107,6 @@ func (s *Store) BeginDataMigration(
 	}
 	token := uuid.NewString()
 	var record migration.Record
-	var progress, validation []byte
 	err = tx.QueryRow(ctx, `
 UPDATE platform.data_migration
 SET status = 'DRAINING', lease_owner = $4, lease_until = clock_timestamp() + $5::interval,
@@ -117,7 +115,7 @@ WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3 AND status = 'PENDING
   AND source_config_version = $8
 RETURNING migration_id, tenant_id, app_id, source_config_version, target_config_version,
           status, lease_owner, lease_until, run_token, drain_deadline,
-          progress, validation_result, failure_reason`,
+          failure_reason`,
 		migrationID, tenantID, appID, owner, intervalLiteral(leaseDuration), token, drainDeadline.UTC(), app.ActiveConfigVersion,
 	).Scan(
 		&record.ID,
@@ -130,8 +128,6 @@ RETURNING migration_id, tenant_id, app_id, source_config_version, target_config_
 		&record.LeaseUntil,
 		&record.RunToken,
 		&record.DrainDeadline,
-		&progress,
-		&validation,
 		&record.FailureReason,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -139,9 +135,6 @@ RETURNING migration_id, tenant_id, app_id, source_config_version, target_config_
 	}
 	if err != nil {
 		return migration.Record{}, fmt.Errorf("begin data migration: %w", err)
-	}
-	if err := unmarshalDataMigrationReport(&record, progress, validation); err != nil {
-		return migration.Record{}, err
 	}
 	if err := record.Validate(); err != nil {
 		return migration.Record{}, fmt.Errorf("started data migration: %w", err)
@@ -168,7 +161,7 @@ func (s *Store) ListOwnedDataMigrations(
 	rows, err := s.pool.Query(ctx, `
 SELECT migration_id, tenant_id, app_id, source_config_version, target_config_version,
        status, lease_owner, lease_until, run_token, drain_deadline,
-       progress, validation_result, failure_reason
+       failure_reason
 FROM platform.data_migration
 WHERE lease_owner = $1
   AND status IN ('DRAINING', 'COPYING', 'VERIFYING')
@@ -226,8 +219,7 @@ WHERE migration.migration_id = candidate.migration_id
 RETURNING migration.migration_id, migration.tenant_id, migration.app_id,
           migration.source_config_version, migration.target_config_version,
           migration.status, migration.lease_owner, migration.lease_until,
-          migration.run_token, migration.drain_deadline, migration.progress,
-          migration.validation_result, migration.failure_reason`, owner, intervalLiteral(leaseDuration), token)
+          migration.run_token, migration.drain_deadline, migration.failure_reason`, owner, intervalLiteral(leaseDuration), token)
 	record, err = scanDataMigrationRecord(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return migration.Record{}, false, nil
@@ -312,9 +304,14 @@ WHERE tenant_id = $1 AND app_id = $2`, record.TenantID, record.AppID, record.Tar
 			return err
 		}
 	}
+	failureReason := ""
+	if next == migration.StatusFailed {
+		failureReason = platformlog.SafeError(errors.New(record.FailureReason))
+	}
 	tag, err := tx.Exec(ctx, `
 UPDATE platform.data_migration
 SET status = $6,
+    failure_reason = CASE WHEN $6 = 'FAILED' THEN $8 ELSE failure_reason END,
     lease_owner = CASE WHEN $6 IN ('SUCCEEDED', 'FAILED') THEN NULL ELSE lease_owner END,
     lease_until = CASE WHEN $6 IN ('SUCCEEDED', 'FAILED') THEN NULL ELSE lease_until END,
     run_token = CASE WHEN $6 IN ('SUCCEEDED', 'FAILED') THEN NULL ELSE run_token END,
@@ -322,7 +319,7 @@ SET status = $6,
 WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3
   AND status = $4 AND lease_owner = $5 AND run_token = $7
   AND lease_until > clock_timestamp()`,
-		record.ID, record.TenantID, record.AppID, record.Status, record.LeaseOwner, next, record.RunToken,
+		record.ID, record.TenantID, record.AppID, record.Status, record.LeaseOwner, next, record.RunToken, failureReason,
 	)
 	if err != nil {
 		return fmt.Errorf("advance data migration: %w", err)
@@ -376,75 +373,12 @@ ORDER BY session_principal_id, session_id`, record.TenantID, record.AppID)
 	return keys, nil
 }
 
-// UpdateDataMigrationReport persists the copy and verification checkpoint for
-// the current lease owner. A former owner cannot overwrite its successor.
-func (s *Store) UpdateDataMigrationReport(
-	ctx context.Context,
-	record migration.Record,
-	progress migration.Progress,
-	validation migration.Validation,
-	failureReason string,
-) error {
-	if err := s.validate(); err != nil {
-		return err
-	}
-	if err := record.Validate(); err != nil {
-		return err
-	}
-	if err := progress.Validate(); err != nil {
-		return err
-	}
-	if err := validation.Validate(); err != nil {
-		return err
-	}
-	failureReason = platformlog.SafeError(errors.New(failureReason))
-	progressJSON, err := json.Marshal(progress)
-	if err != nil {
-		return fmt.Errorf("marshal data migration progress: %w", err)
-	}
-	validationJSON, err := json.Marshal(validation)
-	if err != nil {
-		return fmt.Errorf("marshal data migration validation: %w", err)
-	}
-	tag, err := s.pool.Exec(ctx, `
-UPDATE platform.data_migration
-SET progress = $6::jsonb, validation_result = $7::jsonb, failure_reason = $8,
-    updated_at = clock_timestamp()
-WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3
-  AND status = $4 AND lease_owner = $5 AND run_token = $9
-  AND lease_until > clock_timestamp()`,
-		record.ID, record.TenantID, record.AppID, record.Status, record.LeaseOwner,
-		progressJSON, validationJSON, failureReason, record.RunToken,
-	)
-	if err != nil {
-		return fmt.Errorf("update data migration report: %w", err)
-	}
-	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("update data migration report: %w", migration.ErrLeaseLost)
-	}
-	return nil
-}
-
-func unmarshalDataMigrationReport(record *migration.Record, progress, validation []byte) error {
-	if record == nil {
-		return errors.New("data migration record is required")
-	}
-	if err := json.Unmarshal(progress, &record.Progress); err != nil {
-		return fmt.Errorf("unmarshal data migration progress: %w", err)
-	}
-	if err := json.Unmarshal(validation, &record.Validation); err != nil {
-		return fmt.Errorf("unmarshal data migration validation: %w", err)
-	}
-	return nil
-}
-
 type dataMigrationScanner interface {
 	Scan(...any) error
 }
 
 func scanDataMigrationRecord(scanner dataMigrationScanner) (migration.Record, error) {
 	var record migration.Record
-	var progress, validation []byte
 	if err := scanner.Scan(
 		&record.ID,
 		&record.TenantID,
@@ -456,13 +390,8 @@ func scanDataMigrationRecord(scanner dataMigrationScanner) (migration.Record, er
 		&record.LeaseUntil,
 		&record.RunToken,
 		&record.DrainDeadline,
-		&progress,
-		&validation,
 		&record.FailureReason,
 	); err != nil {
-		return migration.Record{}, err
-	}
-	if err := unmarshalDataMigrationReport(&record, progress, validation); err != nil {
 		return migration.Record{}, err
 	}
 	if err := record.Validate(); err != nil {
@@ -483,20 +412,6 @@ SELECT EXISTS (
 		return false, fmt.Errorf("check data migration admission gate: %w", err)
 	}
 	return blocked, nil
-}
-
-func activeDataMigrationExists(ctx context.Context, tx pgx.Tx, tenantID, appID string) (bool, error) {
-	var active bool
-	err := tx.QueryRow(ctx, `
-SELECT EXISTS (
-    SELECT 1 FROM platform.data_migration
-    WHERE tenant_id = $1 AND app_id = $2
-      AND status IN ('DRAINING', 'COPYING', 'VERIFYING')
-)`, tenantID, appID).Scan(&active)
-	if err != nil {
-		return false, fmt.Errorf("check active data migration: %w", err)
-	}
-	return active, nil
 }
 
 func ensureMigrationDrained(ctx context.Context, tx pgx.Tx, record migration.Record) error {
@@ -551,19 +466,11 @@ func validateSupportedDataMigration(source, target tenant.BackendConfig) error {
 	if !sameBackendRef(source.Memory, target.Memory) || !sameBackendRef(source.Artifact, target.Artifact) {
 		return errors.New("data migration only supports session backend changes")
 	}
-	if !isRedisSessionBackend(source.Session) {
+	if source.Session.Kind != tenant.BackendRedis || source.Session.Provider != "redis" {
 		return errors.New("data migration source session backend must use redis")
 	}
-	if !isPostgresSessionBackend(target.Session) {
+	if target.Session.Kind != tenant.BackendSQL || target.Session.Provider != "postgres" {
 		return errors.New("data migration target session backend must use postgres")
 	}
 	return nil
-}
-
-func isRedisSessionBackend(ref tenant.BackendRef) bool {
-	return ref.Kind == tenant.BackendRedis && (ref.Provider == "" || ref.Provider == "redis")
-}
-
-func isPostgresSessionBackend(ref tenant.BackendRef) bool {
-	return ref.Kind == tenant.BackendSQL && (ref.Provider == "" || ref.Provider == "postgres")
 }

@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
@@ -151,30 +150,6 @@ func scopedSecretEnvironmentKey(scope tenant.Scope, ref tenant.SecretRef) string
 	return strings.Join(parts, "_")
 }
 
-type sessionDSNResolver struct {
-	defaultDSN string
-	secrets    environmentSecretProvider
-}
-
-type sessionURLResolver struct {
-	defaultURL string
-	secrets    environmentSecretProvider
-}
-
-func (r sessionURLResolver) ResolveSessionURL(ctx context.Context, handle storage.Handle) (string, error) {
-	secretRef := handle.Ref.SecretRef
-	if secretRef == (tenant.SecretRef{}) && handle.Ref.DSNRef != "" {
-		secretRef = tenant.SecretRef{Name: handle.Ref.DSNRef}
-	}
-	if secretRef == (tenant.SecretRef{}) {
-		if r.defaultURL == "" {
-			return "", errors.New("session backend secret_ref is required")
-		}
-		return r.defaultURL, nil
-	}
-	return r.secrets.ResolveSecret(ctx, handle.Scope, secretRef)
-}
-
 // defaultEndpointPolicy is the production model endpoint policy: it allows
 // operator-configured https endpoints and blocks addresses that enable
 // server-side request forgery (loopback, link-local, multicast, unspecified).
@@ -213,21 +188,4 @@ func (defaultEndpointPolicy) ResolveModelBaseURL(
 
 func blockedModelEndpointIP(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
-}
-
-func (r sessionDSNResolver) ResolveSessionDSN(
-	ctx context.Context,
-	handle storage.Handle,
-) (string, error) {
-	secretRef := handle.Ref.SecretRef
-	if secretRef == (tenant.SecretRef{}) && handle.Ref.DSNRef != "" {
-		secretRef = tenant.SecretRef{Name: handle.Ref.DSNRef}
-	}
-	if secretRef == (tenant.SecretRef{}) {
-		if r.defaultDSN == "" {
-			return "", errors.New("session backend secret_ref is required")
-		}
-		return r.defaultDSN, nil
-	}
-	return r.secrets.ResolveSecret(ctx, handle.Scope, secretRef)
 }

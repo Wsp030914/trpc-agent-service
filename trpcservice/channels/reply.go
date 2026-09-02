@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ReplyOperation identifies one platform-level outbound operation.
@@ -77,6 +81,18 @@ type Reply struct {
 	ContentDelta bool
 	Card         json.RawMessage
 	ArtifactRef  string
+}
+
+// StableID returns the deterministic identity for one Reply operation. The
+// identity is shared by reply projection and event-to-reply conversion so a
+// replay cannot create a second operation ID.
+func (r Reply) StableID() string {
+	identity := strings.Join([]string{
+		r.TenantID, r.AppID, r.BindingID, r.RequestID,
+		r.SourceEventID, r.LogicalReplyID,
+		strconv.FormatInt(r.PartNo, 10), strconv.FormatInt(r.Revision, 10), string(r.Operation),
+	}, "\x1f")
+	return uuid.NewSHA1(uuid.Nil, []byte(identity)).String()
 }
 
 // Validate checks the stable platform-level fields required by an outbound

@@ -144,7 +144,7 @@ func (s *Stream) Dead(ctx context.Context, delivery queue.Delivery, cause error)
 		Stream: s.name + ":dlq",
 		Values: map[string]any{
 			"source_id": delivery.ID,
-			"error":     truncateError(cause),
+			"error":     platformlog.SafeError(cause),
 		},
 	}).Err(); err != nil {
 		return fmt.Errorf("write redis dispatch dlq: %w", err)
@@ -178,10 +178,6 @@ func decodeDelivery(message goredis.XMessage) (queue.Delivery, error) {
 		return queue.Delivery{}, err
 	}
 	return delivery, nil
-}
-
-func truncateError(err error) string {
-	return platformlog.SafeError(err)
 }
 
 var _ queue.Publisher = (*Stream)(nil)

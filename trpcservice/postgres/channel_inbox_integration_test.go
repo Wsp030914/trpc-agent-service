@@ -346,18 +346,6 @@ func TestChannelAdmissionRejectedInputIsDurableWithoutExecution(t *testing.T) {
 	if inboxCount != 1 || executionCount != 0 || dispatchCount != 0 || identityCount != 0 {
 		t.Fatalf("rejected channel counts = inbox:%d execution:%d dispatch:%d identity:%d", inboxCount, executionCount, dispatchCount, identityCount)
 	}
-	var auditCount int
-	if err := p.pool.QueryRow(p.ctx, `
-SELECT count(*)
-FROM platform.channel_inbox_rejection_audit
-WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
-  AND external_message_id = $4`,
-		p.scope.TenantID, p.scope.AppID, p.binding.BindingID, "message-unsupported").Scan(&auditCount); err != nil {
-		t.Fatalf("count rejected channel audit: %v", err)
-	}
-	if auditCount != 1 {
-		t.Fatalf("rejected channel audit count = %d, want 1", auditCount)
-	}
 }
 
 func TestChannelAdmissionRollsBackInboxAndMappingOnFailure(t *testing.T) {

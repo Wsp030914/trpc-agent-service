@@ -84,10 +84,6 @@ func TestMappedPrincipalValidateSeparatesDirectAndSharedSessions(t *testing.T) {
 		ConversationID:     "conversation-a",
 		SessionPrincipalID: "conversation-a",
 	}
-	shared.Membership = &channels.Membership{
-		ConversationID: "conversation-a",
-		UserID:         "user-a",
-	}
 	shared.SessionPrincipalID = "conversation-a"
 	if err := shared.Validate(); err != nil {
 		t.Fatalf("validate shared mapping: %v", err)

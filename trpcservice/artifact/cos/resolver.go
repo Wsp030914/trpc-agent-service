@@ -6,11 +6,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
+	"strings"
 	"sync"
 
 	sharedcos "github.com/liuzengh/trpc-agent-service/internal/cosclient"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	cosclient "github.com/tencentyun/cos-go-sdk-v5"
@@ -22,12 +24,6 @@ const (
 	providerName = "cos"
 )
 
-// SecretProvider resolves a scoped COS credential bundle. Resolved values must
-// not be logged or persisted by the caller.
-type SecretProvider interface {
-	ResolveSecret(context.Context, tenant.Scope, tenant.SecretRef) (string, error)
-}
-
 // EndpointResolver returns the operator-controlled COS bucket endpoint for a
 // logical backend name. It must not use tenant-provided connection settings.
 type EndpointResolver interface {
@@ -37,7 +33,7 @@ type EndpointResolver interface {
 // Resolver creates COS artifact services selected by immutable application
 // configuration versions.
 type Resolver struct {
-	secrets   SecretProvider
+	secrets   platformsecret.SecretProvider
 	endpoints EndpointResolver
 
 	mu       sync.Mutex
@@ -46,7 +42,7 @@ type Resolver struct {
 }
 
 // NewResolver creates a COS artifact resolver.
-func NewResolver(secrets SecretProvider, endpoints EndpointResolver) (*Resolver, error) {
+func NewResolver(secrets platformsecret.SecretProvider, endpoints EndpointResolver) (*Resolver, error) {
 	if secrets == nil {
 		return nil, errors.New("secret provider is required")
 	}
@@ -75,12 +71,6 @@ func (r *Resolver) ResolveArtifact(ctx context.Context, exec worker.Execution) (
 	ref := exec.Config.BackendConfig.Artifact
 	if ref.IsZero() {
 		return nil, nil
-	}
-	if err := exec.Tenant.Validate(); err != nil {
-		return nil, err
-	}
-	if err := exec.Storage.Artifact.Validate(exec.Tenant.Scope(), storage.CapabilityArtifact, ref); err != nil {
-		return nil, fmt.Errorf("artifact storage handle: %w", err)
 	}
 	if err := ValidateBackend(ref); err != nil {
 		return nil, err
@@ -141,9 +131,142 @@ func (r *Resolver) ResolveArtifact(ctx context.Context, exec worker.Execution) (
 	return service, nil
 }
 
+// InboundObjectStore uploads media before channel admission has allocated a
+// session identity. The returned object key is later attached to SQL artifact
+// metadata in the admission transaction.
+type InboundObjectStore struct {
+	client *cosclient.Client
+	prefix string
+}
+
+// ResolveInboundStore creates a scoped object writer for pre-admission media.
+func (r *Resolver) ResolveInboundStore(
+	ctx context.Context,
+	scope tenant.Scope,
+	configVersion string,
+	ref tenant.BackendRef,
+) (*InboundObjectStore, error) {
+	if r == nil || r.secrets == nil || r.endpoints == nil {
+		return nil, errors.New("cos artifact resolver is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := scope.Validate(); err != nil {
+		return nil, err
+	}
+	if configVersion == "" {
+		return nil, errors.New("artifact config version is required")
+	}
+	if err := ValidateBackend(ref); err != nil {
+		return nil, err
+	}
+	endpoint, err := r.endpoints.ResolveCOSEndpoint(ctx, ref.Name)
+	if err != nil {
+		return nil, fmt.Errorf("resolve cos endpoint: %w", err)
+	}
+	if err := sharedcos.ValidateEndpoint(endpoint); err != nil {
+		return nil, err
+	}
+	credential, err := r.secrets.ResolveSecret(ctx, scope, ref.SecretRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve cos credentials: %w", err)
+	}
+	client, err := sharedcos.New(endpoint, credential)
+	if err != nil {
+		return nil, err
+	}
+	prefix, err := scope.Key("inbound-artifact", configVersion)
+	if err != nil {
+		return nil, err
+	}
+	return &InboundObjectStore{client: client, prefix: prefix}, nil
+}
+
+// Put stores one pre-admission object under an internally generated key.
+func (s *InboundObjectStore) Put(
+	ctx context.Context,
+	objectID string,
+	value *artifact.Artifact,
+) (string, error) {
+	if s == nil || s.client == nil || s.prefix == "" {
+		return "", errors.New("inbound object store is not initialized")
+	}
+	if objectID == "" {
+		return "", errors.New("inbound object id is required")
+	}
+	if value == nil || len(value.Data) == 0 {
+		return "", errors.New("inbound artifact data is required")
+	}
+	key := s.prefix + ":" + objectID
+	_, err := s.client.Object.Put(ctx, key, bytes.NewReader(value.Data), &cosclient.ObjectPutOptions{
+		ObjectPutHeaderOptions: &cosclient.ObjectPutHeaderOptions{ContentType: value.MimeType},
+	})
+	if err != nil {
+		return "", fmt.Errorf("upload inbound artifact: %w", err)
+	}
+	return key, nil
+}
+
+// Delete removes one pre-admission object and is safe for an already removed
+// object.
+func (s *InboundObjectStore) Delete(ctx context.Context, objectKey string) error {
+	if s == nil || s.client == nil || s.prefix == "" {
+		return errors.New("inbound object store is not initialized")
+	}
+	if objectKey == "" || !strings.HasPrefix(objectKey, s.prefix+":") {
+		return errors.New("inbound object key is outside its scope")
+	}
+	_, err := s.client.Object.Delete(ctx, objectKey)
+	if err != nil && !cosclient.IsNotFoundError(err) {
+		return fmt.Errorf("delete inbound artifact: %w", err)
+	}
+	return nil
+}
+
 type versionedService struct {
 	artifact.Service
 	client *cosclient.Client
+}
+
+func (s *versionedService) LoadArtifactObject(
+	ctx context.Context,
+	objectKey, mimeType string,
+	size int64,
+) (*artifact.Artifact, error) {
+	if s == nil || s.client == nil {
+		return nil, errors.New("cos artifact object service is not initialized")
+	}
+	if objectKey == "" || size < 0 {
+		return nil, errors.New("cos artifact object key and size are invalid")
+	}
+	response, err := s.client.Object.Get(ctx, objectKey, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get cos artifact object: %w", err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, size+1))
+	if err != nil {
+		return nil, fmt.Errorf("read cos artifact object: %w", err)
+	}
+	if int64(len(data)) != size {
+		return nil, errors.New("cos artifact object size does not match metadata")
+	}
+	return &artifact.Artifact{Data: data, MimeType: mimeType}, nil
+}
+
+func (s *versionedService) DeleteArtifactObject(ctx context.Context, objectKey string) error {
+	if s == nil || s.client == nil {
+		return errors.New("cos artifact object service is not initialized")
+	}
+	if objectKey == "" {
+		return errors.New("cos artifact object key is required")
+	}
+	_, err := s.client.Object.Delete(ctx, objectKey)
+	if err != nil && !cosclient.IsNotFoundError(err) {
+		return fmt.Errorf("delete cos artifact object: %w", err)
+	}
+	return nil
 }
 
 func (s *versionedService) SaveArtifactVersion(

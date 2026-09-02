@@ -14,16 +14,13 @@ func TestValidateBackend(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "legacy sql",
-			ref:  tenant.BackendRef{Kind: tenant.BackendSQL, Name: "sessions"},
-		},
-		{
-			name: "legacy redis",
-			ref:  tenant.BackendRef{Kind: tenant.BackendRedis, Name: "sessions"},
-		},
-		{
 			name: "explicit postgres",
 			ref:  tenant.BackendRef{Kind: tenant.BackendSQL, Provider: postgresProvider, Name: "sessions"},
+		},
+		{
+			name:    "missing provider",
+			ref:     tenant.BackendRef{Kind: tenant.BackendSQL, Name: "sessions"},
+			wantErr: "backend provider is required",
 		},
 		{
 			name: "explicit redis",

@@ -116,14 +116,10 @@ func (k ConversationKind) Validate() error {
 	}
 }
 
-// IdentityStatus and MembershipStatus values are stored as strings to retain
-// compatibility with the existing channel domain structures.
+// IdentityStatus values are stored as strings.
 const (
-	IdentityActive       = "ACTIVE"
-	IdentitySuspended    = "SUSPENDED"
-	MembershipActive     = "ACTIVE"
-	MembershipSuspended  = "SUSPENDED"
-	MembershipRoleMember = "MEMBER"
+	IdentityActive    = "ACTIVE"
+	IdentitySuspended = "SUSPENDED"
 )
 
 // TargetContext binds an encrypted target to its tenant, binding, channel, and

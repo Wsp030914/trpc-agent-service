@@ -44,6 +44,8 @@ var (
 	errFeishuMessageContent    = errors.New("feishu message content is invalid")
 	errFeishuUnsupportedTarget = errors.New("feishu provider target is invalid")
 	errFeishuTargetMessage     = errors.New("feishu message reply target is invalid")
+	errFeishuRecallEvent       = errors.New("feishu recall event is invalid")
+	errFeishuRecallEventID     = errors.New("feishu recall event id is required")
 )
 
 // VerifiedProviderEnvelope is the provider-neutral result of Feishu callback
@@ -230,48 +232,6 @@ func parseCallbackMetadata(body []byte) (callbackMetadata, error) {
 	return metadata, nil
 }
 
-func normalizeRecallEvent(
-	binding channels.BindingSnapshot,
-	metadata callbackMetadata,
-	plain []byte,
-) (channels.RecallRequest, error) {
-	if metadata.EventType != feishuRecallEventType || metadata.EventID == "" {
-		return channels.RecallRequest{}, errFeishuCallbackEvent
-	}
-	var recalled larkim.P2MessageRecalledV1
-	if err := json.Unmarshal(plain, &recalled); err != nil || recalled.EventV2Base == nil ||
-		recalled.EventV2Base.Header == nil || recalled.Event == nil {
-		return channels.RecallRequest{}, errFeishuCallbackEvent
-	}
-	header := recalled.EventV2Base.Header
-	if header.AppID != binding.ExternalAccount || header.TenantKey == "" ||
-		header.TenantKey != binding.ExternalAccountScope {
-		return channels.RecallRequest{}, errFeishuBindingAccount
-	}
-	messageID, err := channels.NormalizeExternalID(valueOf(recalled.Event.MessageId))
-	if err != nil {
-		return channels.RecallRequest{}, errFeishuMessageID
-	}
-	eventID, err := channels.NormalizeExternalID(metadata.EventID)
-	if err != nil {
-		return channels.RecallRequest{}, errFeishuCallbackEvent
-	}
-	digest := sha256.Sum256(plain)
-	request := channels.RecallRequest{
-		TenantID:          binding.TenantID,
-		AppID:             binding.AppID,
-		BindingID:         binding.BindingID,
-		Channel:           channels.ChannelFeishu,
-		ExternalEventID:   eventID,
-		ExternalMessageID: messageID,
-		PayloadHash:       digest[:],
-	}
-	if err := request.Validate(); err != nil {
-		return channels.RecallRequest{}, err
-	}
-	return request, nil
-}
-
 func verifyCallbackTimestamp(headers http.Header, now time.Time, maxClockSkew time.Duration) error {
 	timestamp, err := oneHeaderValue(headers, larkevent.EventRequestTimestamp)
 	if err != nil {
@@ -413,6 +373,52 @@ func normalizeMessageEvent(binding channels.BindingSnapshot, received *larkim.P2
 		return VerifiedProviderEnvelope{}, err
 	}
 	return envelope, nil
+}
+
+// normalizeRecallEvent converts the official Feishu recall event into the
+// provider-neutral recall boundary. The payload digest is calculated over the
+// already verified/decrypted callback, while scope and binding authorization
+// come only from the route snapshot.
+func normalizeRecallEvent(
+	binding channels.BindingSnapshot,
+	metadata callbackMetadata,
+	recalled *larkim.P2MessageRecalledV1,
+	payloadHash []byte,
+) (channels.RecallRequest, error) {
+	if recalled == nil || recalled.EventV2Base == nil || recalled.EventV2Base.Header == nil || recalled.Event == nil {
+		return channels.RecallRequest{}, errFeishuRecallEvent
+	}
+	header := recalled.EventV2Base.Header
+	if header.EventType != feishuRecallEventType ||
+		header.AppID != binding.ExternalAccount ||
+		header.TenantKey == "" || binding.ExternalAccountScope == "" ||
+		header.TenantKey != binding.ExternalAccountScope {
+		return channels.RecallRequest{}, errFeishuBindingAccount
+	}
+	eventID, err := channels.NormalizeExternalID(metadata.EventID)
+	if err != nil || eventID != metadata.EventID || eventID != header.EventID {
+		return channels.RecallRequest{}, errFeishuRecallEventID
+	}
+	messageID, err := channels.NormalizeExternalID(valueOf(recalled.Event.MessageId))
+	if err != nil {
+		return channels.RecallRequest{}, errFeishuMessageID
+	}
+	if len(payloadHash) != sha256.Size {
+		return channels.RecallRequest{}, errFeishuRecallEvent
+	}
+	request := channels.RecallRequest{
+		TenantID:          binding.TenantID,
+		AppID:             binding.AppID,
+		BindingID:         binding.BindingID,
+		Channel:           channels.ChannelFeishu,
+		ExternalEventID:   eventID,
+		ExternalMessageID: messageID,
+		PayloadHash:       append([]byte(nil), payloadHash...),
+	}
+	if err := request.Validate(); err != nil {
+		return channels.RecallRequest{}, fmt.Errorf("feishu recall: %w", err)
+	}
+	return request, nil
 }
 
 func senderOpenID(sender *larkim.EventSender) string {

@@ -174,7 +174,7 @@ const (
 	IndexJobRunning IndexJobStatus = "RUNNING"
 	// IndexJobSucceeded has written and published every derived chunk.
 	IndexJobSucceeded IndexJobStatus = "SUCCEEDED"
-	// IndexJobFailed cannot make progress until an operator creates a new build.
+	// IndexJobFailed records a terminal failure after retryable attempts are exhausted.
 	IndexJobFailed IndexJobStatus = "FAILED"
 )
 
@@ -184,8 +184,6 @@ type IndexJob struct {
 	ID            string
 	Document      Document
 	ConfigVersion string
-	// BuildID identifies the immutable generation build that owns this job.
-	BuildID       string
 	Status        IndexJobStatus
 	Attempt       int
 	NextAttemptAt time.Time
@@ -197,7 +195,7 @@ type IndexJob struct {
 
 // Validate checks the identity and lease state of IndexJob.
 func (j IndexJob) Validate() error {
-	if j.ID == "" || j.ConfigVersion == "" || j.BuildID == "" {
+	if j.ID == "" || j.ConfigVersion == "" {
 		return errors.New("knowledge index job identity is required")
 	}
 	if err := j.Document.Validate(); err != nil {

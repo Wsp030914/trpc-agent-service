@@ -19,11 +19,10 @@ const (
 )
 
 // MappedPrincipal is the internal identity and session mapping for one channel
-// message. Direct messages have no Conversation or Membership.
+// message. Direct messages have no Conversation.
 type MappedPrincipal struct {
 	Identity           Identity
 	Conversation       *Conversation
-	Membership         *Membership
 	SessionPrincipalID string
 	SessionID          string
 }
@@ -44,9 +43,6 @@ func (m MappedPrincipal) Validate() error {
 		if m.SessionPrincipalID != m.Identity.UserID {
 			return errors.New("direct session principal must equal user_id")
 		}
-		if m.Membership != nil {
-			return errors.New("direct mapping cannot have membership")
-		}
 		return nil
 	}
 	if m.Conversation.ConversationID == "" {
@@ -54,12 +50,6 @@ func (m MappedPrincipal) Validate() error {
 	}
 	if m.SessionPrincipalID != m.Conversation.SessionPrincipalID {
 		return errors.New("shared session principal does not match conversation")
-	}
-	if m.Membership == nil {
-		return errors.New("shared mapping membership is required")
-	}
-	if m.Membership.UserID != m.Identity.UserID || m.Membership.ConversationID != m.Conversation.ConversationID {
-		return errors.New("mapping membership does not match principal")
 	}
 	return nil
 }

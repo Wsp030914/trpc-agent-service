@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/google/uuid"
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
@@ -96,7 +97,7 @@ func (i *Importer) Import(
 	if generation == "" {
 		return platformknowledge.Document{}, errors.New("knowledge backend index_generation is required")
 	}
-	if !contains(exec.Config.KnowledgeBaseIDs, input.KnowledgeBaseID) {
+	if !slices.Contains(exec.Config.KnowledgeBaseIDs, input.KnowledgeBaseID) {
 		return platformknowledge.Document{}, errors.New("knowledge base is not bound by config")
 	}
 	document, err := knowledgecos.NewDocument(
@@ -118,7 +119,6 @@ func (i *Importer) Import(
 		ID:            uuid.NewString(),
 		Document:      document,
 		ConfigVersion: exec.Tenant.ConfigVersion,
-		BuildID:       exec.Tenant.ConfigVersion,
 		Status:        platformknowledge.IndexJobPending,
 	}
 	if err := i.repository.CreateKnowledgeDocumentAndEnqueue(ctx, document, job); err != nil {
@@ -132,15 +132,6 @@ func (i *Importer) Import(
 		return platformknowledge.Document{}, fmt.Errorf("persist knowledge source metadata: %w", err)
 	}
 	return document, nil
-}
-
-func contains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 var _ SourceStore = (*knowledgecos.Resolver)(nil)

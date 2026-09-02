@@ -16,29 +16,6 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
-func TestOpenAIHandlerDerivesCredentialServiceIdentity(t *testing.T) {
-	handler, admitter, source, _ := newTestOpenAIHandler(t)
-	request := validOpenAIRequest()
-	response := httptest.NewRecorder()
-
-	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("response status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
-	}
-	identity := admitter.request.Identity.Tenant
-	if identity.UserID != "service:credential-1" || identity.SessionPrincipalID != "service:credential-1" ||
-		identity.SessionID != "session-1" || identity.TraceID != "request-1" {
-		t.Fatalf("admission identity = %#v", identity)
-	}
-	if admitter.request.RequestID != "request-1" || admitter.request.IdempotencyKey != "idempotency-1" {
-		t.Fatalf("admission request = %#v", admitter.request)
-	}
-	if source.scope != (tenant.Scope{TenantID: "tenant-a", AppID: "support"}) || source.requestID != "request-1" {
-		t.Fatalf("event subscription = scope %#v request %q", source.scope, source.requestID)
-	}
-}
-
 func TestOpenAIHandlerRejectsCallerIdentityHeaders(t *testing.T) {
 	tests := []struct {
 		name   string

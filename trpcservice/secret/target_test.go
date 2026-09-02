@@ -57,12 +57,12 @@ func TestExternalIDHasherUsesTypedHMACNamespaces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hash user id after rotation: %v", err)
 	}
-	legacyHash, err := rotated.HashWithVersion(context.Background(), scope, "binding-a", channels.ExternalIDUser, "user-1", "v1")
+	candidateHash, err := rotated.HashWithVersion(context.Background(), scope, "binding-a", channels.ExternalIDUser, "user-1", "v1")
 	if err != nil {
 		t.Fatalf("hash user id with previous version: %v", err)
 	}
-	if rotatedVersion != "v2" || rotatedHash == legacyHash || legacyHash != userHash {
-		t.Fatalf("rotated hashes/version = %q/%q/%q, want v2 and stable v1 lookup", rotatedHash, legacyHash, rotatedVersion)
+	if rotatedVersion != "v2" || rotatedHash == candidateHash || candidateHash != userHash {
+		t.Fatalf("rotated hashes/version = %q/%q/%q, want v2 and stable v1 lookup", rotatedHash, candidateHash, rotatedVersion)
 	}
 }
 

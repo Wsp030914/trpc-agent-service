@@ -324,8 +324,9 @@ func testMemoryExecution(userID string) worker.Execution {
 			BackendConfig: tenant.BackendConfig{
 				Name: "backends",
 				Session: tenant.BackendRef{
-					Kind: tenant.BackendSQL,
-					Name: "sessions",
+					Kind:     tenant.BackendSQL,
+					Provider: "postgres",
+					Name:     "sessions",
 				},
 				Memory: tenant.BackendRef{
 					Kind:      tenant.BackendExternal,

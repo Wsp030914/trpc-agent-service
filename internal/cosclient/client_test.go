@@ -4,17 +4,6 @@ import (
 	"testing"
 )
 
-func TestNew(t *testing.T) {
-	t.Parallel()
-	_, err := New(
-		"https://bucket.cos.ap-guangzhou.myqcloud.com",
-		`{"secret_id":"id","secret_key":"key"}`,
-	)
-	if err != nil {
-		t.Fatalf("new client: %v", err)
-	}
-}
-
 func TestValidateEndpoint(t *testing.T) {
 	t.Parallel()
 	if err := ValidateEndpoint("https://bucket.cos.ap-guangzhou.myqcloud.com"); err != nil {

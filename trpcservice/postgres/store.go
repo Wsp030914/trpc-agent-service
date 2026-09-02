@@ -87,9 +87,6 @@ func (s *Store) CreateTenant(ctx context.Context, value tenant.Tenant) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
-	if err := value.Validate(); err != nil {
-		return fmt.Errorf("tenant: %w", err)
-	}
 	auditPolicy, err := marshalAuditPolicy(value.Audit)
 	if err != nil {
 		return err
@@ -147,24 +144,6 @@ func (s *Store) CreateAgentApp(
 ) error {
 	if err := s.validate(); err != nil {
 		return err
-	}
-	if err := app.Validate(); err != nil {
-		return fmt.Errorf("agent app: %w", err)
-	}
-	if err := initial.Validate(); err != nil {
-		return fmt.Errorf("initial app config: %w", err)
-	}
-	if err := config.ValidateAppConfigBindings(ctx, initial, s); err != nil {
-		return fmt.Errorf("initial app config channel bindings: %w", err)
-	}
-	if len(initial.KnowledgeBaseIDs) != 0 {
-		return errors.New("initial app config cannot bind knowledge bases before the app exists")
-	}
-	if app.TenantID != initial.TenantID || app.AppID != initial.AppID {
-		return errors.New("initial app config does not match agent app scope")
-	}
-	if app.ActiveConfigVersion != initial.Version {
-		return errors.New("active_config_version does not match initial app config")
 	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -244,12 +223,6 @@ func (s *Store) CreateCredential(
 ) error {
 	if err := s.validate(); err != nil {
 		return err
-	}
-	if err := credential.Validate(); err != nil {
-		return fmt.Errorf("api credential: %w", err)
-	}
-	if digest == (auth.APIKeyDigest{}) {
-		return errors.New("api key digest is required")
 	}
 	var expiresAt any
 	if !credential.ExpiresAt.IsZero() {
@@ -378,31 +351,11 @@ func resolveError(entity string, err error) error {
 	return fmt.Errorf("resolve %s: %w", entity, err)
 }
 
-// CreateChannelBinding inserts one tenant-owned IM account binding for a tenant
-// application. Missing route metadata is generated for lower-level callers;
-// an explicitly supplied route must have the format emitted by
-// channels.NewPublicRouteID.
+// CreateChannelBinding inserts one fully prepared tenant-owned IM account
+// binding for a tenant application.
 func (s *Store) CreateChannelBinding(ctx context.Context, binding channels.Binding) error {
 	if err := s.validate(); err != nil {
 		return err
-	}
-	if binding.PublicRouteID == "" {
-		publicRouteID, err := channels.NewPublicRouteID()
-		if err != nil {
-			return err
-		}
-		binding.PublicRouteID = publicRouteID
-	} else if err := channels.ValidateGeneratedPublicRouteID(binding.PublicRouteID); err != nil {
-		return fmt.Errorf("channel binding public route: %w", err)
-	}
-	if binding.BindingRevision == 0 {
-		binding.BindingRevision = 1
-	}
-	if binding.BindingRevision != 1 {
-		return errors.New("binding_revision must be 1 when creating a channel binding")
-	}
-	if err := binding.Validate(); err != nil {
-		return fmt.Errorf("channel binding: %w", err)
 	}
 	tokenRef, signingSecretRef, secret, err := marshalBindingSecretRefs(binding)
 	if err != nil {

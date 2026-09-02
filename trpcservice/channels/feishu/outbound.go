@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -18,8 +19,9 @@ import (
 )
 
 const (
-	maxFeishuReplyTextBytes = 150 << 10
-	maxFeishuReplyCardBytes = 30 << 10
+	maxFeishuReplyTextBytes    = 150 << 10
+	maxFeishuReplyCardBytes    = 30 << 10
+	maxFeishuInboundMediaBytes = 32 << 20
 )
 
 var (
@@ -178,6 +180,64 @@ func (c *OutboundClient) Capability() channels.ProviderCapability {
 		MaxTextSize:       maxFeishuReplyTextBytes,
 		TargetTTL:         feishuMessageTargetTTL,
 	}
+}
+
+// DownloadMediaForMessage is the production media path. Feishu requires both
+// the message ID and resource key; the former comes from ChannelInput's
+// normalized external message ID and the latter from the opaque media ref.
+func (c *OutboundClient) DownloadMediaForMessage(
+	ctx context.Context,
+	messageID string,
+	media channels.ProviderMediaRef,
+) (channels.DownloadedMedia, error) {
+	if c == nil || c.client == nil {
+		return channels.DownloadedMedia{}, errFeishuOutboundNotInitialized
+	}
+	if err := media.Validate(); err != nil {
+		return channels.DownloadedMedia{}, err
+	}
+	if messageID == "" {
+		return channels.DownloadedMedia{}, errors.New("feishu media message id is required")
+	}
+	resource := media.Reference
+	resourceType := "image"
+	if media.Kind == channels.MessageTypeFile {
+		resourceType = "file"
+	}
+	request := larkim.NewGetMessageResourceReqBuilder().
+		MessageId(messageID).
+		FileKey(resource).
+		Type(resourceType).
+		Build()
+	response, err := c.client.Im.MessageResource.Get(ctx, request)
+	if err != nil {
+		return channels.DownloadedMedia{}, transportError(err)
+	}
+	if response == nil {
+		return channels.DownloadedMedia{}, &ProviderSendError{Retryable: true, cause: errors.New("empty feishu media response")}
+	}
+	if !response.Success() {
+		return channels.DownloadedMedia{}, responseError(response.ApiResp, response.Code)
+	}
+	if response.File == nil {
+		return channels.DownloadedMedia{}, errors.New("feishu media response has no file")
+	}
+	data, err := io.ReadAll(io.LimitReader(response.File, maxFeishuInboundMediaBytes+1))
+	if err != nil {
+		return channels.DownloadedMedia{}, fmt.Errorf("read feishu media: %w", err)
+	}
+	if len(data) > maxFeishuInboundMediaBytes {
+		return channels.DownloadedMedia{}, errors.New("feishu media exceeds size limit")
+	}
+	filename := response.FileName
+	if filename == "" {
+		filename = resource
+	}
+	return channels.DownloadedMedia{
+		Filename: filename,
+		MIMEType: http.DetectContentType(data),
+		Data:     data,
+	}, nil
 }
 
 // SendOnce encodes and sends one Feishu Reply through the official Open API.

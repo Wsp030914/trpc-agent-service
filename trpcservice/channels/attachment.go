@@ -19,7 +19,7 @@ type DownloadedMedia struct {
 }
 
 // InboundArtifact identifies one deterministic, tenant-scoped artifact write.
-// The writer owns persistence and must make the scope/message/item tuple
+// The writer owns persistence and must make the external message/item tuple
 // idempotent.
 type InboundArtifact struct {
 	TenantID          string
@@ -92,8 +92,8 @@ func (f ArtifactWriterFunc) WriteInboundArtifact(ctx context.Context, artifact I
 }
 
 // ArtifactIngestor materializes provider media before PostgreSQL admission.
-// It is deliberately independent of a concrete object store; the supplied
-// ArtifactWriter is the only persistence boundary.
+// It is independent of a concrete object store; the supplied ArtifactWriter
+// is the only persistence boundary.
 type ArtifactIngestor struct {
 	downloader MediaDownloader
 	writer     ArtifactWriter
@@ -125,8 +125,7 @@ func (i *ArtifactIngestor) WithMaxBytes(maxBytes int64) error {
 }
 
 // Prepare downloads and writes media, then returns ChannelInput containing
-// only the resulting ArtifactRefs. A writer error prevents admission and must
-// be classified by the caller as retryable or permanently rejected.
+// only the resulting ArtifactRefs.
 func (i *ArtifactIngestor) Prepare(
 	ctx context.Context,
 	input ChannelInput,

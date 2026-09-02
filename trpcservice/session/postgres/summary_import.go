@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
@@ -27,7 +27,7 @@ func (r *SessionResolver) NewSummaryImporter(
 	ctx context.Context,
 	exec worker.Execution,
 ) (*SummaryImporter, error) {
-	if r == nil || r.dsns == nil {
+	if r == nil || r.secrets == nil {
 		return nil, errors.New("postgres session resolver is not initialized")
 	}
 	if ctx == nil {
@@ -36,29 +36,20 @@ func (r *SessionResolver) NewSummaryImporter(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := exec.Tenant.Validate(); err != nil {
-		return nil, err
-	}
 	if _, err := r.ResolveSession(ctx, exec); err != nil {
 		return nil, fmt.Errorf("resolve postgres session service: %w", err)
 	}
-	handle := exec.Storage.Session
-	if err := handle.Validate(exec.Tenant.Scope(), storage.CapabilitySession, exec.Config.BackendConfig.Session); err != nil {
-		return nil, fmt.Errorf("session storage handle: %w", err)
+	ref := exec.Config.BackendConfig.Session
+	if ref.Kind != tenant.BackendSQL || ref.Provider != "postgres" {
+		return nil, fmt.Errorf("session backend %q must use postgres provider", ref.Name)
 	}
-	if handle.Ref.Kind != "sql" || (handle.Ref.Provider != "" && handle.Ref.Provider != "postgres") {
-		return nil, fmt.Errorf("session backend %q must use postgres provider", handle.Ref.Name)
-	}
-	schema, err := sessionSchema(handle.Ref)
+	schema, err := sessionSchema(ref)
 	if err != nil {
 		return nil, err
 	}
-	dsn, err := r.dsns.ResolveSessionDSN(ctx, handle)
+	dsn, err := r.resolveSessionDSN(ctx, exec)
 	if err != nil {
-		return nil, fmt.Errorf("resolve session dsn: %w", err)
-	}
-	if dsn == "" {
-		return nil, errors.New("session dsn is required")
+		return nil, err
 	}
 	if err := ensureSchema(ctx, dsn, schema); err != nil {
 		return nil, err

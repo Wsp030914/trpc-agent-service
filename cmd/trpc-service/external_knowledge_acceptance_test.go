@@ -15,7 +15,6 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/importer"
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
@@ -216,9 +215,5 @@ func acceptanceExecution(t *testing.T, scope tenant.Scope, config tenant.AppConf
 		UserID:             "external-acceptance",
 		TraceID:            "external-acceptance",
 	}
-	handles, err := (storage.StaticResolver{}).Resolve(context.Background(), runtime, config.BackendConfig)
-	if err != nil {
-		t.Fatalf("resolve acceptance storage: %v", err)
-	}
-	return worker.Execution{Tenant: runtime, Config: config, Storage: handles}
+	return worker.Execution{Tenant: runtime, Config: config}
 }

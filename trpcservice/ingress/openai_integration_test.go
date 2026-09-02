@@ -157,8 +157,9 @@ func seedIngressControlPlane(t *testing.T, ctx context.Context, store *platformp
 		BackendConfig: tenant.BackendConfig{
 			Name: "shared",
 			Session: tenant.BackendRef{
-				Kind: tenant.BackendSQL,
-				Name: "session-postgres",
+				Kind:     tenant.BackendSQL,
+				Provider: "postgres",
+				Name:     "session-postgres",
 			},
 		},
 	}

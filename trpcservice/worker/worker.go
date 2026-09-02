@@ -5,17 +5,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"go.opentelemetry.io/otel/attribute"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
+	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
@@ -24,13 +28,20 @@ import (
 
 const defaultEventSinkTimeout = 5 * time.Second
 
+const (
+	defaultCancellationPollInterval = 500 * time.Millisecond
+	cancellationOperationTimeout    = 5 * time.Second
+)
+
+// ErrExecutionCanceled means a verified recall stopped the current run.
+var ErrExecutionCanceled = errors.New("execution canceled by recall")
+
 // Execution is the prepared context for running one tenant-scoped job.
 type Execution struct {
 	RequestID    string
 	TenantSource gateway.TenantSource
 	Tenant       tenant.RuntimeContext
 	Config       tenant.AppConfig
-	Storage      storage.Handles
 	Message      gateway.Message
 	PartitionKey string
 }
@@ -39,12 +50,13 @@ type Execution struct {
 // The resolver owns runner construction, caching, and lifecycle.
 type RunnerResolver interface {
 	ResolveRunner(ctx context.Context, exec Execution) (runner.Runner, error)
+	ReleaseRunner(runner.Runner) error
 }
 
-// RunnerReleaser releases a Runner returned for one execution. Resolvers that
-// cache runners may omit this interface.
-type RunnerReleaser interface {
-	ReleaseRunner(runner.Runner) error
+// InputArtifactResolver resolves the SQL-guarded artifact service used to
+// validate inbound content references for one execution.
+type InputArtifactResolver interface {
+	ResolveArtifact(context.Context, Execution) (frameworkartifact.Service, error)
 }
 
 // SessionLock owns an acquired session partition lock. Context is canceled
@@ -78,6 +90,14 @@ type ToolPermissionAuthorizer interface {
 	) (frameworktool.PermissionDecision, error)
 }
 
+// CancellationController connects verified recall state to the currently
+// leased execution. The worker polls the controller and asks ManagedRunner to
+// stop; the controller owns the authoritative SQL transition.
+type CancellationController interface {
+	CancellationRequested(context.Context, string, string, string, queue.Lease) (bool, error)
+	CancelExecution(context.Context, string, string, string, queue.Lease) error
+}
+
 // LogSink receives only worker-supplied allowlisted routing fields. Logging is
 // best effort and does not block execution.
 type LogSink interface {
@@ -98,6 +118,14 @@ type Option func(*Worker)
 func WithRunner(resolver RunnerResolver) Option {
 	return func(w *Worker) {
 		w.Runner = resolver
+	}
+}
+
+// WithInputArtifactResolver sets the resolver used to validate inbound
+// artifact references before the runner starts.
+func WithInputArtifactResolver(resolver InputArtifactResolver) Option {
+	return func(w *Worker) {
+		w.Artifacts = resolver
 	}
 }
 
@@ -145,25 +173,43 @@ func WithLogSink(sink LogSink) Option {
 	}
 }
 
-// Worker prepares jobs for execution without owning session state locally.
-type Worker struct {
-	Config           config.Resolver
-	Storage          storage.Resolver
-	Runner           RunnerResolver
-	SessionLocker    SessionLocker
-	Events           EventSink
-	EventSinkTimeout time.Duration
-	ToolAuthorizer   ToolPermissionAuthorizer
-	Audit            AuditSink
-	Logs             LogSink
+// WithCancellationController enables recall polling for a leased execution.
+func WithCancellationController(controller CancellationController) Option {
+	return func(w *Worker) {
+		w.Cancellation = controller
+	}
 }
 
-// New creates a Worker with the required config and storage resolvers. Run
-// additionally requires a RunnerResolver and SessionLocker.
-func New(configResolver config.Resolver, storageResolver storage.Resolver, opts ...Option) *Worker {
+// WithCancellationPollInterval sets the recall polling interval.
+func WithCancellationPollInterval(interval time.Duration) Option {
+	return func(w *Worker) {
+		if interval > 0 {
+			w.CancellationPollInterval = interval
+		}
+	}
+}
+
+// Worker prepares jobs for execution without owning session state locally.
+type Worker struct {
+	Config                   config.Resolver
+	Runner                   RunnerResolver
+	Artifacts                InputArtifactResolver
+	SessionLocker            SessionLocker
+	Events                   EventSink
+	EventSinkTimeout         time.Duration
+	ToolAuthorizer           ToolPermissionAuthorizer
+	Audit                    AuditSink
+	Logs                     LogSink
+	Cancellation             CancellationController
+	CancellationPollInterval time.Duration
+}
+
+// New creates a Worker with the required config resolver. Run additionally
+// requires a RunnerResolver and SessionLocker.
+func New(configResolver config.Resolver, opts ...Option) *Worker {
 	w := &Worker{
-		Config:  configResolver,
-		Storage: storageResolver,
+		Config:                   configResolver,
+		CancellationPollInterval: defaultCancellationPollInterval,
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -183,9 +229,6 @@ func (w Worker) Prepare(ctx context.Context, job execution.Job) (Execution, erro
 	if w.Config == nil {
 		return Execution{}, errors.New("config resolver is required")
 	}
-	if w.Storage == nil {
-		return Execution{}, errors.New("storage resolver is required")
-	}
 	tenantContext := job.Tenant()
 	cfg, err := w.Config.ResolveAppConfig(
 		ctx,
@@ -196,27 +239,16 @@ func (w Worker) Prepare(ctx context.Context, job execution.Job) (Execution, erro
 	if err != nil {
 		return Execution{}, err
 	}
-	if err := cfg.Validate(); err != nil {
-		return Execution{}, fmt.Errorf("app config: %w", err)
-	}
 	if cfg.TenantID != tenantContext.TenantID ||
 		cfg.AppID != tenantContext.AppID ||
 		cfg.Version != tenantContext.ConfigVersion {
 		return Execution{}, errors.New("resolved app config does not match job scope")
-	}
-	stores, err := w.Storage.Resolve(ctx, tenantContext, cfg.BackendConfig)
-	if err != nil {
-		return Execution{}, err
-	}
-	if err := stores.Validate(tenantContext, cfg.BackendConfig); err != nil {
-		return Execution{}, err
 	}
 	return Execution{
 		RequestID:    job.RequestID(),
 		TenantSource: job.TenantSource(),
 		Tenant:       tenantContext,
 		Config:       cfg,
-		Storage:      stores,
 		Message:      job.Message(),
 		PartitionKey: partitionKey,
 	}, nil
@@ -227,6 +259,10 @@ func (w Worker) Prepare(ctx context.Context, job execution.Job) (Execution, erro
 // It uses SessionPrincipalID as the runner user ID so group and thread messages
 // share a session, while UserID remains available in runtime state as the sender.
 func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lease, hasLease := JobLeaseFromContext(ctx)
 	exec, err := w.Prepare(ctx, job)
 	if err != nil {
 		return RunResult{}, err
@@ -235,14 +271,11 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	if w.Runner == nil {
 		return result, errors.New("runner resolver is required")
 	}
-	if err := validateRunExecution(exec); err != nil {
-		return result, err
-	}
-	message, err := runnerMessage(exec.Message)
+	message, err := w.runnerMessage(ctx, exec)
 	if err != nil {
 		return result, err
 	}
-	appName, err := runnerAppName(exec.Tenant)
+	appName, err := exec.Tenant.Scope().Key("runner")
 	if err != nil {
 		return result, err
 	}
@@ -273,7 +306,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		return result, errors.New("runner is required")
 	}
 	defer func() {
-		if releaseErr := releaseRunner(w.Runner, r); releaseErr != nil {
+		if releaseErr := w.Runner.ReleaseRunner(r); releaseErr != nil {
 			w.logExecution(context.WithoutCancel(runCtx), exec, "runner release failed")
 		}
 	}()
@@ -318,6 +351,9 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	}
 	stopManagedCancel := cancelManagedRunnerOnContextDone(runCtx, r, exec.RequestID)
 	defer stopManagedCancel()
+	stopCancellation, checkCancellation, cancellationRequested, cancellationErr :=
+		w.watchCancellation(runCtx, r, exec, lease, hasLease)
+	defer stopCancellation()
 	var sinkErr error
 	var runnerErr error
 	sinkTimedOut := false
@@ -344,6 +380,18 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 			}
 		}
 	}
+	stopCancellation()
+	if !cancellationRequested() {
+		if err := checkCancellation(); err != nil {
+			return result, err
+		}
+	}
+	if err := cancellationErr(); err != nil {
+		return result, err
+	}
+	if cancellationRequested() {
+		return result, ErrExecutionCanceled
+	}
 	if err := runCtx.Err(); err != nil {
 		return result, err
 	}
@@ -356,12 +404,128 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	return result, nil
 }
 
-func releaseRunner(resolver RunnerResolver, resolved runner.Runner) error {
-	releaser, ok := resolver.(RunnerReleaser)
-	if !ok {
+func (w Worker) watchCancellation(
+	runCtx context.Context,
+	r runner.Runner,
+	exec Execution,
+	lease queue.Lease,
+	hasLease bool,
+) (stop func(), check func() error, requested func() bool, watchErr func() error) {
+	noop := func() {}
+	noopCheck := func() error { return nil }
+	falseRequested := func() bool { return false }
+	noError := func() error { return nil }
+	controller := w.Cancellation
+	if controller == nil || !hasLease || runCtx == nil {
+		return noop, noopCheck, falseRequested, noError
+	}
+	managed, _ := r.(runner.ManagedRunner)
+	watchCtx, cancelWatch := context.WithCancel(runCtx)
+	watchDone := make(chan struct{})
+	canceled := make(chan struct{})
+	var stopOnce sync.Once
+	var cancelOnce sync.Once
+	var errMu sync.Mutex
+	var observedErr error
+	setErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if observedErr == nil {
+			observedErr = err
+		}
+		errMu.Unlock()
+	}
+	requestCancellation := func() {
+		cancelOnce.Do(func() {
+			if managed != nil {
+				managed.Cancel(exec.RequestID)
+			}
+			operationCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(runCtx), cancellationOperationTimeout,
+			)
+			err := controller.CancelExecution(
+				operationCtx,
+				exec.Tenant.TenantID,
+				exec.Tenant.AppID,
+				exec.RequestID,
+				lease,
+			)
+			cancel()
+			if err != nil {
+				setErr(err)
+				return
+			}
+			close(canceled)
+		})
+	}
+	checkCancellation := func() error {
+		operationCtx, cancel := context.WithTimeout(
+			context.WithoutCancel(runCtx), cancellationOperationTimeout,
+		)
+		cancelRequested, err := controller.CancellationRequested(
+			operationCtx,
+			exec.Tenant.TenantID,
+			exec.Tenant.AppID,
+			exec.RequestID,
+			lease,
+		)
+		cancel()
+		if err != nil {
+			return err
+		}
+		if cancelRequested {
+			requestCancellation()
+		}
 		return nil
 	}
-	return releaser.ReleaseRunner(resolved)
+	go func() {
+		defer close(watchDone)
+		ticker := time.NewTicker(w.cancellationPollInterval())
+		defer ticker.Stop()
+		for {
+			if err := checkCancellation(); err != nil {
+				setErr(err)
+				if managed != nil {
+					managed.Cancel(exec.RequestID)
+				}
+				return
+			}
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	stop = func() {
+		stopOnce.Do(func() {
+			cancelWatch()
+			<-watchDone
+		})
+	}
+	requested = func() bool {
+		select {
+		case <-canceled:
+			return true
+		default:
+			return false
+		}
+	}
+	watchErr = func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return observedErr
+	}
+	return stop, checkCancellation, requested, watchErr
+}
+
+func (w Worker) cancellationPollInterval() time.Duration {
+	if w.CancellationPollInterval > 0 {
+		return w.CancellationPollInterval
+	}
+	return defaultCancellationPollInterval
 }
 
 func cancelManagedRunnerOnContextDone(
@@ -395,7 +559,7 @@ func (w Worker) toolPermissionPolicy(exec Execution) frameworktool.PermissionPol
 			return decision, w.recordAudit(ctx, exec, AuditEvent{
 				Type:     AuditEventToolDecision,
 				ToolName: name,
-				Decision: auditDecision(decision.Action),
+				Decision: AuditDecision(decision.Action),
 			})
 		}
 		decision := frameworktool.AllowPermission()
@@ -413,16 +577,12 @@ func (w Worker) toolPermissionPolicy(exec Execution) frameworktool.PermissionPol
 		if err := w.recordAudit(ctx, exec, AuditEvent{
 			Type:     AuditEventToolDecision,
 			ToolName: name,
-			Decision: auditDecision(decision.Action),
+			Decision: AuditDecision(decision.Action),
 		}); err != nil {
 			return frameworktool.PermissionDecision{}, err
 		}
 		return decision, nil
 	})
-}
-
-func auditDecision(decision frameworktool.PermissionAction) AuditDecision {
-	return AuditDecision(decision)
 }
 
 func permissionToolName(request *frameworktool.PermissionRequest) string {
@@ -479,13 +639,6 @@ func workerSpanAttributes(exec Execution) []attribute.KeyValue {
 	return attrs
 }
 
-func validateRunExecution(exec Execution) error {
-	if exec.Tenant.UserID == "" {
-		return errors.New("user_id is required for runner")
-	}
-	return nil
-}
-
 func (w Worker) handleRunnerEvent(ctx context.Context, exec Execution, evt *event.Event) error {
 	sinkCtx, cancel := context.WithTimeout(ctx, w.eventSinkTimeout())
 	defer cancel()
@@ -504,24 +657,54 @@ func (w Worker) eventSinkTimeout() time.Duration {
 	return defaultEventSinkTimeout
 }
 
-func runnerMessage(message gateway.Message) (model.Message, error) {
-	if err := message.Validate(); err != nil {
-		return model.Message{}, err
-	}
+func (w Worker) runnerMessage(ctx context.Context, exec Execution) (model.Message, error) {
+	message := exec.Message
 	result := model.NewUserMessage(message.Text)
-	for _, ref := range message.ArtifactRefs {
+	if len(message.ArtifactRefs) == 0 {
+		return result, nil
+	}
+	if w.Artifacts == nil {
+		return model.Message{}, errors.New("artifact resolver is required for inbound artifacts")
+	}
+	service, err := w.Artifacts.ResolveArtifact(ctx, exec)
+	if err != nil {
+		return model.Message{}, fmt.Errorf("resolve inbound artifact service: %w", err)
+	}
+	if service == nil {
+		return model.Message{}, errors.New("inbound artifact service is required")
+	}
+	for index, ref := range message.ArtifactRefs {
+		_, version, err := parsePinnedArtifactRef(ref)
+		if err != nil {
+			return model.Message{}, fmt.Errorf("artifact ref %d: %w", index, err)
+		}
+		contentRef := &model.ContentRef{ArtifactRef: ref, ArtifactVersion: version}
 		result.ContentParts = append(result.ContentParts, model.ContentPart{
-			Type: model.ContentTypeFile,
-			ContentRef: &model.ContentRef{
-				ArtifactRef: ref,
-			},
+			Type:       model.ContentTypeFile,
+			ContentRef: contentRef,
 		})
 	}
 	return result, nil
 }
 
-func runnerAppName(tc tenant.RuntimeContext) (string, error) {
-	return tc.Scope().Key("runner")
+func parsePinnedArtifactRef(ref string) (string, int, error) {
+	if !strings.HasPrefix(ref, "artifact://") {
+		return "", 0, errors.New("artifact ref must use artifact://")
+	}
+	rest := strings.TrimPrefix(ref, "artifact://")
+	separator := strings.LastIndex(rest, "@")
+	if separator <= 0 || separator == len(rest)-1 {
+		return "", 0, errors.New("artifact ref must pin a version")
+	}
+	name := rest[:separator]
+	if strings.ContainsAny(name, "@\x00\r\n") || strings.Contains(name, "..") {
+		return "", 0, errors.New("artifact ref name is invalid")
+	}
+	version, err := strconv.Atoi(rest[separator+1:])
+	if err != nil || version < 0 {
+		return "", 0, errors.New("artifact ref version is invalid")
+	}
+	return name, version, nil
 }
 
 func runnerRuntimeState(exec Execution) map[string]any {

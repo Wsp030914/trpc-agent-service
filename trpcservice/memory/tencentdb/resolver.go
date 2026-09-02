@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkmemory "trpc.group/trpc-go/trpc-agent-go/memory/tencentdb"
@@ -17,12 +17,6 @@ import (
 )
 
 const providerName = "tencentdb"
-
-// SecretProvider resolves a credential after tenant application scope is
-// established. It must not log resolved values.
-type SecretProvider interface {
-	ResolveSecret(context.Context, tenant.Scope, tenant.SecretRef) (string, error)
-}
 
 // GatewayResolver resolves an operator-controlled TencentDB Agent Memory
 // gateway by logical backend name. It must not consume tenant-provided URLs.
@@ -33,7 +27,7 @@ type GatewayResolver interface {
 // Resolver creates and owns TencentDB Agent Memory services selected by
 // immutable application configuration versions.
 type Resolver struct {
-	secrets  SecretProvider
+	secrets  platformsecret.SecretProvider
 	gateways GatewayResolver
 
 	mu       sync.Mutex
@@ -42,7 +36,7 @@ type Resolver struct {
 }
 
 // NewResolver creates a TencentDB Agent Memory resolver.
-func NewResolver(secrets SecretProvider, gateways GatewayResolver) (*Resolver, error) {
+func NewResolver(secrets platformsecret.SecretProvider, gateways GatewayResolver) (*Resolver, error) {
 	if secrets == nil {
 		return nil, errors.New("secret provider is required")
 	}
@@ -95,12 +89,6 @@ func (r *Resolver) ResolveSessionIngestor(
 		return nil, err
 	}
 	scope := exec.Tenant.Scope()
-	if err := exec.Storage.Memory.Validate(scope, storage.CapabilityMemory, ref); err != nil {
-		return nil, fmt.Errorf("memory storage handle: %w", err)
-	}
-	if err := scope.Validate(); err != nil {
-		return nil, err
-	}
 	if exec.Tenant.UserID == "" {
 		return nil, errors.New("memory user_id is required")
 	}

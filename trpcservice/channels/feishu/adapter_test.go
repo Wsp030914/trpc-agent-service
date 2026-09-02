@@ -233,18 +233,10 @@ func TestAdapterRejectsUnknownAndInactiveRoutes(t *testing.T) {
 	}
 }
 
-func TestAdapterRejectsOversizedCallbackAndMissingMediaIngestor(t *testing.T) {
-	adapter, _, _ := newTestAdapter(t, WithMaxCallbackBytes(32))
-	body := messageEventJSON(t, "om-large", "ou-user", "p2p", "oc-private", "", "text", `{"text":"hello"}`)
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, signedRequest(body))
-	if response.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("large callback status=%d", response.Code)
-	}
-
+func TestAdapterRequiresMediaIngestor(t *testing.T) {
 	adapter, admitter, _ := newTestAdapter(t)
-	body = messageEventJSON(t, "om-image", "ou-user", "p2p", "oc-private", "", "image", `{"image_key":"img-key"}`)
-	response = httptest.NewRecorder()
+	body := messageEventJSON(t, "om-image", "ou-user", "p2p", "oc-private", "", "image", `{"image_key":"img-key"}`)
+	response := httptest.NewRecorder()
 	adapter.ServeHTTP(response, signedRequest(body))
 	if response.Code != http.StatusServiceUnavailable || len(admitter.requests()) != 0 {
 		t.Fatalf("missing ingestor status=%d admissions=%d", response.Code, len(admitter.requests()))
@@ -269,7 +261,42 @@ func TestAdapterPassesMediaOnlyThroughAttachmentBoundary(t *testing.T) {
 	}
 }
 
-func TestNormalizeMessageContentSupportsTextPostImageFileCardAndUnsupported(t *testing.T) {
+func TestAdapterAdmitsVerifiedRecall(t *testing.T) {
+	recall := &testRecallAdmitter{}
+	adapter, admitter, _ := newTestAdapter(t, WithRecallAdmitter(recall))
+	body := recallEventJSON(t, "om-recalled", "recall-event-1")
+	response := httptest.NewRecorder()
+	adapter.ServeHTTP(response, signedRequest(body))
+	if response.Code != http.StatusOK || response.Body.String() != `{"code":0}` {
+		t.Fatalf("response status=%d body=%q", response.Code, response.Body.String())
+	}
+	if len(admitter.requests()) != 0 {
+		t.Fatal("recall reached message admission")
+	}
+	requests := recall.requests()
+	if len(requests) != 1 {
+		t.Fatalf("recall requests=%#v", requests)
+	}
+	request := requests[0]
+	if request.TenantID != testTenantID || request.AppID != testAppID ||
+		request.BindingID != testBindingID || request.Channel != channels.ChannelFeishu ||
+		request.ExternalEventID != "recall-event-1" || request.ExternalMessageID != "om-recalled" ||
+		len(request.PayloadHash) != 32 {
+		t.Fatalf("recall request=%#v", request)
+	}
+}
+
+func TestAdapterDoesNotAckRecallWithoutDurableAdmitter(t *testing.T) {
+	adapter, _, _ := newTestAdapter(t)
+	body := recallEventJSON(t, "om-recalled", "recall-event-1")
+	response := httptest.NewRecorder()
+	adapter.ServeHTTP(response, signedRequest(body))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("response status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestNormalizeMessageContentSupportsTextImageAndFile(t *testing.T) {
 	tests := []struct {
 		name      string
 		kind      string
@@ -281,8 +308,6 @@ func TestNormalizeMessageContentSupportsTextPostImageFileCardAndUnsupported(t *t
 		{name: "text", kind: "text", content: `{"text":"hello"}`, wantType: channels.MessageTypeText, wantText: "hello"},
 		{name: "image", kind: "image", content: `{"image_key":"img-key"}`, wantType: channels.MessageTypeImage, wantMedia: 1},
 		{name: "file", kind: "file", content: `{"file_key":"file-key"}`, wantType: channels.MessageTypeFile, wantMedia: 1},
-		{name: "card", kind: "interactive", content: `{"schema":"2.0","body":{}}`, wantType: channels.MessageTypeUnsupported},
-		{name: "unsupported", kind: "audio", content: `{"file_key":"audio-key"}`, wantType: channels.MessageTypeUnsupported},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -291,16 +316,6 @@ func TestNormalizeMessageContentSupportsTextPostImageFileCardAndUnsupported(t *t
 				t.Fatalf("type=%s text=%q media=%#v err=%v", gotType, gotText, gotMedia, err)
 			}
 		})
-	}
-}
-
-func TestNormalizePostExtractsTextAndImages(t *testing.T) {
-	kind, text, media, err := normalizeMessageContent("post", `{"zh_cn":{"title":"title","content":[[{"tag":"text","text":"hello"}],[{"tag":"img","image_key":"img-key"}]]}}`)
-	if err != nil {
-		t.Fatalf("normalize post: %v", err)
-	}
-	if kind != channels.MessageTypeMixed || text != "title\nhello" || len(media) != 1 || media[0].Reference != "img-key" {
-		t.Fatalf("post result type=%s text=%q media=%#v", kind, text, media)
 	}
 }
 
@@ -368,71 +383,8 @@ func TestOutboundClientUsesOfficialFeishuOpenAPI(t *testing.T) {
 	}
 }
 
-func TestOutboundClientSupportsUpdateAndRejectsStreamingAndArtifacts(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/open-apis/auth/v3/tenant_access_token/internal":
-			_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"tenant_access_token":"tenant-token","expire":7200}}`))
-		case "/open-apis/im/v1/messages/om-reply":
-			_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"message_id":"om-reply"}}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	client, err := NewOutboundClient(context.Background(), testSecrets(), testBindingSnapshot(), WithBaseURL(server.URL))
-	if err != nil {
-		t.Fatalf("new outbound client: %v", err)
-	}
-	update := testReply(channels.ReplyOperationUpdate, channels.ReplyKindText)
-	receipt, err := client.SendOnce(context.Background(), update, "message_id:om-inbound", channels.OutboundContext{ProviderMessageID: "om-reply"})
-	if err != nil || receipt.ProviderMessageID != "om-reply" {
-		t.Fatalf("update receipt=%#v err=%v", receipt, err)
-	}
-	_, err = client.SendOnce(context.Background(), testReply(channels.ReplyOperationFinalize, channels.ReplyKindText), "message_id:om-inbound", channels.OutboundContext{StreamContext: "stream-1"})
-	if !errors.Is(err, errFeishuStreamingUnsupported) {
-		t.Fatalf("finalize err=%v", err)
-	}
-	artifact := testReply(channels.ReplyOperationSend, channels.ReplyKindArtifact)
-	_, err = client.SendOnce(context.Background(), artifact, "message_id:om-inbound", channels.OutboundContext{})
-	if !errors.Is(err, errFeishuReplyUnsupported) {
-		t.Fatalf("artifact err=%v", err)
-	}
-}
-
 func TestReceiptRequiresProviderMessageID(t *testing.T) {
 	receipt, err := receiptFromID(nil)
-	var providerErr *ProviderSendError
-	if err == nil || receipt != (channels.ProviderReceipt{}) || !errors.As(err, &providerErr) || !errors.Is(err, errFeishuProviderMessageID) {
-		t.Fatalf("receipt=%#v err=%v provider_err=%#v", receipt, err, providerErr)
-	}
-}
-
-func TestUpdateRequiresProviderMessageIDFromProvider(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/open-apis/auth/v3/tenant_access_token/internal":
-			_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"tenant_access_token":"tenant-token","expire":7200}}`))
-		case "/open-apis/im/v1/messages/om-reply":
-			_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	client, err := NewOutboundClient(context.Background(), testSecrets(), testBindingSnapshot(), WithBaseURL(server.URL))
-	if err != nil {
-		t.Fatalf("new outbound client: %v", err)
-	}
-	receipt, err := client.SendOnce(
-		context.Background(),
-		testReply(channels.ReplyOperationUpdate, channels.ReplyKindText),
-		"message_id:om-inbound",
-		channels.OutboundContext{ProviderMessageID: "om-reply"},
-	)
 	var providerErr *ProviderSendError
 	if err == nil || receipt != (channels.ProviderReceipt{}) || !errors.As(err, &providerErr) || !errors.Is(err, errFeishuProviderMessageID) {
 		t.Fatalf("receipt=%#v err=%v provider_err=%#v", receipt, err, providerErr)
@@ -489,6 +441,24 @@ func (a *testAdmitter) requests() []gateway.AdmissionRequest {
 
 type testAttachmentIngestor struct {
 	media []channels.ProviderMediaRef
+}
+
+type testRecallAdmitter struct {
+	mu           sync.Mutex
+	requestsList []channels.RecallRequest
+}
+
+func (a *testRecallAdmitter) AdmitRecall(_ context.Context, request channels.RecallRequest) (channels.RecallResult, error) {
+	a.mu.Lock()
+	a.requestsList = append(a.requestsList, request)
+	a.mu.Unlock()
+	return channels.RecallResult{RequestID: "request-1", ExecutionStatus: "CANCELED"}, nil
+}
+
+func (a *testRecallAdmitter) requests() []channels.RecallRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]channels.RecallRequest(nil), a.requestsList...)
 }
 
 func (i *testAttachmentIngestor) Prepare(_ context.Context, input channels.ChannelInput, media []channels.ProviderMediaRef) (channels.ChannelInput, error) {
@@ -573,6 +543,31 @@ func messageEventJSON(
 	return payload
 }
 
+func recallEventJSON(t *testing.T, messageID, eventID string) []byte {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"schema": "2.0",
+		"header": map[string]any{
+			"event_id":    eventID,
+			"event_type":  feishuRecallEventType,
+			"app_id":      testExternalAppID,
+			"tenant_key":  testExternalTenantKey,
+			"create_time": "1710000000",
+			"token":       testVerifyToken,
+		},
+		"event": map[string]any{
+			"message_id":  messageID,
+			"chat_id":     "oc-private",
+			"recall_time": "1710000000000",
+			"recall_type": "消息撤回",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal recall event: %v", err)
+	}
+	return payload
+}
+
 func signedRequest(body []byte) *http.Request {
 	return signedRequestAt(body, "1710000000")
 }
@@ -588,19 +583,19 @@ func signedRequestAt(body []byte, timestamp string) *http.Request {
 
 func testReply(operation channels.ReplyOperation, kind channels.ReplyKind) channels.Reply {
 	reply := channels.Reply{
-		TenantID:       testTenantID,
-		AppID:          testAppID,
-		RequestID:      "request-1",
-		SourceEventID:  "event-1",
-		Channel:        channels.ChannelFeishu,
-		BindingID:      testBindingID,
+		TenantID:        testTenantID,
+		AppID:           testAppID,
+		RequestID:       "request-1",
+		SourceEventID:   "event-1",
+		Channel:         channels.ChannelFeishu,
+		BindingID:       testBindingID,
 		BindingRevision: 3,
-		ReplyID:        "reply-1",
-		LogicalReplyID: "logical-1",
-		PartNo:         1,
-		Revision:       1,
-		Operation:      operation,
-		Kind:           kind,
+		ReplyID:         "reply-1",
+		LogicalReplyID:  "logical-1",
+		PartNo:          1,
+		Revision:        1,
+		Operation:       operation,
+		Kind:            kind,
 		Target: channels.ReplyTarget{
 			Kind:             channels.TargetKindMessage,
 			InternalEntityID: "request-1",

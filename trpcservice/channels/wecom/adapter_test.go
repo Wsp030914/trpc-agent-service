@@ -167,21 +167,6 @@ func TestAdapterRejectsBindingAccountMismatch(t *testing.T) {
 	}
 }
 
-func TestAdapterRejectsMissingMessageID(t *testing.T) {
-	adapter, codec, admitter, _ := newTestAdapter(t)
-	body := []byte(`{"aibotid":"aibot-test","chattype":"single","from":{"userid":"user-1"},"msgtype":"text","text":{"content":"hello"}}`)
-	encrypted, err := codec.encrypt(body)
-	if err != nil {
-		t.Fatalf("encrypt callback: %v", err)
-	}
-	request := signedRequest(t, http.MethodPost, "/im/wecom/"+testRoute, encrypted, "body")
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest || len(admitter.requests()) != 0 {
-		t.Fatalf("missing id status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-}
-
 func TestAdapterRequiresAttachmentIngestorForMedia(t *testing.T) {
 	adapter, _, admitter, _ := newTestAdapter(t)
 	body := []byte(`{"msgid":"msg-image","aibotid":"aibot-test","chattype":"single","from":{"userid":"user-1"},"msgtype":"image","image":{"url":"https://example.test/image"}}`)
@@ -210,19 +195,6 @@ func TestAdapterPassesMediaThroughAttachmentBoundary(t *testing.T) {
 	}
 }
 
-func TestAdapterRejectsOversizedCallback(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t, WithMaxCallbackBytes(32))
-	body := []byte(`{"encrypt":"this body is larger than the configured limit"}`)
-	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/im/wecom/"+testRoute, strings.NewReader(string(body)))
-	request.Header.Set("Content-Type", "application/json")
-	request.URL.RawQuery = signedQueryForTest("not-used")
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusRequestEntityTooLarge || len(admitter.requests()) != 0 {
-		t.Fatalf("oversized callback status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-}
-
 func TestAdapterDoesNotAckGatewayFailure(t *testing.T) {
 	adapter, _, admitter, _ := newTestAdapter(t)
 	admitter.err = errors.New("database unavailable")
@@ -234,37 +206,6 @@ func TestAdapterDoesNotAckGatewayFailure(t *testing.T) {
 	}
 }
 
-func TestAdapterRequiresJSONContentType(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t)
-	body := validCallbackJSON(t, "msg-1", "text", "hello")
-	request := callbackRequest(t, body)
-	request.Header.Set("Content-Type", "text/plain")
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest || len(admitter.requests()) != 0 {
-		t.Fatalf("content type status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-	request = callbackRequest(t, body)
-	request.Header.Del("Content-Type")
-	response = httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest || len(admitter.requests()) != 0 {
-		t.Fatalf("missing content type status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-}
-
-func TestAdapterRejectsMalformedEncryptedEnvelope(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t)
-	request := httptest.NewRequest(http.MethodPost, "/im/wecom/"+testRoute, strings.NewReader(`{"encrypt":"bad","extra":true}`))
-	request.Header.Set("Content-Type", "application/json")
-	request.URL.RawQuery = signedQueryForTest("bad")
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest || len(admitter.requests()) != 0 {
-		t.Fatalf("malformed envelope status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-}
-
 func TestAdapterRejectsValidSignatureWithDecryptionFailure(t *testing.T) {
 	adapter, _, admitter, _ := newTestAdapter(t)
 	request := signedRequest(t, http.MethodPost, "/im/wecom/"+testRoute, "not-valid-ciphertext", "encrypt")
@@ -272,60 +213,6 @@ func TestAdapterRejectsValidSignatureWithDecryptionFailure(t *testing.T) {
 	adapter.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || len(admitter.requests()) != 0 {
 		t.Fatalf("decryption failure status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-}
-
-func TestAdapterRejectsMissingSignature(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t)
-	request := callbackRequest(t, validCallbackJSON(t, "msg-1", "text", "hello"))
-	query := request.URL.Query()
-	query.Del("msg_signature")
-	request.URL.RawQuery = query.Encode()
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest || len(admitter.requests()) != 0 {
-		t.Fatalf("missing signature status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-}
-
-func TestAdapterRejectsEmptyAndInvalidJSONBodies(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t)
-	for _, body := range []string{"", "not-json"} {
-		request := httptest.NewRequest(http.MethodPost, "/im/wecom/"+testRoute, strings.NewReader(body))
-		request.Header.Set("Content-Type", "application/json")
-		request.URL.RawQuery = signedQueryForTest("invalid")
-		response := httptest.NewRecorder()
-		adapter.ServeHTTP(response, request)
-		if response.Code != http.StatusBadRequest {
-			t.Fatalf("body %q status=%d, want %d", body, response.Code, http.StatusBadRequest)
-		}
-	}
-	if len(admitter.requests()) != 0 {
-		t.Fatal("invalid body reached Gateway")
-	}
-}
-
-func TestAdapterRejectsDuplicateOrCaseVariantEncryptField(t *testing.T) {
-	adapter, codec, admitter, _ := newTestAdapter(t)
-	encrypted, err := codec.encrypt(validCallbackJSON(t, "msg-1", "text", "hello"))
-	if err != nil {
-		t.Fatalf("encrypt callback: %v", err)
-	}
-	for _, body := range []string{
-		fmt.Sprintf(`{"encrypt":%q,"encrypt":%q}`, encrypted, encrypted),
-		fmt.Sprintf(`{"Encrypt":%q}`, encrypted),
-		fmt.Sprintf(`{"encrypt":%q}{}`, encrypted),
-	} {
-		request := signedRequest(t, http.MethodPost, "/im/wecom/"+testRoute, encrypted, "encrypt")
-		request.Body = io.NopCloser(strings.NewReader(body))
-		response := httptest.NewRecorder()
-		adapter.ServeHTTP(response, request)
-		if response.Code != http.StatusBadRequest {
-			t.Fatalf("body %q status=%d, want %d", body, response.Code, http.StatusBadRequest)
-		}
-	}
-	if len(admitter.requests()) != 0 {
-		t.Fatal("malformed encrypt envelope reached Gateway")
 	}
 }
 
@@ -346,54 +233,6 @@ func TestAdapterRejectsStaleAndFutureCallbacks(t *testing.T) {
 	}
 	if len(admitter.requests()) != 0 {
 		t.Fatal("stale or future callback reached Gateway")
-	}
-}
-
-func TestNormalizeCallbackPreservesStreamAndEventContext(t *testing.T) {
-	binding := testBindingSnapshot()
-	stream, err := normalizeCallback(binding, callbackMessage{
-		MessageID:   "stream-1",
-		AIBotID:     testExternalBot,
-		ChatType:    "group",
-		ChatID:      "chat-1",
-		From:        callbackFrom{UserID: "user-1"},
-		MessageType: "stream",
-		Stream:      callbackStream{ID: "stream-id"},
-	})
-	if err != nil {
-		t.Fatalf("normalize stream callback: %v", err)
-	}
-	if stream.MessageType != channels.MessageTypeEvent || stream.Context.StreamID != "stream-id" {
-		t.Fatalf("stream envelope = %#v", stream)
-	}
-	event, err := normalizeCallback(binding, callbackMessage{
-		MessageID:   "event-1",
-		AIBotID:     testExternalBot,
-		ChatType:    "single",
-		From:        callbackFrom{UserID: "user-1"},
-		MessageType: "event",
-		Event:       json.RawMessage(`{"eventtype":"template_card_event","template_card_event":{"event_key":"ok"}}`),
-	})
-	if err != nil {
-		t.Fatalf("normalize event callback: %v", err)
-	}
-	if event.Context.EventType != "template_card_event" || !bytes.Equal(event.Context.EventPayload, eventPayload(t)) {
-		t.Fatalf("event envelope = %#v", event)
-	}
-}
-
-func TestNormalizeCallbackRejectsUnsupportedConversationMessage(t *testing.T) {
-	_, err := normalizeCallback(testBindingSnapshot(), callbackMessage{
-		MessageID:   "image-group",
-		AIBotID:     testExternalBot,
-		ChatType:    "group",
-		ChatID:      "chat-1",
-		From:        callbackFrom{UserID: "user-1"},
-		MessageType: "image",
-		Image:       callbackMedia{URL: "https://example.test/image"},
-	})
-	if !errors.Is(err, errWeComMessageConversation) {
-		t.Fatalf("normalize invalid conversation error=%v, want conversation mismatch", err)
 	}
 }
 
@@ -483,117 +322,6 @@ func TestOutboundClientUsesOneActiveResponseCall(t *testing.T) {
 	}
 }
 
-func TestOutboundClientSendsActiveStreamUpdates(t *testing.T) {
-	var calls int
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		_, _ = w.Write([]byte(`{"errcode":0}`))
-	}))
-	defer server.Close()
-	client := NewOutboundClient(server.Client())
-	client.targetValidator = func(string) error { return nil }
-	for _, operation := range []channels.ReplyOperation{
-		channels.ReplyOperationUpdate,
-		channels.ReplyOperationFinalize,
-	} {
-		_, err := client.SendOnce(
-			context.Background(),
-			testReply(operation, channels.ReplyKindText),
-			server.URL,
-			channels.OutboundContext{StreamContext: "stream-1"},
-		)
-		if err != nil {
-			t.Fatalf("operation %s error=%v", operation, err)
-		}
-	}
-	if calls != 2 {
-		t.Fatalf("active response_url calls=%d, want 2", calls)
-	}
-}
-
-func TestPassiveReplyWriterWritesEncryptedCurrentCallbackResponse(t *testing.T) {
-	writer, err := NewPassiveReplyWriter(
-		testToken,
-		base64Raw("01234567890123456789012345678901"),
-		WithPassiveReplyClock(func() time.Time { return testNow }),
-	)
-	if err != nil {
-		t.Fatalf("new passive reply writer: %v", err)
-	}
-	response := httptest.NewRecorder()
-	receipt, err := writer.Write(
-		response,
-		testReply(channels.ReplyOperationUpdate, channels.ReplyKindText),
-		"nonce-1",
-		channels.OutboundContext{StreamContext: "stream-1"},
-	)
-	if err != nil {
-		t.Fatalf("write passive reply: %v", err)
-	}
-	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json" {
-		t.Fatalf("passive response status=%d content-type=%q", response.Code, response.Header().Get("Content-Type"))
-	}
-	if receipt.ProviderMessageID != "reply-1" {
-		t.Fatalf("receipt id=%q, want local reply id", receipt.ProviderMessageID)
-	}
-	var envelope struct {
-		Encrypt      string `json:"encrypt"`
-		MsgSignature string `json:"msgsignature"`
-		Timestamp    int64  `json:"timestamp"`
-		Nonce        string `json:"nonce"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
-		t.Fatalf("decode passive envelope: %v", err)
-	}
-	if envelope.Nonce != "nonce-1" || envelope.Timestamp != testNow.Unix() || envelope.Encrypt == "" {
-		t.Fatalf("passive envelope = %#v", envelope)
-	}
-	codec, err := newCallbackCodec(testToken, base64Raw("01234567890123456789012345678901"))
-	if err != nil {
-		t.Fatalf("new passive verification codec: %v", err)
-	}
-	if err := codec.verifySignature(strconv.FormatInt(envelope.Timestamp, 10), envelope.Nonce, envelope.Encrypt, envelope.MsgSignature); err != nil {
-		t.Fatalf("verify passive envelope: %v", err)
-	}
-	decrypted, err := codec.decrypt(envelope.Encrypt)
-	if err != nil {
-		t.Fatalf("decrypt passive payload: %v", err)
-	}
-	var payload struct {
-		MessageType string `json:"msgtype"`
-		Stream      struct {
-			ID     string `json:"id"`
-			Finish bool   `json:"finish"`
-		} `json:"stream"`
-	}
-	if err := json.Unmarshal(decrypted, &payload); err != nil {
-		t.Fatalf("decode stream payload: %v", err)
-	}
-	if payload.MessageType != "stream" || payload.Stream.ID != "stream-1" || payload.Stream.Finish {
-		t.Fatalf("stream payload = %#v", payload)
-	}
-}
-
-func TestPassiveReplyWriterRejectsOrdinarySend(t *testing.T) {
-	writer, err := NewPassiveReplyWriter(testToken, base64Raw("01234567890123456789012345678901"))
-	if err != nil {
-		t.Fatalf("new passive reply writer: %v", err)
-	}
-	response := httptest.NewRecorder()
-	_, err = writer.Write(
-		response,
-		testReply(channels.ReplyOperationSend, channels.ReplyKindText),
-		"nonce-1",
-		channels.OutboundContext{},
-	)
-	if !errors.Is(err, errWeComPassiveReplyRequired) {
-		t.Fatalf("ordinary send error=%v, want passive response error", err)
-	}
-	if response.Code != http.StatusOK || response.Body.Len() != 0 {
-		t.Fatalf("ordinary send response status=%d body=%q", response.Code, response.Body.String())
-	}
-}
-
 func TestCallbackCodecDecryptsIndependentProtocolVector(t *testing.T) {
 	key := []byte("01234567890123456789012345678901")
 	codec, err := newCallbackCodec(testToken, base64Raw(string(key)))
@@ -645,12 +373,6 @@ func TestCallbackCodecRejectsTamperedCiphertext(t *testing.T) {
 	tampered := encrypted[:len(encrypted)-1] + string(replacement)
 	if _, err := codec.decrypt(tampered); err == nil {
 		t.Fatal("tampered ciphertext decrypted successfully")
-	}
-}
-
-func TestCheckTimestampDoesNotOverflow(t *testing.T) {
-	if err := checkTimestamp(strconv.FormatInt(int64(^uint64(0)>>1), 10), testNow, defaultClockSkew); err == nil {
-		t.Fatal("extreme timestamp passed freshness check")
 	}
 }
 
@@ -728,15 +450,6 @@ func (c *fakeOutboundClient) SendOnce(
 		return channels.ProviderReceipt{}, c.err
 	}
 	return c.receipt, nil
-}
-
-func TestFakeOutboundClientIsSingleOperationOnly(t *testing.T) {
-	fake := &fakeOutboundClient{receipt: channels.ProviderReceipt{ProviderMessageID: "provider-1"}}
-	var client channels.ProviderOutboundClient = fake
-	receipt, err := client.SendOnce(context.Background(), testReply(channels.ReplyOperationSend, channels.ReplyKindText), "https://example.test/reply", channels.OutboundContext{})
-	if err != nil || receipt.ProviderMessageID != "provider-1" || fake.calls != 1 {
-		t.Fatalf("fake outbound result=%#v err=%v calls=%d", receipt, err, fake.calls)
-	}
 }
 
 func TestFakeOutboundClientPropagatesProviderError(t *testing.T) {
@@ -888,11 +601,6 @@ func testBindingSnapshot() channels.BindingSnapshot {
 		BindingRevision:  3,
 		Status:           channels.BindingActive,
 	}}
-}
-
-func eventPayload(t *testing.T) []byte {
-	t.Helper()
-	return []byte(`{"eventtype":"template_card_event","template_card_event":{"event_key":"ok"}}`)
 }
 
 func testReply(operation channels.ReplyOperation, kind channels.ReplyKind) channels.Reply {

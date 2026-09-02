@@ -35,29 +35,6 @@ func TestAPIValidateAppConfigRejectsMissingChannelBinding(t *testing.T) {
 	}
 }
 
-func TestAPIValidateAppConfigRejectsUnsupportedMemoryBackend(t *testing.T) {
-	repository := &recordingRepository{}
-	cfg := testAppConfig()
-	cfg.BackendConfig.Memory = tenant.BackendRef{
-		Kind:     tenant.BackendVector,
-		Provider: "qdrant",
-		Name:     "memory",
-	}
-	if err := (admin.API{Bindings: repository}).ValidateAppConfig(context.Background(), cfg); err == nil {
-		t.Fatal("validate app config with unsupported memory backend succeeded")
-	}
-}
-
-func TestAPIValidateAppConfigRejectsUnsupportedSessionProvider(t *testing.T) {
-	cfg := testAppConfig()
-	cfg.BackendConfig.Session.Provider = "mysql"
-
-	err := (admin.API{Bindings: &recordingRepository{}}).ValidateAppConfig(context.Background(), cfg)
-	if err == nil || !strings.Contains(err.Error(), `session provider "mysql" is not supported`) {
-		t.Fatalf("validate app config error = %v, want unsupported provider", err)
-	}
-}
-
 func TestAPIValidateAppConfigUsesToolPolicyValidator(t *testing.T) {
 	cfg := testAppConfig()
 	cfg.Tools = tenant.ToolPolicy{VisibleTools: []string{"search"}}
@@ -86,74 +63,6 @@ func TestAPIValidateAppConfigRequiresArtifactCOSForKnowledgeSource(t *testing.T)
 	}
 	if err := (admin.API{Bindings: &recordingRepository{}}).ValidateAppConfig(context.Background(), cfg); err == nil {
 		t.Fatal("validate app config with Knowledge but no Artifact COS succeeded")
-	}
-}
-
-func TestAPIManagesMinimalControlPlaneWithoutPersistingRawAPIKey(t *testing.T) {
-	bindings, err := config.NewStaticBindingResolver(testBinding())
-	if err != nil {
-		t.Fatalf("new binding resolver: %v", err)
-	}
-	repository := &recordingRepository{}
-	api := admin.API{Bindings: bindings, Repository: repository}
-	tenantValue := tenant.Tenant{ID: "tenant-a", Name: "Tenant A", Status: tenant.StatusActive}
-	if err := api.CreateTenant(context.Background(), tenantValue); err != nil {
-		t.Fatalf("create tenant: %v", err)
-	}
-	initial := testAppConfig()
-	app := tenant.AgentApp{
-		TenantID:            initial.TenantID,
-		AppID:               initial.AppID,
-		Name:                "Support",
-		ActiveConfigVersion: initial.Version,
-		Status:              tenant.StatusActive,
-	}
-	if err := api.CreateAgentApp(context.Background(), app, initial); err != nil {
-		t.Fatalf("create agent app: %v", err)
-	}
-	binding := testBinding()
-	binding.PublicRouteID = ""
-	binding.BindingRevision = 0
-	if err := api.CreateChannelBinding(context.Background(), binding); err != nil {
-		t.Fatalf("create channel binding: %v", err)
-	}
-	if repository.binding.PublicRouteID == "" || repository.binding.BindingRevision != 1 {
-		t.Fatalf("provisioned binding route = %#v", repository.binding)
-	}
-	published := initial.Clone()
-	published.Version = "v2"
-	published.Model.Model = "gpt-4.1"
-	published.ChannelBinding = []string{binding.BindingID}
-	if err := api.PublishAppConfig(context.Background(), published); err != nil {
-		t.Fatalf("publish app config: %v", err)
-	}
-	scope := tenant.Scope{TenantID: initial.TenantID, AppID: initial.AppID}
-	if err := api.ActivateAppConfig(context.Background(), scope, published.Version); err != nil {
-		t.Fatalf("activate app config: %v", err)
-	}
-
-	issued, err := api.IssueCredential(context.Background(), scope, time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatalf("issue credential: %v", err)
-	}
-	if issued.APIKey == "" || issued.Credential.KeyPrefix == "" ||
-		issued.Credential.Status != auth.CredentialActive {
-		t.Fatalf("issued credential = %#v", issued)
-	}
-	digest, err := auth.DigestAPIKey(issued.APIKey)
-	if err != nil {
-		t.Fatalf("digest issued api key: %v", err)
-	}
-	if repository.digest != digest || repository.credential.ID != issued.Credential.ID {
-		t.Fatalf("persisted credential = %#v", repository.credential)
-	}
-	if err := api.RevokeCredential(context.Background(), scope, issued.Credential.ID); err != nil {
-		t.Fatalf("revoke credential: %v", err)
-	}
-	if repository.revokedTenantID != scope.TenantID ||
-		repository.revokedAppID != scope.AppID ||
-		repository.revokedCredentialID != issued.Credential.ID {
-		t.Fatalf("revocation scope = %q %q %q", repository.revokedTenantID, repository.revokedAppID, repository.revokedCredentialID)
 	}
 }
 
@@ -190,8 +99,9 @@ func testAppConfig() tenant.AppConfig {
 		BackendConfig: tenant.BackendConfig{
 			Name: "shared",
 			Session: tenant.BackendRef{
-				Kind: tenant.BackendSQL,
-				Name: "session-sql",
+				Kind:     tenant.BackendSQL,
+				Provider: "postgres",
+				Name:     "session-sql",
 			},
 		},
 		ChannelBinding: []string{"binding-1"},

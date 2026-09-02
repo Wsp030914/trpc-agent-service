@@ -235,9 +235,10 @@ func testAppConfig(tenantID, appID, version string) tenant.AppConfig {
 		BackendConfig: tenant.BackendConfig{
 			Name: "shared",
 			Session: tenant.BackendRef{
-				Kind:    tenant.BackendSQL,
-				Name:    "session-sql",
-				Options: map[string]string{"schema": "agent"},
+				Kind:     tenant.BackendSQL,
+				Provider: "postgres",
+				Name:     "session-sql",
+				Options:  map[string]string{"schema": "agent"},
 			},
 		},
 	}

@@ -174,8 +174,9 @@ func httpTestAppConfig() tenant.AppConfig {
 		BackendConfig: tenant.BackendConfig{
 			Name: "shared",
 			Session: tenant.BackendRef{
-				Kind: tenant.BackendSQL,
-				Name: "session-sql",
+				Kind:     tenant.BackendSQL,
+				Provider: "postgres",
+				Name:     "session-sql",
 			},
 		},
 	}

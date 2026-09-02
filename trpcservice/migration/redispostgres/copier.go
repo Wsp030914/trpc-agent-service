@@ -11,7 +11,6 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 	platformsession "github.com/liuzengh/trpc-agent-service/trpcservice/session"
 	sessionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/session/postgres"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -31,12 +30,11 @@ type Copier struct {
 func NewCopier(
 	ctx context.Context,
 	configs config.Resolver,
-	stores storage.Resolver,
 	sessions platformsession.Resolver,
 	postgresSessions *sessionpostgres.SessionResolver,
 	record migration.Record,
 ) (*Copier, error) {
-	if configs == nil || stores == nil || sessions == nil || postgresSessions == nil {
+	if configs == nil || sessions == nil || postgresSessions == nil {
 		return nil, errors.New("data migration copier dependencies are required")
 	}
 	if err := record.Validate(); err != nil {
@@ -48,18 +46,20 @@ func NewCopier(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	sourceExec, err := resolveExecution(ctx, configs, stores, record, record.SourceConfigVersion)
+	sourceExec, err := resolveExecution(ctx, configs, record, record.SourceConfigVersion)
 	if err != nil {
 		return nil, fmt.Errorf("resolve data migration source: %w", err)
 	}
-	targetExec, err := resolveExecution(ctx, configs, stores, record, record.TargetConfigVersion)
+	targetExec, err := resolveExecution(ctx, configs, record, record.TargetConfigVersion)
 	if err != nil {
 		return nil, fmt.Errorf("resolve data migration target: %w", err)
 	}
-	if !isRedisSession(sourceExec.Config.BackendConfig.Session) {
+	if sourceExec.Config.BackendConfig.Session.Kind != tenant.BackendRedis ||
+		sourceExec.Config.BackendConfig.Session.Provider != "redis" {
 		return nil, errors.New("data migration source session backend must use redis")
 	}
-	if !isPostgresSession(targetExec.Config.BackendConfig.Session) {
+	if targetExec.Config.BackendConfig.Session.Kind != tenant.BackendSQL ||
+		targetExec.Config.BackendConfig.Session.Provider != "postgres" {
 		return nil, errors.New("data migration target session backend must use postgres")
 	}
 	source, err := sessions.ResolveSession(ctx, sourceExec)
@@ -155,7 +155,6 @@ func (c *Copier) Close() {
 func resolveExecution(
 	ctx context.Context,
 	configs config.Resolver,
-	stores storage.Resolver,
 	record migration.Record,
 	version string,
 ) (worker.Execution, error) {
@@ -172,23 +171,8 @@ func resolveExecution(
 	if err != nil {
 		return worker.Execution{}, err
 	}
-	if err := cfg.Validate(); err != nil {
-		return worker.Execution{}, fmt.Errorf("app config: %w", err)
-	}
 	if cfg.TenantID != record.TenantID || cfg.AppID != record.AppID || cfg.Version != version {
 		return worker.Execution{}, errors.New("resolved app config does not match data migration")
 	}
-	handles, err := stores.Resolve(ctx, runtime, cfg.BackendConfig)
-	if err != nil {
-		return worker.Execution{}, err
-	}
-	return worker.Execution{Tenant: runtime, Config: cfg, Storage: handles}, nil
-}
-
-func isRedisSession(ref tenant.BackendRef) bool {
-	return ref.Kind == tenant.BackendRedis && (ref.Provider == "" || ref.Provider == "redis")
-}
-
-func isPostgresSession(ref tenant.BackendRef) bool {
-	return ref.Kind == tenant.BackendSQL && (ref.Provider == "" || ref.Provider == "postgres")
+	return worker.Execution{Tenant: runtime, Config: cfg}, nil
 }

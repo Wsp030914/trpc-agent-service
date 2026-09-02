@@ -6,10 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -20,32 +21,36 @@ const defaultSessionSchema = "agent"
 
 var postgresIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// SessionDSNResolver resolves the PostgreSQL DSN for a configured session backend.
-type SessionDSNResolver interface {
-	ResolveSessionDSN(context.Context, storage.Handle) (string, error)
-}
-
 // SessionResolver caches framework PostgreSQL session services selected by an
 // immutable application configuration. Session concurrency is owned by the
 // Redis lease at the worker boundary, not by this provider.
 type SessionResolver struct {
-	dsns     SessionDSNResolver
-	mu       sync.Mutex
-	closed   bool
-	services map[string]session.Service
+	secrets    platformsecret.SecretProvider
+	defaultDSN string
+	mu         sync.Mutex
+	closed     bool
+	services   map[string]session.Service
 }
 
-// NewSessionResolver creates a PostgreSQL session resolver.
-func NewSessionResolver(dsns SessionDSNResolver) (*SessionResolver, error) {
-	if dsns == nil {
-		return nil, errors.New("session dsn resolver is required")
+// NewSessionResolver creates a PostgreSQL session resolver backed by a scoped
+// secret provider.
+func NewSessionResolver(secrets platformsecret.SecretProvider, defaultDSNs ...string) (*SessionResolver, error) {
+	if secrets == nil {
+		return nil, errors.New("secret provider is required")
 	}
-	return &SessionResolver{dsns: dsns, services: make(map[string]session.Service)}, nil
+	if len(defaultDSNs) > 1 {
+		return nil, errors.New("only one default postgres dsn is supported")
+	}
+	defaultDSN := ""
+	if len(defaultDSNs) == 1 {
+		defaultDSN = strings.TrimSpace(defaultDSNs[0])
+	}
+	return &SessionResolver{secrets: secrets, defaultDSN: defaultDSN, services: make(map[string]session.Service)}, nil
 }
 
 // ResolveSession returns the configured framework PostgreSQL session service.
 func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execution) (session.Service, error) {
-	if r == nil || r.dsns == nil {
+	if r == nil || r.secrets == nil {
 		return nil, errors.New("postgres session resolver is not initialized")
 	}
 	if ctx == nil {
@@ -54,17 +59,11 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := exec.Tenant.Validate(); err != nil {
-		return nil, err
+	ref := exec.Config.BackendConfig.Session
+	if ref.Kind != tenant.BackendSQL || ref.Provider != "postgres" {
+		return nil, fmt.Errorf("session backend %q must use postgres provider", ref.Name)
 	}
-	handle := exec.Storage.Session
-	if err := handle.Validate(exec.Tenant.Scope(), storage.CapabilitySession, exec.Config.BackendConfig.Session); err != nil {
-		return nil, fmt.Errorf("session storage handle: %w", err)
-	}
-	if handle.Ref.Kind != tenant.BackendSQL || (handle.Ref.Provider != "" && handle.Ref.Provider != "postgres") {
-		return nil, fmt.Errorf("session backend %q must use postgres provider", handle.Ref.Name)
-	}
-	schema, err := sessionSchema(handle.Ref)
+	schema, err := sessionSchema(ref)
 	if err != nil {
 		return nil, err
 	}
@@ -80,12 +79,9 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	if value := r.services[key]; value != nil {
 		return value, nil
 	}
-	dsn, err := r.dsns.ResolveSessionDSN(ctx, handle)
+	dsn, err := r.resolveSessionDSN(ctx, exec)
 	if err != nil {
-		return nil, fmt.Errorf("resolve session dsn: %w", err)
-	}
-	if dsn == "" {
-		return nil, errors.New("session dsn is required")
+		return nil, err
 	}
 	if err := ensureSchema(ctx, dsn, schema); err != nil {
 		return nil, err
@@ -96,6 +92,23 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	}
 	r.services[key] = service
 	return service, nil
+}
+
+func (r *SessionResolver) resolveSessionDSN(ctx context.Context, exec worker.Execution) (string, error) {
+	ref := exec.Config.BackendConfig.Session
+	dsn := r.defaultDSN
+	if ref.SecretRef != (tenant.SecretRef{}) {
+		var err error
+		dsn, err = r.secrets.ResolveSecret(ctx, exec.Tenant.Scope(), ref.SecretRef)
+		if err != nil {
+			return "", fmt.Errorf("resolve session dsn: %w", err)
+		}
+	}
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" {
+		return "", errors.New("session dsn is required")
+	}
+	return dsn, nil
 }
 
 func ensureSchema(ctx context.Context, dsn, schema string) (err error) {
@@ -147,15 +160,14 @@ func sessionSchema(ref tenant.BackendRef) (string, error) {
 	return schema, nil
 }
 func (r *SessionResolver) sessionCacheKey(exec worker.Execution) (string, error) {
-	schema, err := sessionSchema(exec.Storage.Session.Ref)
+	ref := exec.Config.BackendConfig.Session
+	schema, err := sessionSchema(ref)
 	if err != nil {
 		return "", err
 	}
-	parts := []string{exec.Tenant.ConfigVersion, exec.Config.BackendConfig.Name, exec.Storage.Session.Ref.Name, schema}
-	if ref := exec.Storage.Session.Ref.SecretRef; ref != (tenant.SecretRef{}) {
-		parts = append(parts, ref.Name, ref.Version)
-	} else if ref := exec.Storage.Session.Ref.DSNRef; ref != "" {
-		parts = append(parts, ref)
+	parts := []string{exec.Tenant.ConfigVersion, exec.Config.BackendConfig.Name, ref.Name, schema}
+	if secretRef := ref.SecretRef; secretRef != (tenant.SecretRef{}) {
+		parts = append(parts, secretRef.Name, secretRef.Version)
 	}
 	return exec.Tenant.Scope().Key("session-service", parts...)
 }

@@ -132,25 +132,6 @@ func ValidatePublicRouteID(publicRouteID string) error {
 	return nil
 }
 
-// ValidateGeneratedPublicRouteID checks the format emitted by
-// NewPublicRouteID. Provisioning code uses this stricter check when a caller
-// supplies a route explicitly; route lookup intentionally accepts any
-// transport-safe opaque value so migrated records remain readable.
-func ValidateGeneratedPublicRouteID(publicRouteID string) error {
-	if err := ValidatePublicRouteID(publicRouteID); err != nil {
-		return err
-	}
-	encoded, ok := strings.CutPrefix(publicRouteID, publicRoutePrefix)
-	if !ok || len(encoded) != base64.RawURLEncoding.EncodedLen(publicRouteEntropyBytes) {
-		return errors.New("public_route_id is not a generated route")
-	}
-	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil || len(decoded) != publicRouteEntropyBytes {
-		return errors.New("public_route_id is not a generated route")
-	}
-	return nil
-}
-
 // Scope returns the tenant application scope that owns the binding.
 func (b Binding) Scope() tenant.Scope {
 	return tenant.Scope{TenantID: b.TenantID, AppID: b.AppID}
@@ -185,9 +166,9 @@ func (b Binding) Validate() error {
 	if err := b.SigningSecretRef.Validate(); err != nil {
 		return fmt.Errorf("signing_secret_ref: %w", err)
 	}
-	if !secretRefZero(b.Secret) {
+	if b.Channel == ChannelFeishu || !secretRefZero(b.Secret) {
 		if err := b.Secret.Validate(); err != nil {
-			return fmt.Errorf("secret_ref: %w", err)
+			return fmt.Errorf("outbound secret_ref: %w", err)
 		}
 	}
 	if err := ValidatePublicRouteID(b.PublicRouteID); err != nil {
@@ -232,16 +213,6 @@ type Conversation struct {
 	// ThreadKeyHash. It is distinct from ProviderTargetEnvelope.KeyVersion.
 	KeyVersion             string
 	ProviderTargetEnvelope TargetEnvelope
-}
-
-// Membership records a user's role in one IM conversation.
-type Membership struct {
-	TenantID       string
-	AppID          string
-	ConversationID string
-	UserID         string
-	Role           string
-	Status         string
 }
 
 func validChannel(channel Channel) bool {

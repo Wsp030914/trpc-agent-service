@@ -38,50 +38,17 @@ const (
 
 // Record identifies one Tenant/App migration between immutable config versions.
 type Record struct {
-	ID                  string     `json:"migration_id"`
-	TenantID            string     `json:"tenant_id"`
-	AppID               string     `json:"app_id"`
-	SourceConfigVersion string     `json:"source_config_version"`
-	TargetConfigVersion string     `json:"target_config_version"`
-	Status              Status     `json:"status"`
-	LeaseOwner          string     `json:"lease_owner,omitempty"`
-	LeaseUntil          time.Time  `json:"lease_until,omitempty"`
-	RunToken            string     `json:"run_token,omitempty"`
-	DrainDeadline       time.Time  `json:"drain_deadline,omitempty"`
-	Progress            Progress   `json:"progress"`
-	Validation          Validation `json:"validation_result"`
-	FailureReason       string     `json:"failure_reason,omitempty"`
-}
-
-// Progress records durable per-session copy and verification progress.
-type Progress struct {
-	SessionCount    int `json:"session_count"`
-	SessionsCopied  int `json:"sessions_copied"`
-	SessionsChecked int `json:"sessions_checked"`
-}
-
-// Validate checks that Progress is internally consistent.
-func (p Progress) Validate() error {
-	if p.SessionCount < 0 || p.SessionsCopied < 0 || p.SessionsChecked < 0 {
-		return errors.New("data migration progress must not be negative")
-	}
-	if p.SessionsCopied > p.SessionCount || p.SessionsChecked > p.SessionCount {
-		return errors.New("data migration progress exceeds session count")
-	}
-	return nil
-}
-
-// Validation records the successful data validation boundary.
-type Validation struct {
-	SessionsVerified int `json:"sessions_verified"`
-}
-
-// Validate checks that Validation is internally consistent.
-func (v Validation) Validate() error {
-	if v.SessionsVerified < 0 {
-		return errors.New("data migration validation must not be negative")
-	}
-	return nil
+	ID                  string    `json:"migration_id"`
+	TenantID            string    `json:"tenant_id"`
+	AppID               string    `json:"app_id"`
+	SourceConfigVersion string    `json:"source_config_version"`
+	TargetConfigVersion string    `json:"target_config_version"`
+	Status              Status    `json:"status"`
+	LeaseOwner          string    `json:"lease_owner,omitempty"`
+	LeaseUntil          time.Time `json:"lease_until,omitempty"`
+	RunToken            string    `json:"run_token,omitempty"`
+	DrainDeadline       time.Time `json:"drain_deadline,omitempty"`
+	FailureReason       string    `json:"failure_reason,omitempty"`
 }
 
 // Validate checks the persisted identity and lifecycle fields of Record.
@@ -97,12 +64,6 @@ func (r Record) Validate() error {
 	}
 	if !validStatus(r.Status) {
 		return errors.New("data migration status is invalid")
-	}
-	if err := r.Progress.Validate(); err != nil {
-		return err
-	}
-	if err := r.Validation.Validate(); err != nil {
-		return err
 	}
 	if r.LeaseOwner == "" && (!r.LeaseUntil.IsZero() || r.RunToken != "") {
 		return errors.New("data migration lease owner is required")

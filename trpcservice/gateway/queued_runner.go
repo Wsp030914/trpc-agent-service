@@ -3,8 +3,8 @@ package gateway
 import (
 	"context"
 	"errors"
-	"fmt"
 	"reflect"
+	"slices"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
@@ -137,12 +137,9 @@ func (r *QueuedRunner) Run(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	request, ok := AuthenticatedRequestFromContext(ctx)
+	_, ok := AuthenticatedRequestFromContext(ctx)
 	if !ok {
 		return nil, errors.New("authenticated request is required")
-	}
-	if err := request.Validate(); err != nil {
-		return nil, err
 	}
 	if err := validateQueuedRunOptions(runOpts); err != nil {
 		return nil, err
@@ -152,7 +149,8 @@ func (r *QueuedRunner) Run(
 		return nil, err
 	}
 	admitted, ok := ctx.Value(admittedRequestContextKey{}).(admittedRequest)
-	if !ok || admitted.message.Text != command.Text || len(admitted.message.ArtifactRefs) != len(command.ArtifactRefs) {
+	if !ok || admitted.message.Text != command.Text ||
+		!slices.Equal(admitted.message.ArtifactRefs, command.ArtifactRefs) {
 		ctx, err = r.Admit(ctx, command)
 		if err != nil {
 			return nil, err
@@ -181,9 +179,6 @@ func (r *QueuedRunner) Admit(ctx context.Context, message Message) (context.Cont
 	if !ok {
 		return nil, errors.New("authenticated request is required")
 	}
-	if err := request.Validate(); err != nil {
-		return nil, err
-	}
 	identityResolver, ok := request.Tenant.(AdmissionIdentityResolver)
 	if !ok {
 		return nil, ErrAdmissionIdentityRequired
@@ -191,9 +186,6 @@ func (r *QueuedRunner) Admit(ctx context.Context, message Message) (context.Cont
 	identity, err := identityResolver.ResolveAdmissionIdentity(ctx)
 	if err != nil {
 		return nil, err
-	}
-	if err := identity.Validate(); err != nil {
-		return nil, fmt.Errorf("admission identity: %w", err)
 	}
 	result, err := r.gateway.Handle(ctx, Request{
 		RequestID: request.RequestID, IdempotencyKey: request.IdempotencyKey,

@@ -9,15 +9,6 @@ import (
 	"strings"
 )
 
-var (
-	// ErrKnowledgeGenerationPending reports that a target Knowledge generation
-	// has not indexed every source document required before activation.
-	ErrKnowledgeGenerationPending = errors.New("knowledge generation rebuild is pending")
-	// ErrKnowledgeGenerationFailed reports that a target Knowledge generation
-	// needs an explicit rebuild before activation can continue.
-	ErrKnowledgeGenerationFailed = errors.New("knowledge generation rebuild failed")
-)
-
 // Status is the lifecycle state of a tenant or agent application.
 type Status string
 
@@ -167,6 +158,23 @@ type ModelConfig struct {
 	Parameters map[string]string `json:"parameters"`
 }
 
+// ModelProviderOpenAI is the only model provider constructed by the
+// production runtime.
+const ModelProviderOpenAI = "openai"
+
+// ValidateModelProvider checks that a configured provider is executable by
+// the deployed runtime.
+func ValidateModelProvider(provider string) error {
+	switch strings.TrimSpace(provider) {
+	case ModelProviderOpenAI:
+		return nil
+	case "":
+		return errors.New("model provider is required")
+	default:
+		return fmt.Errorf("unsupported model provider %q", provider)
+	}
+}
+
 // Clone returns a deep copy of the model config.
 func (c ModelConfig) Clone() ModelConfig {
 	cloned := c
@@ -177,8 +185,8 @@ func (c ModelConfig) Clone() ModelConfig {
 // Validate checks model provider and model name fields. Parameters may be nil.
 // The API key reference is required.
 func (c ModelConfig) Validate() error {
-	if c.Provider == "" {
-		return errors.New("model provider is required")
+	if err := ValidateModelProvider(c.Provider); err != nil {
+		return err
 	}
 	if c.Model == "" {
 		return errors.New("model is required")
@@ -249,15 +257,11 @@ const (
 // BackendRef references one concrete backend without exposing its secret.
 type BackendRef struct {
 	Kind     BackendKind `json:"kind"`
-	Provider string      `json:"provider,omitempty"`
+	Provider string      `json:"provider"`
 	Name     string      `json:"name"`
 	// SecretRef identifies credentials owned by the tenant application scope.
-	// It replaces DSNRef for new configuration versions.
-	SecretRef SecretRef `json:"secret_ref,omitempty"`
-	// DSNRef is retained only to read configuration versions published before
-	// phase two. New configuration versions must use SecretRef.
-	DSNRef  string            `json:"dsn_ref,omitempty"`
-	Options map[string]string `json:"options"`
+	SecretRef SecretRef         `json:"secret_ref,omitempty"`
+	Options   map[string]string `json:"options"`
 }
 
 // Clone returns a deep copy of the backend reference.
@@ -270,7 +274,7 @@ func (r BackendRef) Clone() BackendRef {
 // IsZero reports whether the backend reference is not configured.
 func (r BackendRef) IsZero() bool {
 	return r.Kind == "" && r.Provider == "" && r.Name == "" &&
-		r.SecretRef == (SecretRef{}) && r.DSNRef == "" && len(r.Options) == 0
+		r.SecretRef == (SecretRef{}) && len(r.Options) == 0
 }
 
 // Validate checks that the backend reference can be resolved later.
@@ -279,6 +283,9 @@ func (r BackendRef) Validate() error {
 	if !validBackendKind(r.Kind) {
 		return errors.New("backend kind is invalid")
 	}
+	if r.Provider == "" {
+		return errors.New("backend provider is required")
+	}
 	if r.Name == "" {
 		return errors.New("backend name is required")
 	}
@@ -286,9 +293,6 @@ func (r BackendRef) Validate() error {
 		if err := r.SecretRef.Validate(); err != nil {
 			return fmt.Errorf("backend secret_ref: %w", err)
 		}
-	}
-	if r.SecretRef != (SecretRef{}) && r.DSNRef != "" {
-		return errors.New("backend secret_ref and dsn_ref cannot both be set")
 	}
 	if err := validateStringMap(r.Options, "backend option"); err != nil {
 		return err

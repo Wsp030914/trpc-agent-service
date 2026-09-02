@@ -10,7 +10,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
 
-func TestExecutorPersistsSessionCopyAndVerificationProgress(t *testing.T) {
+func TestExecutorCopiesAndVerifiesSessions(t *testing.T) {
 	t.Parallel()
 	record := migration.Record{
 		ID:                  "migration-1",
@@ -44,16 +44,6 @@ func TestExecutorPersistsSessionCopyAndVerificationProgress(t *testing.T) {
 		repository.transitions[2] != migration.StatusSucceeded {
 		t.Fatalf("transitions=%v, want COPYING VERIFYING SUCCEEDED", repository.transitions)
 	}
-	if len(repository.reports) != 3 {
-		t.Fatalf("reports=%d, want 3", len(repository.reports))
-	}
-	last := repository.reports[len(repository.reports)-1]
-	if last.progress != (migration.Progress{SessionCount: 1, SessionsCopied: 1, SessionsChecked: 1}) {
-		t.Fatalf("last progress=%+v", last.progress)
-	}
-	if last.validation != (migration.Validation{SessionsVerified: 1}) {
-		t.Fatalf("last validation=%+v", last.validation)
-	}
 }
 
 func TestExecutorFailsWhenDrainDeadlineExpires(t *testing.T) {
@@ -85,8 +75,8 @@ func TestExecutorFailsWhenDrainDeadlineExpires(t *testing.T) {
 		repository.transitions[1] != migration.StatusFailed {
 		t.Fatalf("transitions=%v, want COPYING FAILED", repository.transitions)
 	}
-	if len(repository.reports) != 1 || repository.reports[0].failure == "" {
-		t.Fatalf("failure reports=%#v, want one failure", repository.reports)
+	if repository.failureReason == "" {
+		t.Fatalf("failure reason is empty")
 	}
 }
 
@@ -103,39 +93,23 @@ func (c testSessionCatalog) ListDataMigrationSessionKeys(
 }
 
 type testMigrationRepository struct {
-	transitions []migration.Status
-	reports     []testMigrationReport
-	advanceErr  error
-}
-
-type testMigrationReport struct {
-	progress   migration.Progress
-	validation migration.Validation
-	failure    string
+	transitions   []migration.Status
+	advanceErr    error
+	failureReason string
 }
 
 func (r *testMigrationRepository) AdvanceDataMigration(
 	_ context.Context,
-	_ migration.Record,
+	record migration.Record,
 	next migration.Status,
 ) error {
 	r.transitions = append(r.transitions, next)
 	if next == migration.StatusCopying && r.advanceErr != nil {
 		return r.advanceErr
 	}
-	return nil
-}
-
-func (r *testMigrationRepository) UpdateDataMigrationReport(
-	_ context.Context,
-	_ migration.Record,
-	progress migration.Progress,
-	validation migration.Validation,
-	failure string,
-) error {
-	r.reports = append(r.reports, testMigrationReport{
-		progress: progress, validation: validation, failure: failure,
-	})
+	if next == migration.StatusFailed {
+		r.failureReason = record.FailureReason
+	}
 	return nil
 }
 

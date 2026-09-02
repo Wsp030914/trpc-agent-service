@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkmemory "trpc.group/trpc-go/trpc-agent-go/memory/tencentdb"
@@ -110,7 +109,6 @@ func testExecution(userID string) worker.Execution {
 			Version: "v1",
 		},
 	}
-	scope := tenant.Scope{TenantID: "tenant-a", AppID: "app-a"}
 	return worker.Execution{
 		Tenant: tenant.RuntimeContext{
 			TenantID:           "tenant-a",
@@ -120,11 +118,6 @@ func testExecution(userID string) worker.Execution {
 			UserID:             userID,
 		},
 		Config: tenant.AppConfig{BackendConfig: tenant.BackendConfig{Memory: memory}},
-		Storage: storage.Handles{Memory: storage.Handle{
-			Scope:      scope,
-			Capability: storage.CapabilityMemory,
-			Ref:        memory,
-		}},
 	}
 }
 

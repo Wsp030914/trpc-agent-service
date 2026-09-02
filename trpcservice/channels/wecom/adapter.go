@@ -3,12 +3,10 @@ package wecom
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"net/url"
 	"slices"
@@ -19,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/internal/callbackhttp"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -32,10 +31,6 @@ const (
 )
 
 var (
-	errInvalidWeComPath             = errors.New("invalid wecom callback path")
-	errCallbackBodyRequired         = errors.New("wecom callback body is required")
-	errCallbackBodyTooLarge         = errors.New("wecom callback body is too large")
-	errCallbackContentType          = errors.New("wecom callback content type is invalid")
 	errCallbackQuery                = errors.New("wecom callback query is invalid")
 	errCallbackTimestamp            = errors.New("wecom callback timestamp is invalid")
 	errCallbackMessage              = errors.New("wecom callback message is invalid")
@@ -95,15 +90,6 @@ func WithAttachmentIngestor(ingestor channels.AttachmentIngestor) AdapterOption 
 	}
 }
 
-// WithRecallAdmitter registers the durable recall boundary. Authenticated
-// recall events are rejected for retry when no admitter is configured.
-func WithRecallAdmitter(admitter channels.RecallAdmitter) AdapterOption {
-	return func(adapter *Adapter) error {
-		adapter.recallAdmitter = admitter
-		return nil
-	}
-}
-
 // Adapter verifies Enterprise WeChat AI Bot callbacks and submits normalized
 // channel inputs to the tenant-aware Gateway. It does not call Runner or own
 // reply outbox delivery.
@@ -112,7 +98,6 @@ type Adapter struct {
 	admissionGateway   *gateway.Gateway
 	secrets            platformsecret.SecretProvider
 	attachmentIngestor channels.AttachmentIngestor
-	recallAdmitter     channels.RecallAdmitter
 	maxCallbackBytes   int64
 	clockSkew          time.Duration
 	now                func() time.Time
@@ -160,7 +145,7 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a == nil || w == nil || r == nil {
 		return
 	}
-	routeKey, err := callbackRouteKey(r)
+	routeKey, err := callbackhttp.RouteKey(r, channels.ChannelWeCom)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -172,7 +157,7 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		routeKey,
 	)
 	if err != nil {
-		writeRouteError(w, r, err)
+		callbackhttp.WriteRouteError(w, r, err)
 		return
 	}
 	switch r.Method {
@@ -264,7 +249,7 @@ func (e VerifiedProviderEnvelope) Validate() error {
 	if e.MessageType == channels.MessageTypeMixed && e.Text == "" && len(e.Media) == 0 {
 		return errCallbackMessage
 	}
-	if !validUTF8(e.Text) {
+	if !utf8.ValidString(e.Text) {
 		return errCallbackMessage
 	}
 	for _, media := range e.Media {
@@ -304,25 +289,25 @@ func (a *Adapter) handleURLVerification(w http.ResponseWriter, r *http.Request, 
 	}
 	echostr, err := oneValue(r.URL.Query(), "echostr")
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	query, err := signedQuery(r, echostr)
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	if err := checkTimestamp(query.timestamp, a.now(), a.clockSkew); err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	if err := codec.verifySignature(query.timestamp, query.nonce, query.encrypted, query.signature); err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	message, err := codec.decrypt(query.encrypted)
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -332,28 +317,33 @@ func (a *Adapter) handleURLVerification(w http.ResponseWriter, r *http.Request, 
 
 func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route gateway.LocatedChannelBinding) {
 	if r.Body == nil {
-		writeProtocolError(w, r, errCallbackBodyRequired)
+		callbackhttp.WriteProtocolError(w, callbackhttp.ErrBodyRequired)
 		return
 	}
 	defer func() {
 		_ = r.Body.Close()
 	}()
-	if err := validateJSONContentType(r); err != nil {
-		writeProtocolError(w, r, err)
+	if err := callbackhttp.ValidateJSONContentType(r); err != nil {
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
-	encrypted, err := readEncryptedCallback(w, r, a.maxCallbackBytes)
+	body, err := callbackhttp.ReadBody(w, r, a.maxCallbackBytes)
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
+		return
+	}
+	encrypted, err := decodeEncryptedCallback(body)
+	if err != nil {
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	query, err := signedQuery(r, encrypted)
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	if err := checkTimestamp(query.timestamp, a.now(), a.clockSkew); err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	binding := route.Snapshot()
@@ -363,38 +353,22 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 		return
 	}
 	if err := codec.verifySignature(query.timestamp, query.nonce, encrypted, query.signature); err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	decrypted, err := codec.decrypt(encrypted)
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	var callback callbackMessage
 	if err := json.Unmarshal(decrypted, &callback); err != nil {
-		writeProtocolError(w, r, fmt.Errorf("%w: json", errCallbackMessage))
-		return
-	}
-	if recall, ok, err := normalizeRecallCallback(binding, callback, decrypted); ok {
-		if err != nil {
-			writeProtocolError(w, r, err)
-			return
-		}
-		if a.recallAdmitter == nil {
-			http.Error(w, "recall processing unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		if _, err := a.recallAdmitter.AdmitRecall(r.Context(), recall); err != nil {
-			writeAdmissionError(w, r, err)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
+		callbackhttp.WriteProtocolError(w, fmt.Errorf("%w: json", errCallbackMessage))
 		return
 	}
 	envelope, err := normalizeCallback(binding, callback)
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	input, err := a.channelInput(r.Context(), envelope)
@@ -403,7 +377,7 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 			http.Error(w, "attachment processing unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	requestID := uuid.NewString()
@@ -427,7 +401,7 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 		ChannelInput:   &input,
 	})
 	if err != nil {
-		writeAdmissionError(w, r, err)
+		callbackhttp.WriteAdmissionError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -494,18 +468,6 @@ func (a *Adapter) channelInput(ctx context.Context, envelope VerifiedProviderEnv
 	return input, nil
 }
 
-func callbackRouteKey(r *http.Request) (string, error) {
-	if r == nil || r.URL == nil {
-		return "", errInvalidWeComPath
-	}
-	path := strings.TrimSuffix(r.URL.Path, "/")
-	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
-	if len(parts) != 3 || parts[0] != "im" || parts[1] != string(channels.ChannelWeCom) || parts[2] == "" {
-		return "", errInvalidWeComPath
-	}
-	return parts[2], nil
-}
-
 type signedCallbackQuery struct {
 	signature string
 	timestamp string
@@ -558,36 +520,6 @@ func checkTimestamp(value string, now time.Time, skew time.Duration) error {
 		return errCallbackTimestamp
 	}
 	return nil
-}
-
-func validateJSONContentType(r *http.Request) error {
-	value := strings.TrimSpace(r.Header.Get("Content-Type"))
-	if value == "" {
-		return errCallbackContentType
-	}
-	mediaType, _, err := mime.ParseMediaType(value)
-	if err != nil || mediaType != "application/json" {
-		return errCallbackContentType
-	}
-	return nil
-}
-
-func readEncryptedCallback(w http.ResponseWriter, r *http.Request, maxBytes int64) (string, error) {
-	if maxBytes <= 0 {
-		return "", errCallbackBodyTooLarge
-	}
-	limited := http.MaxBytesReader(w, r.Body, maxBytes)
-	body, err := io.ReadAll(limited)
-	if err != nil {
-		if strings.Contains(err.Error(), "request body too large") {
-			return "", errCallbackBodyTooLarge
-		}
-		return "", errCallbackBodyRequired
-	}
-	if len(body) == 0 {
-		return "", errCallbackBodyRequired
-	}
-	return decodeEncryptedCallback(body)
 }
 
 func decodeEncryptedCallback(body []byte) (string, error) {
@@ -855,93 +787,6 @@ func normalizeEvent(raw json.RawMessage) (string, []byte, error) {
 	return eventType, slices.Clone(raw), nil
 }
 
-func normalizeRecallCallback(
-	binding channels.BindingSnapshot,
-	callback callbackMessage,
-	decrypted []byte,
-) (channels.RecallRequest, bool, error) {
-	if callback.MessageType != "event" {
-		return channels.RecallRequest{}, false, nil
-	}
-	eventType, raw, err := normalizeEvent(callback.Event)
-	if err != nil {
-		return channels.RecallRequest{}, true, err
-	}
-	if !strings.Contains(strings.ToLower(eventType), "recall") {
-		return channels.RecallRequest{}, false, nil
-	}
-	if callback.AIBotID == "" || callback.AIBotID != binding.ExternalAccount {
-		return channels.RecallRequest{}, true, errWeComBindingAccountMismatch
-	}
-	messageID, err := recallMessageID(callback.MessageID, raw)
-	if err != nil {
-		return channels.RecallRequest{}, true, err
-	}
-	eventID := recallEventID(raw, messageID)
-	digest := sha256.Sum256(decrypted)
-	request := channels.RecallRequest{
-		TenantID:          binding.TenantID,
-		AppID:             binding.AppID,
-		BindingID:         binding.BindingID,
-		Channel:           channels.ChannelWeCom,
-		ExternalEventID:   eventID,
-		ExternalMessageID: messageID,
-		PayloadHash:       digest[:],
-	}
-	if err := request.Validate(); err != nil {
-		return channels.RecallRequest{}, true, err
-	}
-	return request, true, nil
-}
-
-func recallMessageID(callbackMessageID string, raw json.RawMessage) (string, error) {
-	var payload struct {
-		MessageID         string `json:"message_id"`
-		RecallMessageID   string `json:"recall_msgid"`
-		ProviderMessageID string `json:"msgid"`
-		Recall            *struct {
-			MessageID string `json:"message_id"`
-			MsgID     string `json:"msgid"`
-		} `json:"recall"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return "", errCallbackMessage
-	}
-	for _, candidate := range []string{
-		payload.RecallMessageID,
-		payload.MessageID,
-		payload.ProviderMessageID,
-		callbackMessageID,
-	} {
-		if normalized, err := channels.NormalizeExternalID(candidate); err == nil {
-			return normalized, nil
-		}
-	}
-	if payload.Recall != nil {
-		for _, candidate := range []string{payload.Recall.MessageID, payload.Recall.MsgID} {
-			if normalized, err := channels.NormalizeExternalID(candidate); err == nil {
-				return normalized, nil
-			}
-		}
-	}
-	return "", errWeComMessageIDRequired
-}
-
-func recallEventID(raw json.RawMessage, messageID string) string {
-	var payload struct {
-		EventID string `json:"event_id"`
-		ID      string `json:"eventid"`
-	}
-	if err := json.Unmarshal(raw, &payload); err == nil {
-		for _, candidate := range []string{payload.EventID, payload.ID} {
-			if normalized, err := channels.NormalizeExternalID(candidate); err == nil {
-				return normalized
-			}
-		}
-	}
-	return "recall:" + messageID
-}
-
 func validateResponseURL(value string) error {
 	if value == "" || len(value) > maxProviderURLLength {
 		return errWeComResponseTargetInvalid
@@ -962,38 +807,4 @@ func validateMediaURL(value string) error {
 		return errWeComResponseTargetInvalid
 	}
 	return nil
-}
-
-func validUTF8(value string) bool {
-	return utf8.ValidString(value)
-}
-
-func writeRouteError(w http.ResponseWriter, r *http.Request, err error) {
-	switch {
-	case errors.Is(err, channels.ErrBindingNotFound), errors.Is(err, channels.ErrBindingChannelMismatch):
-		http.NotFound(w, r)
-	case errors.Is(err, channels.ErrBindingInactive):
-		http.Error(w, "callback binding is inactive", http.StatusForbidden)
-	default:
-		http.Error(w, "callback route unavailable", http.StatusServiceUnavailable)
-	}
-}
-
-func writeProtocolError(w http.ResponseWriter, _ *http.Request, err error) {
-	if errors.Is(err, errCallbackBodyTooLarge) {
-		http.Error(w, "callback body is too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	http.Error(w, "invalid callback", http.StatusBadRequest)
-}
-
-func writeAdmissionError(w http.ResponseWriter, _ *http.Request, err error) {
-	switch {
-	case errors.Is(err, gateway.ErrIdempotencyConflict):
-		http.Error(w, "callback idempotency conflict", http.StatusConflict)
-	case errors.Is(err, channels.ErrBindingInactive), errors.Is(err, gateway.ErrChannelBindingSnapshotStale):
-		http.Error(w, "callback binding changed", http.StatusServiceUnavailable)
-	default:
-		http.Error(w, "callback admission unavailable", http.StatusServiceUnavailable)
-	}
 }

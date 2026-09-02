@@ -12,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	sessionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/session/postgres"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -49,7 +48,7 @@ func TestSessionResolverPersistsDistinctCredentialSessions(t *testing.T) {
 		}
 	})
 
-	resolver, err := sessionpostgres.NewSessionResolver(staticSessionDSN(*sessionPostgresTestDSN))
+	resolver, err := sessionpostgres.NewSessionResolver(staticSessionSecret(*sessionPostgresTestDSN))
 	if err != nil {
 		t.Fatalf("new session resolver: %v", err)
 	}
@@ -78,7 +77,7 @@ func TestSessionResolverPersistsDistinctCredentialSessions(t *testing.T) {
 		t.Fatalf("close first session resolver: %v", err)
 	}
 
-	resolver, err = sessionpostgres.NewSessionResolver(staticSessionDSN(*sessionPostgresTestDSN))
+	resolver, err = sessionpostgres.NewSessionResolver(staticSessionSecret(*sessionPostgresTestDSN))
 	if err != nil {
 		t.Fatalf("new second session resolver: %v", err)
 	}
@@ -145,8 +144,10 @@ func sessionTestExecution(t *testing.T, principal, schema string) worker.Executi
 	backend := tenant.BackendConfig{
 		Name: "session-postgres",
 		Session: tenant.BackendRef{
-			Kind: tenant.BackendSQL,
-			Name: "session-postgres",
+			Kind:      tenant.BackendSQL,
+			Provider:  "postgres",
+			Name:      "session-postgres",
+			SecretRef: tenant.SecretRef{Name: "session-postgres-dsn", Version: "1"},
 			Options: map[string]string{
 				"schema": schema,
 			},
@@ -161,10 +162,6 @@ func sessionTestExecution(t *testing.T, principal, schema string) worker.Executi
 		UserID:             principal,
 		TraceID:            "trace-session",
 	}
-	handles, err := (storage.StaticResolver{}).Resolve(context.Background(), runtimeContext, backend)
-	if err != nil {
-		t.Fatalf("resolve session storage: %v", err)
-	}
 	return worker.Execution{
 		TenantSource: gateway.TenantSourceAuthenticatedClaims,
 		Tenant:       runtimeContext,
@@ -174,13 +171,12 @@ func sessionTestExecution(t *testing.T, principal, schema string) worker.Executi
 			Version:       runtimeContext.ConfigVersion,
 			BackendConfig: backend,
 		},
-		Storage: handles,
 	}
 }
 
-type staticSessionDSN string
+type staticSessionSecret string
 
-func (r staticSessionDSN) ResolveSessionDSN(context.Context, storage.Handle) (string, error) {
+func (r staticSessionSecret) ResolveSecret(context.Context, tenant.Scope, tenant.SecretRef) (string, error) {
 	return string(r), nil
 }
 

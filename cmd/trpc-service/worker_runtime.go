@@ -28,12 +28,14 @@ import (
 	platformsession "github.com/liuzengh/trpc-agent-service/trpcservice/session"
 	sessionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/session/postgres"
 	sessionredis "github.com/liuzengh/trpc-agent-service/trpcservice/session/redis"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/chunking"
 	frameworkdocument "trpc.group/trpc-go/trpc-agent-go/knowledge/document"
+	frameworkknowledgetool "trpc.group/trpc-go/trpc-agent-go/knowledge/tool"
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
+	frameworktodo "trpc.group/trpc-go/trpc-agent-go/tool/todo"
 )
 
 type workerRuntime struct {
@@ -57,13 +59,18 @@ type artifactCleanupExecutor interface {
 
 type workerRuntimeDependencies struct {
 	store             *postgres.Store
-	defaultSessionDSN string
-	defaultRedisURL   string
 	redisClient       *platformredis.Client
 	stream            *platformredis.Stream
 	owner             string
 	getenv            func(string) string
+	defaultSessionDSN string
+	defaultRedisURL   string
 }
+
+const (
+	defaultReplyRateLimit       = 5
+	defaultReplyRateLimitWindow = time.Second
+)
 
 func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	if deps.store == nil || deps.redisClient == nil || deps.stream == nil || deps.owner == "" {
@@ -76,22 +83,16 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	}
 	models, err := platformruntime.NewOpenAIModelResolver(
 		apiKeys,
-		platformruntime.WithModelEndpointPolicy(defaultEndpointPolicy{}),
+		defaultEndpointPolicy{},
 	)
 	if err != nil {
 		return nil, err
 	}
-	sessions, err := sessionpostgres.NewSessionResolver(sessionDSNResolver{
-		defaultDSN: deps.defaultSessionDSN,
-		secrets:    secrets,
-	})
+	sessions, err := sessionpostgres.NewSessionResolver(secrets, deps.defaultSessionDSN)
 	if err != nil {
 		return nil, err
 	}
-	redisSessions, err := sessionredis.NewSessionResolver(sessionURLResolver{
-		defaultURL: deps.defaultRedisURL,
-		secrets:    secrets,
-	})
+	redisSessions, err := sessionredis.NewSessionResolver(secrets, deps.defaultRedisURL)
 	if err != nil {
 		return nil, joinCloseError(err, sessions.Close)
 	}
@@ -139,7 +140,7 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		platformruntime.WithSessionIngestorResolver(memories),
 		platformruntime.WithArtifactResolver(artifactServices),
 		platformruntime.WithKnowledgeResolver(knowledge),
-		platformruntime.WithRuntimeToolResolver(noToolsResolver{}),
+		platformruntime.WithRuntimeToolResolver(runtimeToolResolver{knowledge: knowledge}),
 	)
 	if err != nil {
 		return nil, joinCloseError(err, knowledge.Close, knowledgeSources.Close, artifacts.Close, memories.Close, sessionRouter.Close)
@@ -160,10 +161,22 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	if err != nil {
 		return nil, joinCloseError(err, runners.Close, knowledge.Close, knowledgeSources.Close, artifacts.Close, memories.Close, sessionRouter.Close)
 	}
+	replyLimiter, err := platformredis.NewReplyRateLimiter(
+		deps.redisClient,
+		defaultReplyRateLimit,
+		defaultReplyRateLimitWindow,
+	)
+	if err != nil {
+		return nil, joinCloseError(err, runners.Close, knowledge.Close, knowledgeSources.Close, artifacts.Close, memories.Close, sessionRouter.Close)
+	}
 	replySender, err := worker.NewReplySender(
 		deps.store,
 		deps.store,
-		runtimeReplyProviderResolver{store: deps.store, secrets: secrets},
+		runtimeReplyProviderResolver{
+			store:   deps.store,
+			secrets: secrets,
+			limiter: replyLimiter,
+		},
 		worker.ReplySenderOptions{Owner: deps.owner},
 	)
 	if err != nil {
@@ -171,11 +184,12 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	}
 	executor := worker.New(
 		deps.store,
-		storage.StaticResolver{},
 		worker.WithRunner(runners),
+		worker.WithInputArtifactResolver(artifactServices),
 		worker.WithSessionLocker(locker),
 		worker.WithEventSink(events),
 		worker.WithAuditSink(audit),
+		worker.WithCancellationController(deps.store),
 	)
 	consumer, err := worker.NewConsumer(executor, deps.stream, deps.store, deps.owner)
 	if err != nil {
@@ -216,6 +230,7 @@ func (runtimeReplyCapabilityResolver) ResolveReplyCapability(
 type runtimeReplyProviderResolver struct {
 	store   *postgres.Store
 	secrets secret.SecretProvider
+	limiter worker.ReplyRateLimiter
 }
 
 func (r runtimeReplyProviderResolver) ResolveReplyProvider(
@@ -243,37 +258,106 @@ func (r runtimeReplyProviderResolver) ResolveReplyProvider(
 	switch binding.Channel {
 	case channels.ChannelWeCom:
 		client := wecom.NewOutboundClient(nil)
-		return worker.ReplyProvider{Capability: client.Capability(), Client: client}, nil
+		return worker.ReplyProvider{Capability: client.Capability(), Client: client, Limiter: r.limiter}, nil
 	case channels.ChannelFeishu:
 		client, err := feishu.NewOutboundClient(ctx, r.secrets, binding.Snapshot())
 		if err != nil {
 			return worker.ReplyProvider{}, err
 		}
-		return worker.ReplyProvider{Capability: client.Capability(), Client: client}, nil
+		return worker.ReplyProvider{Capability: client.Capability(), Client: client, Limiter: r.limiter}, nil
 	default:
 		return worker.ReplyProvider{}, fmt.Errorf("unsupported reply channel %q", binding.Channel)
 	}
 }
 
-type noToolsResolver struct{}
+// runtimeToolResolver is the production tool catalog. Tenant policy selects
+// names from this catalog; execution authorization remains enforced by the
+// worker immediately before each call.
+type runtimeToolResolver struct {
+	knowledge *knowledgeqdrant.Resolver
+}
 
-func (noToolsResolver) ResolveTools(ctx context.Context, exec worker.Execution) ([]frameworktool.Tool, error) {
+func (r runtimeToolResolver) ResolveTools(ctx context.Context, exec worker.Execution) ([]frameworktool.Tool, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 	}
-	if len(exec.Config.Tools.VisibleTools) > 0 || len(exec.Config.Tools.ExecutableTools) > 0 {
-		return nil, errors.New("configured tools are not supported by this runtime")
+	if err := r.ValidateToolPolicy(ctx, exec.Config.Tools); err != nil {
+		return nil, err
 	}
-	return nil, nil
+	names := runtimeToolNames(exec.Config.Tools)
+	tools := make([]frameworktool.Tool, 0, len(names))
+	var knowledgeService frameworkknowledge.Knowledge
+	for _, name := range names {
+		switch name {
+		case frameworktodo.DefaultToolName:
+			tools = append(tools, frameworktodo.New())
+		case "search", "knowledge_search":
+			if exec.Config.BackendConfig.Knowledge.IsZero() {
+				return nil, fmt.Errorf("runtime tool %q requires a knowledge backend", name)
+			}
+			if r.knowledge == nil {
+				return nil, errors.New("knowledge resolver is required for knowledge search tool")
+			}
+			if knowledgeService == nil {
+				var err error
+				knowledgeService, err = r.knowledge.ResolveKnowledge(ctx, exec)
+				if err != nil {
+					return nil, fmt.Errorf("resolve knowledge for tool: %w", err)
+				}
+			}
+			if knowledgeService == nil {
+				return nil, errors.New("configured knowledge service is required for knowledge search tool")
+			}
+			tools = append(tools, frameworkknowledgetool.NewKnowledgeSearchTool(
+				knowledgeService,
+				frameworkknowledgetool.WithToolName(name),
+			))
+		default:
+			return nil, fmt.Errorf("unsupported runtime tool %q", name)
+		}
+	}
+	return tools, nil
 }
 
-func (noToolsResolver) ValidateToolPolicy(_ context.Context, policy tenant.ToolPolicy) error {
-	if len(policy.VisibleTools) > 0 || len(policy.ExecutableTools) > 0 {
-		return errors.New("configured tools are not supported by this runtime")
+func (runtimeToolResolver) ValidateToolPolicy(_ context.Context, policy tenant.ToolPolicy) error {
+	if err := policy.Validate(); err != nil {
+		return err
+	}
+	for _, name := range runtimeToolNames(policy) {
+		if name != frameworktodo.DefaultToolName && name != "search" && name != "knowledge_search" {
+			return fmt.Errorf("unsupported runtime tool %q", name)
+		}
 	}
 	return nil
+}
+
+func (r runtimeToolResolver) ValidateAppConfigTools(ctx context.Context, cfg tenant.AppConfig) error {
+	if err := r.ValidateToolPolicy(ctx, cfg.Tools); err != nil {
+		return err
+	}
+	for _, name := range runtimeToolNames(cfg.Tools) {
+		if (name == "search" || name == "knowledge_search") && cfg.BackendConfig.Knowledge.IsZero() {
+			return fmt.Errorf("runtime tool %q requires a knowledge backend", name)
+		}
+	}
+	return nil
+}
+
+func runtimeToolNames(policy tenant.ToolPolicy) []string {
+	seen := make(map[string]struct{}, len(policy.VisibleTools)+len(policy.ExecutableTools))
+	names := make([]string, 0, len(policy.VisibleTools)+len(policy.ExecutableTools))
+	for _, values := range [][]string{policy.VisibleTools, policy.ExecutableTools} {
+		for _, name := range values {
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func joinCloseError(base error, closers ...func() error) error {
@@ -294,7 +378,7 @@ func (r *workerRuntime) close() error {
 }
 
 func (r *workerRuntime) runDataMigrations(ctx context.Context) error {
-	if r == nil || r.store == nil || r.sessions == nil || r.postgresSessions == nil || r.artifactServices == nil || r.knowledgeSources == nil || r.knowledge == nil || r.owner == "" {
+	if r == nil || r.store == nil || r.sessions == nil || r.postgresSessions == nil || r.owner == "" {
 		return errors.New("data migration worker runtime is not initialized")
 	}
 	if ctx == nil {
@@ -352,7 +436,6 @@ func (r *workerRuntime) runDataMigration(ctx context.Context, record migration.R
 	copier, err := migrationredispostgres.NewCopier(
 		runCtx,
 		r.store,
-		storage.StaticResolver{},
 		r.sessions,
 		r.postgresSessions,
 		record,
@@ -404,14 +487,7 @@ func (r *workerRuntime) renewDataMigrationLease(
 }
 
 func (r *workerRuntime) failDataMigration(ctx context.Context, record migration.Record, cause error) error {
-	if err := r.store.UpdateDataMigrationReport(
-		context.WithoutCancel(ctx), record, record.Progress, record.Validation, platformlog.SafeError(cause),
-	); err != nil {
-		if errors.Is(err, migration.ErrLeaseLost) {
-			return nil
-		}
-		return fmt.Errorf("record failed data migration: %w", err)
-	}
+	record.FailureReason = platformlog.SafeError(cause)
 	if err := r.store.AdvanceDataMigration(context.WithoutCancel(ctx), record, migration.StatusFailed); err != nil {
 		if errors.Is(err, migration.ErrLeaseLost) {
 			return nil
@@ -445,7 +521,7 @@ func (r *workerRuntime) runArtifactCleanup(ctx context.Context, record platforma
 	config, err := r.store.ResolveAppConfig(runCtx, record.TenantID, record.AppID, record.ConfigVersion)
 	if err == nil {
 		var exec worker.Execution
-		exec, err = artifactCleanupExecution(runCtx, record, config)
+		exec, err = artifactCleanupExecution(record, config)
 		if err == nil {
 			err = deleteArtifactCleanup(runCtx, r.artifactServices, exec, record)
 		}
@@ -629,7 +705,7 @@ func (r *workerRuntime) indexKnowledgeSource(ctx context.Context, job platformkn
 	if err != nil {
 		return fmt.Errorf("resolve knowledge index config: %w", err)
 	}
-	exec, err := knowledgeIndexExecution(ctx, job, config)
+	exec, err := knowledgeIndexExecution(job, config)
 	if err != nil {
 		return err
 	}
@@ -658,13 +734,9 @@ func (r *workerRuntime) indexKnowledgeSource(ctx context.Context, job platformkn
 }
 
 func knowledgeIndexExecution(
-	ctx context.Context,
 	job platformknowledge.IndexJob,
 	config tenant.AppConfig,
 ) (worker.Execution, error) {
-	if err := job.Validate(); err != nil {
-		return worker.Execution{}, err
-	}
 	if config.TenantID != job.Document.Scope.TenantID || config.AppID != job.Document.Scope.AppID || config.Version != job.ConfigVersion {
 		return worker.Execution{}, errors.New("knowledge index config does not match job")
 	}
@@ -677,11 +749,7 @@ func knowledgeIndexExecution(
 		UserID:             "knowledge-index",
 		TraceID:            job.ID,
 	}
-	handles, err := (storage.StaticResolver{}).Resolve(ctx, runtime, config.BackendConfig)
-	if err != nil {
-		return worker.Execution{}, err
-	}
-	return worker.Execution{Tenant: runtime, Config: config, Storage: handles}, nil
+	return worker.Execution{Tenant: runtime, Config: config}, nil
 }
 
 func knowledgeSourceChunks(
@@ -743,13 +811,9 @@ func knowledgeSourceChunks(
 }
 
 func artifactCleanupExecution(
-	ctx context.Context,
 	record platformartifact.CleanupRecord,
 	config tenant.AppConfig,
 ) (worker.Execution, error) {
-	if err := record.Validate(); err != nil {
-		return worker.Execution{}, err
-	}
 	if config.TenantID != record.TenantID || config.AppID != record.AppID || config.Version != record.ConfigVersion {
 		return worker.Execution{}, errors.New("artifact cleanup config does not match record")
 	}
@@ -762,9 +826,5 @@ func artifactCleanupExecution(
 		UserID:             record.SessionPrincipalID,
 		TraceID:            record.ID,
 	}
-	handles, err := (storage.StaticResolver{}).Resolve(ctx, runtime, config.BackendConfig)
-	if err != nil {
-		return worker.Execution{}, err
-	}
-	return worker.Execution{Tenant: runtime, Config: config, Storage: handles}, nil
+	return worker.Execution{Tenant: runtime, Config: config}, nil
 }

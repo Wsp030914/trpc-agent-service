@@ -35,7 +35,6 @@ func NewHTTPHandler(api API, token string) (http.Handler, error) {
 	mux.HandleFunc("/admin/v1/channel-bindings", methodHandler(http.MethodPost, handler.createChannelBinding))
 	mux.HandleFunc("/admin/v1/configs", methodHandler(http.MethodPost, handler.publishAppConfig))
 	mux.HandleFunc("/admin/v1/configs/activate", methodHandler(http.MethodPost, handler.activateAppConfig))
-	mux.HandleFunc("/admin/v1/configs/rebuild-knowledge", methodHandler(http.MethodPost, handler.rebuildKnowledgeGeneration))
 	mux.HandleFunc("/admin/v1/data-migrations", methodHandler(http.MethodPost, handler.createDataMigration))
 	mux.HandleFunc("/admin/v1/data-migrations/begin", methodHandler(http.MethodPost, handler.beginDataMigration))
 	mux.HandleFunc("/admin/v1/credentials", methodHandler(http.MethodPost, handler.issueCredential))
@@ -152,12 +151,12 @@ func (h adminHTTPHandler) validAuthorization(r *http.Request) bool {
 
 func (h adminHTTPHandler) createTenant(w http.ResponseWriter, r *http.Request) {
 	var request createTenantRequest
-	if !decodeJSON(w, r, &request) || request.Tenant.Validate() != nil {
+	if !decodeJSON(w, r, &request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid tenant")
 		return
 	}
 	if err := h.api.CreateTenant(r.Context(), request.Tenant); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "create tenant failed")
+		writeAdminOperationError(w, err, "create tenant failed")
 		return
 	}
 	writeJSON(w, http.StatusCreated, request.Tenant)
@@ -165,24 +164,15 @@ func (h adminHTTPHandler) createTenant(w http.ResponseWriter, r *http.Request) {
 
 func (h adminHTTPHandler) createAgentApp(w http.ResponseWriter, r *http.Request) {
 	var request createAgentAppRequest
-	if !decodeJSON(w, r, &request) || !validAgentAppRequest(h.api, r, request) {
+	if !decodeJSON(w, r, &request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid agent app")
 		return
 	}
 	if err := h.api.CreateAgentApp(r.Context(), request.App, request.InitialConfig); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "create agent app failed")
+		writeAdminOperationError(w, err, "create agent app failed")
 		return
 	}
 	writeJSON(w, http.StatusCreated, request.App)
-}
-
-func validAgentAppRequest(api API, r *http.Request, request createAgentAppRequest) bool {
-	if r == nil || request.App.Validate() != nil || api.ValidateAppConfig(r.Context(), request.InitialConfig) != nil {
-		return false
-	}
-	return request.App.TenantID == request.InitialConfig.TenantID &&
-		request.App.AppID == request.InitialConfig.AppID &&
-		request.App.ActiveConfigVersion == request.InitialConfig.Version
 }
 
 func (h adminHTTPHandler) createChannelBinding(w http.ResponseWriter, r *http.Request) {
@@ -193,12 +183,7 @@ func (h adminHTTPHandler) createChannelBinding(w http.ResponseWriter, r *http.Re
 	}
 	binding, err := h.api.ProvisionChannelBinding(r.Context(), request.Binding)
 	if err != nil {
-		status := http.StatusInternalServerError
-		var inputErr *channelBindingInputError
-		if errors.As(err, &inputErr) {
-			status = http.StatusBadRequest
-		}
-		writeJSONError(w, status, "create channel binding failed")
+		writeAdminOperationError(w, err, "create channel binding failed")
 		return
 	}
 	writeJSON(w, http.StatusCreated, binding)
@@ -206,12 +191,12 @@ func (h adminHTTPHandler) createChannelBinding(w http.ResponseWriter, r *http.Re
 
 func (h adminHTTPHandler) publishAppConfig(w http.ResponseWriter, r *http.Request) {
 	var request publishAppConfigRequest
-	if !decodeJSON(w, r, &request) || h.api.ValidateAppConfig(r.Context(), request.Config) != nil {
+	if !decodeJSON(w, r, &request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid app config")
 		return
 	}
 	if err := h.api.PublishAppConfig(r.Context(), request.Config); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "publish app config failed")
+		writeAdminOperationError(w, err, "publish app config failed")
 		return
 	}
 	writeJSON(w, http.StatusCreated, request.Config)
@@ -219,39 +204,13 @@ func (h adminHTTPHandler) publishAppConfig(w http.ResponseWriter, r *http.Reques
 
 func (h adminHTTPHandler) activateAppConfig(w http.ResponseWriter, r *http.Request) {
 	var request activateAppConfigRequest
-	if !decodeJSON(w, r, &request) || request.Version == "" {
+	if !decodeJSON(w, r, &request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid app config activation")
 		return
 	}
 	scope := tenant.Scope{TenantID: request.TenantID, AppID: request.AppID}
-	if scope.Validate() != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid app config activation")
-		return
-	}
 	if err := h.api.ActivateAppConfig(r.Context(), scope, request.Version); err != nil {
-		if errors.Is(err, tenant.ErrKnowledgeGenerationPending) || errors.Is(err, tenant.ErrKnowledgeGenerationFailed) {
-			writeJSONError(w, http.StatusConflict, err.Error())
-			return
-		}
-		writeJSONError(w, http.StatusInternalServerError, "activate app config failed")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h adminHTTPHandler) rebuildKnowledgeGeneration(w http.ResponseWriter, r *http.Request) {
-	var request activateAppConfigRequest
-	if !decodeJSON(w, r, &request) || request.Version == "" {
-		writeJSONError(w, http.StatusBadRequest, "invalid knowledge generation rebuild")
-		return
-	}
-	scope := tenant.Scope{TenantID: request.TenantID, AppID: request.AppID}
-	if scope.Validate() != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid knowledge generation rebuild")
-		return
-	}
-	if err := h.api.RebuildKnowledgeGeneration(r.Context(), scope, request.Version); err != nil {
-		writeJSONError(w, http.StatusConflict, "rebuild knowledge generation failed")
+		writeAdminOperationError(w, err, "activate app config failed")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -268,7 +227,7 @@ func (h adminHTTPHandler) createDataMigration(w http.ResponseWriter, r *http.Req
 		AppID:    request.AppID,
 	}, request.SourceVersion, request.TargetVersion)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "create data migration failed")
+		writeAdminOperationError(w, err, "create data migration failed")
 		return
 	}
 	writeJSON(w, http.StatusCreated, record)
@@ -290,7 +249,7 @@ func (h adminHTTPHandler) beginDataMigration(w http.ResponseWriter, r *http.Requ
 		AppID:    request.AppID,
 	}, request.MigrationID, request.Owner, request.DrainDeadline, leaseDuration)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "begin data migration failed")
+		writeAdminOperationError(w, err, "begin data migration failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, record)
@@ -307,14 +266,15 @@ func (h adminHTTPHandler) issueCredential(w http.ResponseWriter, r *http.Request
 	if request.ExpiresAt != nil {
 		expiresAt = *request.ExpiresAt
 	}
-	if scope.Validate() != nil || (!expiresAt.IsZero() && !expiresAt.After(time.Now())) {
-		writeJSONError(w, http.StatusBadRequest, "invalid credential request")
-		return
-	}
 	issued, err := h.api.IssueCredential(r.Context(), scope, expiresAt)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "issue credential failed")
+		writeAdminOperationError(w, err, "issue credential failed")
 		return
+	}
+	var responseExpiresAt *time.Time
+	if !issued.Credential.ExpiresAt.IsZero() {
+		value := issued.Credential.ExpiresAt
+		responseExpiresAt = &value
 	}
 	writeJSON(w, http.StatusCreated, issueCredentialResponse{
 		Credential: credentialResponse{
@@ -323,7 +283,7 @@ func (h adminHTTPHandler) issueCredential(w http.ResponseWriter, r *http.Request
 			AppID:     issued.Credential.AppID,
 			KeyPrefix: issued.Credential.KeyPrefix,
 			Status:    string(issued.Credential.Status),
-			ExpiresAt: optionalTime(issued.Credential.ExpiresAt),
+			ExpiresAt: responseExpiresAt,
 		},
 		APIKey: issued.APIKey,
 	})
@@ -331,27 +291,16 @@ func (h adminHTTPHandler) issueCredential(w http.ResponseWriter, r *http.Request
 
 func (h adminHTTPHandler) revokeCredential(w http.ResponseWriter, r *http.Request) {
 	var request revokeCredentialRequest
-	if !decodeJSON(w, r, &request) || request.CredentialID == "" {
+	if !decodeJSON(w, r, &request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid credential revocation")
 		return
 	}
 	scope := tenant.Scope{TenantID: request.TenantID, AppID: request.AppID}
-	if scope.Validate() != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid credential revocation")
-		return
-	}
 	if err := h.api.RevokeCredential(r.Context(), scope, request.CredentialID); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "revoke credential failed")
+		writeAdminOperationError(w, err, "revoke credential failed")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func optionalTime(value time.Time) *time.Time {
-	if value.IsZero() {
-		return nil
-	}
-	return &value
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
@@ -385,4 +334,13 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, struct {
 		Error string `json:"error"`
 	}{Error: message})
+}
+
+func writeAdminOperationError(w http.ResponseWriter, err error, message string) {
+	status := http.StatusInternalServerError
+	var inputErr *inputError
+	if errors.As(err, &inputErr) {
+		status = http.StatusBadRequest
+	}
+	writeJSONError(w, status, message)
 }

@@ -105,8 +105,17 @@ func importExecution() worker.Execution {
 			Version:          "v2",
 			KnowledgeBaseIDs: []string{"handbook"},
 			BackendConfig: tenant.BackendConfig{
-				Knowledge: tenant.BackendRef{Options: map[string]string{indexGenerationOption: "g1"}},
-				Artifact:  tenant.BackendRef{Kind: tenant.BackendObject, Name: "cos"},
+				Knowledge: tenant.BackendRef{
+					Kind:     tenant.BackendVector,
+					Provider: "qdrant",
+					Name:     "qdrant",
+					Options:  map[string]string{indexGenerationOption: "g1"},
+				},
+				Artifact: tenant.BackendRef{
+					Kind:     tenant.BackendObject,
+					Provider: "cos",
+					Name:     "cos",
+				},
 			},
 		},
 	}

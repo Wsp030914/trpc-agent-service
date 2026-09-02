@@ -253,12 +253,12 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	if config.Role.runsWorker() {
 		runtime, err = newWorkerRuntime(workerRuntimeDependencies{
 			store:             store,
-			defaultSessionDSN: config.PostgresDSN,
-			defaultRedisURL:   config.RedisURL,
 			redisClient:       redisClient,
 			stream:            stream,
 			owner:             config.WorkerID,
 			getenv:            os.Getenv,
+			defaultSessionDSN: config.PostgresDSN,
+			defaultRedisURL:   config.RedisURL,
 		})
 		if err != nil {
 			return err
@@ -309,10 +309,15 @@ func newGatewayHandler(store *postgres.Store) (http.Handler, error) {
 		return nil, err
 	}
 	secrets := environmentSecretProvider{getenv: os.Getenv}
+	attachmentIngestor, err := newProductionAttachmentIngestor(store, secrets)
+	if err != nil {
+		return nil, err
+	}
 	wecomAdapter, err := wecom.NewAdapter(
 		store,
 		gateway.New(gateway.WithAdmitter(store)),
 		secrets,
+		wecom.WithAttachmentIngestor(attachmentIngestor),
 	)
 	if err != nil {
 		return nil, err
@@ -321,6 +326,8 @@ func newGatewayHandler(store *postgres.Store) (http.Handler, error) {
 		store,
 		gateway.New(gateway.WithAdmitter(store)),
 		secrets,
+		feishu.WithAttachmentIngestor(attachmentIngestor),
+		feishu.WithRecallAdmitter(store),
 	)
 	if err != nil {
 		return nil, err
@@ -339,7 +346,7 @@ func newAdminHandler(store *postgres.Store, token string) (http.Handler, error) 
 	return admin.NewHTTPHandler(admin.API{
 		Bindings:            store,
 		Repository:          store,
-		ToolPolicyValidator: noToolsResolver{},
+		ToolPolicyValidator: runtimeToolResolver{},
 	}, token)
 }
 
@@ -412,7 +419,7 @@ func runWorkerUntilShutdown(
 		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
 		migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
 		return dataMigrationShutdownResult(
-			workerShutdownResult(errors.Join(err), workerErr, stopped),
+			workerShutdownResult(err, workerErr, stopped),
 			migrationErr,
 			migrationStopped,
 		)

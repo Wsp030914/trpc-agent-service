@@ -54,8 +54,9 @@ func TestAppConfigPersistenceDocumentRoundTrip(t *testing.T) {
 				BackendConfig: tenant.BackendConfig{
 					Name: "shared",
 					Session: tenant.BackendRef{
-						Kind: tenant.BackendSQL,
-						Name: "session-postgres",
+						Kind:     tenant.BackendSQL,
+						Provider: "postgres",
+						Name:     "session-postgres",
 					},
 				},
 			},
@@ -79,14 +80,18 @@ func TestAppConfigPersistenceDocumentRoundTrip(t *testing.T) {
 				BackendConfig: tenant.BackendConfig{
 					Name: "isolated",
 					Session: tenant.BackendRef{
-						Kind:    tenant.BackendSQL,
-						Name:    "tenant-postgres",
-						DSNRef:  "secret/session-dsn",
+						Kind:     tenant.BackendSQL,
+						Provider: "postgres",
+						Name:     "tenant-postgres",
+						SecretRef: tenant.SecretRef{
+							Name: "session-dsn",
+						},
 						Options: map[string]string{"schema": "agent"},
 					},
 					Memory: tenant.BackendRef{
-						Kind: tenant.BackendRedis,
-						Name: "memory-redis",
+						Kind:     tenant.BackendRedis,
+						Provider: "redis",
+						Name:     "memory-redis",
 					},
 				},
 				Audit: tenant.AuditPolicy{

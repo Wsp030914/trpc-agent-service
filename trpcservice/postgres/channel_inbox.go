@@ -15,7 +15,6 @@ import (
 const (
 	channelInboxStatusAdmitted = "ADMITTED"
 	channelInboxStatusRejected = "REJECTED"
-	channelInboxRejectType     = "CHANNEL_MESSAGE_REJECTED"
 )
 
 type channelInboxRecord struct {
@@ -113,40 +112,6 @@ ON CONFLICT (tenant_id, app_id, binding_id, external_message_id) DO NOTHING`,
 		providerTimestamp,
 	); err != nil {
 		return fmt.Errorf("insert channel inbox: %w", err)
-	}
-	return nil
-}
-
-func insertChannelInboxRejectionAudit(
-	ctx context.Context,
-	tx pgx.Tx,
-	request gateway.AdmissionRequest,
-	rejectReason string,
-) error {
-	input := request.ChannelInput
-	if input == nil {
-		return errors.New("channel input is required")
-	}
-	if rejectReason == "" {
-		return errors.New("channel rejection reason is required")
-	}
-	identity := request.Identity.Tenant
-	if _, err := tx.Exec(ctx, `
-INSERT INTO platform.channel_inbox_rejection_audit (
-    tenant_id, app_id, binding_id, external_message_id, request_id,
-    event_type, reject_reason
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (tenant_id, app_id, binding_id, external_message_id, event_type)
-DO NOTHING`,
-		identity.TenantID,
-		identity.AppID,
-		identity.BindingID,
-		input.ExternalMessageID,
-		request.RequestID,
-		channelInboxRejectType,
-		rejectReason,
-	); err != nil {
-		return fmt.Errorf("insert channel inbox rejection audit: %w", err)
 	}
 	return nil
 }

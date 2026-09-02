@@ -18,8 +18,7 @@ type Resolver interface {
 	Close() error
 }
 
-// Router selects a Session resolver by backend provider. Empty providers in
-// configurations published before phase two retain their historic defaults.
+// Router selects a Session resolver by backend provider.
 type Router struct {
 	resolvers map[string]Resolver
 }
@@ -48,27 +47,22 @@ func NewRouter(resolvers map[string]Resolver) (*Router, error) {
 }
 
 // ValidateBackend checks whether the platform's built-in Session provider
-// registry can resolve ref. An empty provider retains the SQL and Redis
-// defaults used by older configuration versions.
+// registry can resolve ref.
 func ValidateBackend(ref tenant.BackendRef) error {
 	if err := ref.Validate(); err != nil {
 		return err
 	}
-	provider, err := sessionProvider(ref)
-	if err != nil {
-		return err
-	}
-	switch provider {
+	switch ref.Provider {
 	case postgresProvider:
 		if ref.Kind != tenant.BackendSQL {
-			return fmt.Errorf("session backend kind %q does not match provider %q", ref.Kind, provider)
+			return fmt.Errorf("session backend kind %q does not match provider %q", ref.Kind, ref.Provider)
 		}
 	case redisProvider:
 		if ref.Kind != tenant.BackendRedis {
-			return fmt.Errorf("session backend kind %q does not match provider %q", ref.Kind, provider)
+			return fmt.Errorf("session backend kind %q does not match provider %q", ref.Kind, ref.Provider)
 		}
 	default:
-		return fmt.Errorf("session provider %q is not supported", provider)
+		return fmt.Errorf("session provider %q is not supported", ref.Provider)
 	}
 	return nil
 }
@@ -78,10 +72,7 @@ func (r *Router) ResolveSession(ctx context.Context, exec worker.Execution) (fra
 	if r == nil {
 		return nil, errors.New("session router is not initialized")
 	}
-	provider, err := sessionProvider(exec.Config.BackendConfig.Session)
-	if err != nil {
-		return nil, err
-	}
+	provider := exec.Config.BackendConfig.Session.Provider
 	resolver := r.resolvers[provider]
 	if resolver == nil {
 		return nil, fmt.Errorf("session provider %q is not supported", provider)
@@ -107,18 +98,4 @@ func (r *Router) Close() error {
 		}
 	}
 	return errors.Join(errs...)
-}
-
-func sessionProvider(ref tenant.BackendRef) (string, error) {
-	if ref.Provider != "" {
-		return ref.Provider, nil
-	}
-	switch ref.Kind {
-	case tenant.BackendSQL:
-		return postgresProvider, nil
-	case tenant.BackendRedis:
-		return redisProvider, nil
-	default:
-		return "", fmt.Errorf("session backend kind %q has no legacy provider", ref.Kind)
-	}
 }

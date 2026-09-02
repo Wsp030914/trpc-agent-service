@@ -5,40 +5,45 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworksession "trpc.group/trpc-go/trpc-agent-go/session"
 	redisprovider "trpc.group/trpc-go/trpc-agent-go/session/redis"
 )
 
-// SessionURLResolver resolves a Redis URL for a configured Session backend.
-type SessionURLResolver interface {
-	ResolveSessionURL(context.Context, storage.Handle) (string, error)
-}
-
 // SessionResolver caches framework Redis Session services selected by immutable
 // application configuration. Its provider keeps event persistence synchronous.
 type SessionResolver struct {
-	urls     SessionURLResolver
-	mu       sync.Mutex
-	closed   bool
-	services map[string]frameworksession.Service
+	secrets    platformsecret.SecretProvider
+	defaultURL string
+	mu         sync.Mutex
+	closed     bool
+	services   map[string]frameworksession.Service
 }
 
-// NewSessionResolver creates a Redis Session resolver.
-func NewSessionResolver(urls SessionURLResolver) (*SessionResolver, error) {
-	if urls == nil {
-		return nil, errors.New("session url resolver is required")
+// NewSessionResolver creates a Redis session resolver backed by a scoped
+// secret provider.
+func NewSessionResolver(secrets platformsecret.SecretProvider, defaultURLs ...string) (*SessionResolver, error) {
+	if secrets == nil {
+		return nil, errors.New("secret provider is required")
 	}
-	return &SessionResolver{urls: urls, services: make(map[string]frameworksession.Service)}, nil
+	if len(defaultURLs) > 1 {
+		return nil, errors.New("only one default redis url is supported")
+	}
+	defaultURL := ""
+	if len(defaultURLs) == 1 {
+		defaultURL = strings.TrimSpace(defaultURLs[0])
+	}
+	return &SessionResolver{secrets: secrets, defaultURL: defaultURL, services: make(map[string]frameworksession.Service)}, nil
 }
 
 // ResolveSession returns a framework Redis Session service for one execution.
 func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execution) (frameworksession.Service, error) {
-	if r == nil || r.urls == nil {
+	if r == nil || r.secrets == nil {
 		return nil, errors.New("redis session resolver is not initialized")
 	}
 	if ctx == nil {
@@ -47,12 +52,9 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	handle := exec.Storage.Session
-	if err := handle.Validate(exec.Tenant.Scope(), storage.CapabilitySession, exec.Config.BackendConfig.Session); err != nil {
-		return nil, fmt.Errorf("session storage handle: %w", err)
-	}
-	if handle.Ref.Kind != tenant.BackendRedis || (handle.Ref.Provider != "" && handle.Ref.Provider != "redis") {
-		return nil, fmt.Errorf("session backend %q must use redis provider", handle.Ref.Name)
+	ref := exec.Config.BackendConfig.Session
+	if ref.Kind != tenant.BackendRedis || ref.Provider != "redis" {
+		return nil, fmt.Errorf("session backend %q must use redis provider", ref.Name)
 	}
 	key, err := sessionCacheKey(exec)
 	if err != nil {
@@ -66,11 +68,15 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	if service := r.services[key]; service != nil {
 		return service, nil
 	}
-	url, err := r.urls.ResolveSessionURL(ctx, handle)
-	if err != nil {
-		return nil, fmt.Errorf("resolve session url: %w", err)
+	url := r.defaultURL
+	if ref.SecretRef != (tenant.SecretRef{}) {
+		var err error
+		url, err = r.secrets.ResolveSecret(ctx, exec.Tenant.Scope(), ref.SecretRef)
+		if err != nil {
+			return nil, fmt.Errorf("resolve session url: %w", err)
+		}
 	}
-	if url == "" {
+	if strings.TrimSpace(url) == "" {
 		return nil, errors.New("session redis url is required")
 	}
 	service, err := redisprovider.NewService(redisprovider.WithRedisClientURL(url))
@@ -105,12 +111,10 @@ func (r *SessionResolver) Close() error {
 }
 
 func sessionCacheKey(exec worker.Execution) (string, error) {
-	ref := exec.Storage.Session.Ref
+	ref := exec.Config.BackendConfig.Session
 	parts := []string{exec.Tenant.ConfigVersion, exec.Config.BackendConfig.Name, ref.Provider, ref.Name}
 	if ref.SecretRef != (tenant.SecretRef{}) {
 		parts = append(parts, ref.SecretRef.Name, ref.SecretRef.Version)
-	} else if ref.DSNRef != "" {
-		parts = append(parts, ref.DSNRef)
 	}
 	return exec.Tenant.Scope().Key("session-service", parts...)
 }

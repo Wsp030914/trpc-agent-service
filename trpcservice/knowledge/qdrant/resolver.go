@@ -9,13 +9,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
-	qdrantclient "github.com/qdrant/go-client/qdrant"
 	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	frameworkembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
@@ -28,30 +26,15 @@ import (
 const (
 	providerName = "qdrant"
 
-	scopedPayloadIndexBootstrapTimeout = 10 * time.Second
-	scopedPayloadIndexWaitTimeout      = 2 * time.Second
-	scopedPayloadIndexPollInterval     = 50 * time.Millisecond
-	minQdrantPort                      = 1
-	maxQdrantPort                      = 65535
-	maxCollectionSegmentLength         = 96
+	minQdrantPort              = 1
+	maxQdrantPort              = 65535
+	maxCollectionSegmentLength = 96
 
 	optionEmbeddingModel      = "embedding_model"
 	optionEmbeddingDimensions = "embedding_dimensions"
 	optionEmbeddingProfile    = "embedding_profile"
 	optionIndexGeneration     = "index_generation"
 )
-
-var scopedPayloadFields = []string{
-	"metadata." + platformknowledge.MetadataTenantID,
-	"metadata." + platformknowledge.MetadataAppID,
-	"metadata." + platformknowledge.MetadataKnowledgeBaseID,
-}
-
-// SecretProvider resolves scoped Qdrant and embedding credentials. Values must
-// not be persisted or logged by callers.
-type SecretProvider interface {
-	ResolveSecret(context.Context, tenant.Scope, tenant.SecretRef) (string, error)
-}
 
 // Endpoint is an operator-controlled Qdrant gRPC endpoint.
 type Endpoint struct {
@@ -85,22 +68,19 @@ type EmbedderEndpointPolicy interface {
 
 // Resolver owns Qdrant VectorStores selected by immutable app configs.
 type Resolver struct {
-	secrets   SecretProvider
+	secrets   platformsecret.SecretProvider
 	endpoints EndpointResolver
 	catalog   platformknowledge.Catalog
 	policy    EmbedderEndpointPolicy
-	lifecycle context.Context
-	cancel    context.CancelFunc
 
-	mu              sync.Mutex
-	closed          bool
-	stores          map[string]vectorstore.VectorStore
-	indexBootstraps map[string]*indexBootstrap
+	mu     sync.Mutex
+	closed bool
+	stores map[string]vectorstore.VectorStore
 }
 
 // NewResolver creates a scoped Qdrant knowledge resolver.
 func NewResolver(
-	secrets SecretProvider,
+	secrets platformsecret.SecretProvider,
 	endpoints EndpointResolver,
 	catalog platformknowledge.Catalog,
 	policy EmbedderEndpointPolicy,
@@ -117,16 +97,12 @@ func NewResolver(
 	if policy == nil {
 		return nil, errors.New("embedding endpoint policy is required")
 	}
-	lifecycle, cancel := context.WithCancel(context.Background())
 	return &Resolver{
-		secrets:         secrets,
-		endpoints:       endpoints,
-		catalog:         catalog,
-		policy:          policy,
-		lifecycle:       lifecycle,
-		cancel:          cancel,
-		stores:          make(map[string]vectorstore.VectorStore),
-		indexBootstraps: make(map[string]*indexBootstrap),
+		secrets:   secrets,
+		endpoints: endpoints,
+		catalog:   catalog,
+		policy:    policy,
+		stores:    make(map[string]vectorstore.VectorStore),
 	}, nil
 }
 
@@ -148,9 +124,6 @@ func (r *Resolver) ResolveKnowledge(
 	ref := exec.Config.BackendConfig.Knowledge
 	if ref.IsZero() {
 		return nil, nil
-	}
-	if err := exec.Storage.Knowledge.Validate(exec.Tenant.Scope(), storage.CapabilityKnowledge, ref); err != nil {
-		return nil, fmt.Errorf("knowledge storage handle: %w", err)
 	}
 	settings, err := validateBackend(ref)
 	if err != nil {
@@ -208,9 +181,6 @@ func (r *Resolver) Index(
 	if ref.IsZero() {
 		return errors.New("knowledge backend is not configured")
 	}
-	if err := exec.Storage.Knowledge.Validate(exec.Tenant.Scope(), storage.CapabilityKnowledge, ref); err != nil {
-		return fmt.Errorf("knowledge storage handle: %w", err)
-	}
 	settings, err := validateBackend(ref)
 	if err != nil {
 		return err
@@ -259,15 +229,11 @@ func (r *Resolver) Close() error {
 		return nil
 	}
 	r.closed = true
-	if r.cancel != nil {
-		r.cancel()
-	}
 	var result error
 	for _, store := range r.stores {
 		result = errors.Join(result, store.Close())
 	}
 	r.stores = nil
-	r.indexBootstraps = nil
 	return result
 }
 
@@ -324,12 +290,6 @@ func (r *Resolver) resolveStore(
 		}
 		return nil, result
 	}
-	if err := r.ensureScopedPayloadIndexes(ctx, client, endpoint, settings.collectionName()); err != nil {
-		if closeErr := client.Close(); closeErr != nil {
-			return nil, errors.Join(err, fmt.Errorf("close qdrant client: %w", closeErr))
-		}
-		return nil, err
-	}
 	managed := &managedStore{VectorStore: store, client: client}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -348,165 +308,6 @@ func (r *Resolver) resolveStore(
 	}
 	r.stores[key] = managed
 	return managed, nil
-}
-
-type indexBootstrap struct {
-	done chan struct{}
-	err  error
-}
-
-type payloadIndexClient interface {
-	GetCollectionInfo(context.Context, string) (*qdrantclient.CollectionInfo, error)
-	CreateFieldIndex(context.Context, *qdrantclient.CreateFieldIndexCollection) (*qdrantclient.UpdateResult, error)
-}
-
-func (r *Resolver) ensureScopedPayloadIndexes(
-	ctx context.Context,
-	client payloadIndexClient,
-	endpoint Endpoint,
-	collectionName string,
-) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	key := strings.Join([]string{
-		endpoint.Host,
-		strconv.Itoa(endpoint.Port),
-		strconv.FormatBool(endpoint.TLS),
-		collectionName,
-	}, "\x00")
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return errors.New("qdrant knowledge resolver is closed")
-	}
-	if r.indexBootstraps == nil {
-		r.indexBootstraps = make(map[string]*indexBootstrap)
-	}
-	if existing := r.indexBootstraps[key]; existing != nil {
-		r.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-existing.done:
-			return existing.err
-		}
-	}
-	bootstrap := &indexBootstrap{done: make(chan struct{})}
-	r.indexBootstraps[key] = bootstrap
-	lifecycle := r.lifecycle
-	r.mu.Unlock()
-
-	if lifecycle == nil {
-		lifecycle = context.Background()
-	}
-	bootstrapCtx, cancel := context.WithTimeout(lifecycle, scopedPayloadIndexBootstrapTimeout)
-	bootstrap.err = ensureScopedPayloadIndexes(bootstrapCtx, client, collectionName)
-	cancel()
-	close(bootstrap.done)
-	if bootstrap.err != nil {
-		r.mu.Lock()
-		if r.indexBootstraps[key] == bootstrap {
-			delete(r.indexBootstraps, key)
-		}
-		r.mu.Unlock()
-	}
-	if bootstrap.err == nil && ctx != nil {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-	}
-	return bootstrap.err
-}
-
-func ensureScopedPayloadIndexes(
-	ctx context.Context,
-	client payloadIndexClient,
-	collectionName string,
-) error {
-	if client == nil {
-		return errors.New("qdrant client is required")
-	}
-	if collectionName == "" {
-		return errors.New("qdrant collection name is required")
-	}
-	missing, err := missingScopedPayloadIndexes(ctx, client, collectionName)
-	if err != nil {
-		return err
-	}
-	wait := true
-	for _, field := range missing {
-		if _, err := client.CreateFieldIndex(ctx, &qdrantclient.CreateFieldIndexCollection{
-			CollectionName: collectionName,
-			FieldName:      field,
-			FieldType:      qdrantclient.FieldType_FieldTypeKeyword.Enum(),
-			Wait:           &wait,
-		}); err != nil {
-			if verifyErr := waitForScopedPayloadIndex(ctx, client, collectionName, field); verifyErr != nil {
-				return errors.Join(fmt.Errorf("create qdrant payload index %q: %w", field, err), verifyErr)
-			}
-		}
-	}
-	remaining, err := missingScopedPayloadIndexes(ctx, client, collectionName)
-	if err != nil {
-		return err
-	}
-	if len(remaining) != 0 {
-		return fmt.Errorf("qdrant payload indexes are missing: %s", strings.Join(remaining, ", "))
-	}
-	return nil
-}
-
-func waitForScopedPayloadIndex(
-	ctx context.Context,
-	client payloadIndexClient,
-	collectionName string,
-	field string,
-) error {
-	waitCtx, cancel := context.WithTimeout(ctx, scopedPayloadIndexWaitTimeout)
-	defer cancel()
-	ticker := time.NewTicker(scopedPayloadIndexPollInterval)
-	defer ticker.Stop()
-	for {
-		missing, err := missingScopedPayloadIndexes(waitCtx, client, collectionName)
-		if err != nil {
-			return err
-		}
-		if !slices.Contains(missing, field) {
-			return nil
-		}
-		select {
-		case <-waitCtx.Done():
-			return fmt.Errorf("wait for qdrant payload index %q: %w", field, waitCtx.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
-func missingScopedPayloadIndexes(
-	ctx context.Context,
-	client payloadIndexClient,
-	collectionName string,
-) ([]string, error) {
-	info, err := client.GetCollectionInfo(ctx, collectionName)
-	if err != nil {
-		return nil, fmt.Errorf("get qdrant collection %q: %w", collectionName, err)
-	}
-	if info == nil {
-		return nil, fmt.Errorf("get qdrant collection %q: collection info is required", collectionName)
-	}
-	missing := make([]string, 0, len(scopedPayloadFields))
-	for _, field := range scopedPayloadFields {
-		schema := info.PayloadSchema[field]
-		if schema == nil {
-			missing = append(missing, field)
-			continue
-		}
-		if schema.DataType != qdrantclient.PayloadSchemaType_Keyword {
-			return nil, fmt.Errorf("qdrant payload index %q must use keyword schema", field)
-		}
-	}
-	return missing, nil
 }
 
 type managedStore struct {

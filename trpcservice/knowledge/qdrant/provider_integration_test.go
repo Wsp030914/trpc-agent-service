@@ -206,9 +206,10 @@ func knowledgeConfig(scope tenant.Scope, version string) tenant.AppConfig {
 		BackendConfig: tenant.BackendConfig{
 			Name: "shared",
 			Session: tenant.BackendRef{
-				Kind:    tenant.BackendSQL,
-				Name:    "session-postgres",
-				Options: map[string]string{"schema": "agent"},
+				Kind:     tenant.BackendSQL,
+				Provider: "postgres",
+				Name:     "session-postgres",
+				Options:  map[string]string{"schema": "agent"},
 			},
 		},
 		Audit:      tenant.AuditPolicy{Enabled: true, RetentionDays: 30, RedactPII: true},

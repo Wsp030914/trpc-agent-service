@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
 // EnqueueKnowledgeIndex records a source document version for asynchronous
@@ -36,10 +35,10 @@ func insertKnowledgeIndexJob(ctx context.Context, db databaseExecutor, job platf
 	_, err := db.Exec(ctx, `
 INSERT INTO platform.knowledge_index_job (
     job_id, tenant_id, app_id, knowledge_base_id, document_id, document_version,
-    index_generation, config_version, build_id, status, last_error
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    index_generation, config_version, status, last_error
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT (tenant_id, app_id, knowledge_base_id, document_id, document_version,
-             index_generation, config_version, build_id)
+             index_generation, config_version)
 DO NOTHING`,
 		job.ID,
 		job.Document.Scope.TenantID,
@@ -49,7 +48,6 @@ DO NOTHING`,
 		job.Document.Version,
 		job.Document.IndexGeneration,
 		job.ConfigVersion,
-		job.BuildID,
 		job.Status,
 		job.LastError,
 	)
@@ -57,207 +55,6 @@ DO NOTHING`,
 		return fmt.Errorf("enqueue knowledge index: %w", err)
 	}
 	return nil
-}
-
-func enqueueKnowledgeGeneration(
-	ctx context.Context,
-	tx pgx.Tx,
-	scope tenant.Scope,
-	configVersion string,
-	buildID string,
-	baseIDs []string,
-	generation string,
-) (int, error) {
-	if len(baseIDs) == 0 || generation == "" || buildID == "" {
-		return 0, nil
-	}
-	rows, err := tx.Query(ctx, `
-SELECT document.knowledge_base_id, document.document_id, document.version,
-       document.object_key, document.content_sha256, document.mime_type, document.status
-FROM platform.knowledge_document AS document
-WHERE document.tenant_id = $1
-  AND document.app_id = $2
-  AND document.knowledge_base_id = ANY($3)
-  AND document.status = 'AVAILABLE'
-  AND NOT EXISTS (
-      SELECT 1
-      FROM platform.knowledge_index_job AS job
-      WHERE job.tenant_id = document.tenant_id
-        AND job.app_id = document.app_id
-        AND job.knowledge_base_id = document.knowledge_base_id
-        AND job.document_id = document.document_id
-        AND job.document_version = document.version
-        AND job.index_generation = $4
-        AND job.config_version = $5
-        AND job.build_id = $6
-  )`, scope.TenantID, scope.AppID, baseIDs, generation, configVersion, buildID)
-	if err != nil {
-		return 0, fmt.Errorf("list knowledge generation sources: %w", err)
-	}
-	defer rows.Close()
-	documents := make([]platformknowledge.Document, 0)
-	for rows.Next() {
-		document := platformknowledge.Document{
-			Scope:           scope,
-			Status:          platformknowledge.DocumentStatusAvailable,
-			IndexGeneration: generation,
-		}
-		if err := rows.Scan(
-			&document.KnowledgeBaseID,
-			&document.ID,
-			&document.Version,
-			&document.ObjectKey,
-			&document.ContentSHA256,
-			&document.MIMEType,
-			&document.Status,
-		); err != nil {
-			return 0, fmt.Errorf("read knowledge generation source: %w", err)
-		}
-		documents = append(documents, document)
-	}
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("iterate knowledge generation sources: %w", err)
-	}
-	rows.Close()
-	for _, document := range documents {
-		job := platformknowledge.IndexJob{
-			ID:            uuid.NewString(),
-			Document:      document,
-			ConfigVersion: configVersion,
-			BuildID:       buildID,
-			Status:        platformknowledge.IndexJobPending,
-		}
-		if err := insertKnowledgeIndexJob(ctx, tx, job); err != nil {
-			return 0, err
-		}
-	}
-	return len(documents), nil
-}
-
-func knowledgeGenerationReady(
-	ctx context.Context,
-	tx pgx.Tx,
-	scope tenant.Scope,
-	configVersion string,
-	buildID string,
-	baseIDs []string,
-	generation string,
-) (bool, error) {
-	if len(baseIDs) == 0 || generation == "" || buildID == "" {
-		return true, nil
-	}
-	var ready bool
-	err := tx.QueryRow(ctx, `
-SELECT NOT EXISTS (
-    SELECT 1
-    FROM platform.knowledge_document AS document
-    WHERE document.tenant_id = $1
-      AND document.app_id = $2
-      AND document.knowledge_base_id = ANY($3)
-      AND document.status = 'AVAILABLE'
-      AND NOT EXISTS (
-          SELECT 1
-          FROM platform.knowledge_index_job AS job
-          WHERE job.tenant_id = document.tenant_id
-            AND job.app_id = document.app_id
-            AND job.knowledge_base_id = document.knowledge_base_id
-            AND job.document_id = document.document_id
-            AND job.document_version = document.version
-            AND job.index_generation = $4
-            AND job.config_version = $5
-            AND job.build_id = $6
-            AND job.status = 'SUCCEEDED'
-      )
-)`, scope.TenantID, scope.AppID, baseIDs, generation, configVersion, buildID).Scan(&ready)
-	if err != nil {
-		return false, fmt.Errorf("check knowledge generation readiness: %w", err)
-	}
-	return ready, nil
-}
-
-func ensureKnowledgeGenerationBuild(
-	ctx context.Context,
-	tx pgx.Tx,
-	scope tenant.Scope,
-	configVersion string,
-	generation string,
-) (string, platformknowledge.IndexJobStatus, error) {
-	var buildID string
-	var storedGeneration string
-	var status platformknowledge.IndexJobStatus
-	err := tx.QueryRow(ctx, `
-SELECT build_id, index_generation, status
-FROM platform.knowledge_generation_build
-WHERE tenant_id = $1 AND app_id = $2 AND config_version = $3
-FOR UPDATE`, scope.TenantID, scope.AppID, configVersion).Scan(&buildID, &storedGeneration, &status)
-	if errors.Is(err, pgx.ErrNoRows) {
-		buildID = uuid.NewString()
-		if _, err := tx.Exec(ctx, `
-INSERT INTO platform.knowledge_generation_build (
-    build_id, tenant_id, app_id, config_version, index_generation, status
-) VALUES ($1, $2, $3, $4, $5, 'PENDING')`,
-			buildID, scope.TenantID, scope.AppID, configVersion, generation); err != nil {
-			return "", "", fmt.Errorf("create knowledge generation build: %w", err)
-		}
-		return buildID, platformknowledge.IndexJobPending, nil
-	}
-	if err != nil {
-		return "", "", fmt.Errorf("lock knowledge generation build: %w", err)
-	}
-	if storedGeneration != generation {
-		return "", "", errors.New("knowledge generation build does not match config")
-	}
-	return buildID, status, nil
-}
-
-func failKnowledgeGenerationBuild(
-	ctx context.Context,
-	tx pgx.Tx,
-	buildID string,
-	cause string,
-) error {
-	if cause == "" {
-		cause = "knowledge index job failed"
-	}
-	cause = platformlog.SafeError(errors.New(cause))
-	if _, err := tx.Exec(ctx, `
-UPDATE platform.knowledge_generation_build
-SET status = 'FAILED', last_error = $2, updated_at = clock_timestamp()
-WHERE build_id = $1 AND status = 'PENDING'`, buildID, cause); err != nil {
-		return fmt.Errorf("fail knowledge generation build: %w", err)
-	}
-	return nil
-}
-
-func completeKnowledgeGenerationBuild(ctx context.Context, tx pgx.Tx, buildID string) error {
-	if _, err := tx.Exec(ctx, `
-UPDATE platform.knowledge_generation_build
-SET status = 'SUCCEEDED', last_error = '', updated_at = clock_timestamp()
-WHERE build_id = $1 AND status = 'PENDING'`, buildID); err != nil {
-		return fmt.Errorf("complete knowledge generation build: %w", err)
-	}
-	return nil
-}
-
-func failedKnowledgeGenerationJob(
-	ctx context.Context,
-	tx pgx.Tx,
-	buildID string,
-) (string, bool, error) {
-	var cause string
-	err := tx.QueryRow(ctx, `
-SELECT last_error
-FROM platform.knowledge_index_job
-WHERE build_id = $1 AND status = 'FAILED'
-ORDER BY updated_at, job_id
-LIMIT 1`, buildID).Scan(&cause)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("read failed knowledge index job: %w", err)
-	}
-	return cause, true, nil
 }
 
 func scanKnowledgeIndexJob(scanner interface{ Scan(...any) error }) (platformknowledge.IndexJob, error) {
@@ -275,7 +72,6 @@ func scanKnowledgeIndexJob(scanner interface{ Scan(...any) error }) (platformkno
 		&job.Document.Status,
 		&job.Document.IndexGeneration,
 		&job.ConfigVersion,
-		&job.BuildID,
 		&job.Status,
 		&job.Attempt,
 		&job.NextAttemptAt,
@@ -328,7 +124,7 @@ WITH candidate AS (
 )
 SELECT claimed.job_id, document.tenant_id, document.app_id, document.knowledge_base_id,
        document.document_id, document.version, document.object_key, document.content_sha256,
-       document.mime_type, document.status, claimed.index_generation, claimed.config_version, claimed.build_id,
+       document.mime_type, document.status, claimed.index_generation, claimed.config_version,
        claimed.status, claimed.attempt, claimed.next_attempt_at, claimed.lease_owner,
        claimed.lease_until, claimed.run_token, claimed.last_error
 FROM claimed

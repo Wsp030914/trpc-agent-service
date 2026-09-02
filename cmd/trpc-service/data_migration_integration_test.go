@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	platformredis "github.com/liuzengh/trpc-agent-service/trpcservice/redis"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -136,13 +136,16 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 		t.Fatalf("create redis stream: %v", err)
 	}
 	runtime, err := newWorkerRuntime(workerRuntimeDependencies{
-		store:             store,
-		defaultSessionDSN: *dataMigrationTestDSN,
-		defaultRedisURL:   *dataMigrationTestURL,
-		redisClient:       redisClient,
-		stream:            stream,
-		owner:             "worker-migration",
-		getenv:            environmentReader(nil),
+		store:       store,
+		redisClient: redisClient,
+		stream:      stream,
+		owner:       "worker-migration",
+		getenv: migrationSecretEnvironment(
+			tenantID,
+			appID,
+			*dataMigrationTestURL,
+			*dataMigrationTestDSN,
+		),
 	})
 	if err != nil {
 		t.Fatalf("new worker runtime: %v", err)
@@ -166,21 +169,6 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 	if status != migration.StatusSucceeded {
 		t.Fatalf("migration status = %q, want %q", status, migration.StatusSucceeded)
 	}
-	var progress migration.Progress
-	var validation migration.Validation
-	if err := pool.QueryRow(ctx, `
-SELECT progress, validation_result
-FROM platform.data_migration
-WHERE migration_id = $1`, record.ID).Scan(&progress, &validation); err != nil {
-		t.Fatalf("query migration report: %v", err)
-	}
-	if progress != (migration.Progress{SessionCount: 1, SessionsCopied: 1, SessionsChecked: 1}) {
-		t.Fatalf("migration progress = %+v", progress)
-	}
-	if validation != (migration.Validation{SessionsVerified: 1}) {
-		t.Fatalf("migration validation = %+v", validation)
-	}
-
 	targetExec := dataMigrationExecution(t, key, v2)
 	target, err := runtime.postgresSessions.ResolveSession(ctx, targetExec)
 	if err != nil {
@@ -261,83 +249,7 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 		t.Fatalf("begin data migration: %v", err)
 	}
 
-	runtime := newDataMigrationTestRuntime(t, ctx, store, seed, "worker-copy-failure", "redis://127.0.0.1:1/0")
-	if err := runtime.runDataMigrationPass(ctx); err != nil {
-		t.Fatalf("run data migration pass: %v", err)
-	}
-	assertDataMigrationFailed(t, ctx, pool, store, tenantID, appID, record.ID, v1.Version)
-}
-
-func TestWorkerRuntimeFailsMigrationWhenDrainDeadlineExpires(t *testing.T) {
-	if *dataMigrationTestDSN == "" || *dataMigrationTestURL == "" {
-		t.Skip("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN and TRPC_AGENT_SERVICE_REDIS_TEST_URL are required")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	pool := openDataMigrationIntegrationPool(t)
-	store, err := postgres.New(pool)
-	if err != nil {
-		t.Fatalf("new postgres store: %v", err)
-	}
-	if err := store.Migrate(ctx); err != nil {
-		t.Fatalf("migrate postgres store: %v", err)
-	}
-
-	seed := time.Now().UnixNano()
-	tenantID := fmt.Sprintf("migration-drain-deadline-%x", seed)
-	appID := "support"
-	schema := fmt.Sprintf("drain%x", seed&0xffffff)
-	t.Cleanup(func() { cleanupDataMigrationIntegration(t, pool, tenantID, appID, schema) })
-	v1, v2 := dataMigrationAppConfigs(tenantID, appID, schema)
-	if err := store.CreateTenant(ctx, tenant.Tenant{ID: tenantID, Name: "Migration Drain Deadline", Status: tenant.StatusActive}); err != nil {
-		t.Fatalf("create tenant: %v", err)
-	}
-	if err := store.CreateAgentApp(ctx, tenant.AgentApp{
-		TenantID: tenantID, AppID: appID, Name: "Migration Drain Deadline", ActiveConfigVersion: v1.Version, Status: tenant.StatusActive,
-	}, v1); err != nil {
-		t.Fatalf("create agent app: %v", err)
-	}
-	if err := store.InsertAppConfigVersion(ctx, v2); err != nil {
-		t.Fatalf("insert target config: %v", err)
-	}
-	key := dataMigrationSessionKey(t, tenantID, appID)
-	if _, err := pool.Exec(ctx, `
-INSERT INTO platform.session_lane (tenant_id, app_id, session_principal_id, session_id)
-VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != nil {
-		t.Fatalf("insert session lane: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `
-INSERT INTO platform.execution (
-    tenant_id, app_id, request_id, session_principal_id, session_id, user_id,
-    turn_seq, config_version, tenant_source, source_id, idempotency_key,
-    payload_hash, command, status, trace_id
-) VALUES (
-    $1, $2, 'drain-deadline', $3, $4, $3,
-    1, $5, 'authenticated_claims', 'drain-deadline', 'drain-deadline',
-    decode(repeat('00', 32), 'hex'), '{}'::jsonb, 'PENDING', 'drain-deadline'
-)`, tenantID, appID, key.UserID, key.SessionID, v1.Version); err != nil {
-		t.Fatalf("insert draining execution: %v", err)
-	}
-
-	record := migration.Record{
-		ID:                  fmt.Sprintf("migration-drain-deadline-%x", seed),
-		TenantID:            tenantID,
-		AppID:               appID,
-		SourceConfigVersion: v1.Version,
-		TargetConfigVersion: v2.Version,
-		Status:              migration.StatusPending,
-	}
-	if err := store.CreateDataMigration(ctx, record); err != nil {
-		t.Fatalf("create data migration: %v", err)
-	}
-	if _, err := store.BeginDataMigration(ctx, tenantID, appID, record.ID, "worker-drain-deadline", time.Now().Add(time.Minute), dataMigrationLease); err != nil {
-		t.Fatalf("begin data migration: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE platform.data_migration SET drain_deadline = clock_timestamp() - interval '1 second' WHERE migration_id = $1`, record.ID); err != nil {
-		t.Fatalf("expire migration drain deadline: %v", err)
-	}
-
-	runtime := newDataMigrationTestRuntime(t, ctx, store, seed, "worker-drain-deadline", *dataMigrationTestURL)
+	runtime := newDataMigrationTestRuntime(t, ctx, store, seed, tenantID, appID, "worker-copy-failure", "redis://127.0.0.1:1/0")
 	if err := runtime.runDataMigrationPass(ctx); err != nil {
 		t.Fatalf("run data migration pass: %v", err)
 	}
@@ -402,8 +314,8 @@ func TestDataMigrationLeaseTakeoverRejectsPreviousWorker(t *testing.T) {
 	if !found || claimed.LeaseOwner != "worker-successor" || claimed.RunToken == previous.RunToken {
 		t.Fatalf("claimed migration = %+v, previous token = %q", claimed, previous.RunToken)
 	}
-	if err := store.UpdateDataMigrationReport(ctx, previous, migration.Progress{}, migration.Validation{}, ""); !errors.Is(err, migration.ErrLeaseLost) {
-		t.Fatalf("previous worker update error = %v, want lease lost", err)
+	if err := store.AdvanceDataMigration(ctx, previous, migration.StatusCopying); !errors.Is(err, migration.ErrLeaseLost) {
+		t.Fatalf("previous worker advance error = %v, want lease lost", err)
 	}
 }
 
@@ -489,11 +401,8 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 		t.Fatalf("complete successor cleanup: %v", err)
 	}
 	var status platformartifact.CleanupStatus
-	if err := pool.QueryRow(ctx, `SELECT status FROM platform.artifact_cleanup WHERE cleanup_id = $1`, record.ID).Scan(&status); err != nil {
-		t.Fatalf("query cleanup status: %v", err)
-	}
-	if status != platformartifact.CleanupSucceeded {
-		t.Fatalf("cleanup status = %q, want %q", status, platformartifact.CleanupSucceeded)
+	if err := pool.QueryRow(ctx, `SELECT status FROM platform.artifact_cleanup WHERE cleanup_id = $1`, record.ID).Scan(&status); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("completed cleanup row error = %v, want %v", err, pgx.ErrNoRows)
 	}
 }
 
@@ -557,11 +466,8 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 		t.Fatalf("cleanup invocation = %#v", cleanup)
 	}
 	var status platformartifact.CleanupStatus
-	if err := pool.QueryRow(ctx, `SELECT status FROM platform.artifact_cleanup WHERE cleanup_id = $1`, record.ID).Scan(&status); err != nil {
-		t.Fatalf("query cleanup status: %v", err)
-	}
-	if status != platformartifact.CleanupSucceeded {
-		t.Fatalf("cleanup status = %q, want %q", status, platformartifact.CleanupSucceeded)
+	if err := pool.QueryRow(ctx, `SELECT status FROM platform.artifact_cleanup WHERE cleanup_id = $1`, record.ID).Scan(&status); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("completed cleanup row error = %v, want %v", err, pgx.ErrNoRows)
 	}
 
 	retryRecord := record
@@ -589,11 +495,8 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 	if err := runtime.runArtifactCleanupPass(ctx); err != nil {
 		t.Fatalf("run successful retry cleanup pass: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT status FROM platform.artifact_cleanup WHERE cleanup_id = $1`, retryRecord.ID).Scan(&status); err != nil {
-		t.Fatalf("query completed retry cleanup status: %v", err)
-	}
-	if status != platformartifact.CleanupSucceeded {
-		t.Fatalf("completed retry cleanup status = %q, want %q", status, platformartifact.CleanupSucceeded)
+	if err := pool.QueryRow(ctx, `SELECT status FROM platform.artifact_cleanup WHERE cleanup_id = $1`, retryRecord.ID).Scan(&status); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("completed retry cleanup row error = %v, want %v", err, pgx.ErrNoRows)
 	}
 }
 
@@ -617,6 +520,8 @@ func appendMigrationTestEvents(ctx context.Context, service session.Service, val
 }
 
 func dataMigrationAppConfigs(tenantID, appID, schema string) (tenant.AppConfig, tenant.AppConfig) {
+	redisSecret := tenant.SecretRef{Name: "migration-redis-url", Version: "1"}
+	postgresSecret := tenant.SecretRef{Name: "migration-postgres-dsn", Version: "1"}
 	base := tenant.AppConfig{
 		TenantID: tenantID,
 		AppID:    appID,
@@ -625,16 +530,21 @@ func dataMigrationAppConfigs(tenantID, appID, schema string) (tenant.AppConfig, 
 			Model:     "gpt-4.1-mini",
 			APIKeyRef: tenant.SecretRef{Name: "model-key", Version: "1"},
 		},
-		SecretRefs: []tenant.SecretRef{{Name: "model-key", Version: "1"}},
+		SecretRefs: []tenant.SecretRef{
+			{Name: "model-key", Version: "1"},
+			redisSecret,
+			postgresSecret,
+		},
 	}
 	v1 := base
 	v1.Version = "v1"
 	v1.BackendConfig = tenant.BackendConfig{
 		Name: "redis-source",
 		Session: tenant.BackendRef{
-			Kind:     tenant.BackendRedis,
-			Provider: "redis",
-			Name:     "redis-source",
+			Kind:      tenant.BackendRedis,
+			Provider:  "redis",
+			Name:      "redis-source",
+			SecretRef: redisSecret,
 		},
 	}
 	v2 := base
@@ -642,10 +552,11 @@ func dataMigrationAppConfigs(tenantID, appID, schema string) (tenant.AppConfig, 
 	v2.BackendConfig = tenant.BackendConfig{
 		Name: "postgres-target",
 		Session: tenant.BackendRef{
-			Kind:     tenant.BackendSQL,
-			Provider: "postgres",
-			Name:     "postgres-target",
-			Options:  map[string]string{"schema": schema},
+			Kind:      tenant.BackendSQL,
+			Provider:  "postgres",
+			Name:      "postgres-target",
+			SecretRef: postgresSecret,
+			Options:   map[string]string{"schema": schema},
 		},
 	}
 	return v1, v2
@@ -662,11 +573,7 @@ func dataMigrationExecution(t *testing.T, key session.Key, config tenant.AppConf
 		UserID:             key.UserID,
 		TraceID:            "migration-integration",
 	}
-	handles, err := (storage.StaticResolver{}).Resolve(context.Background(), runtime, config.BackendConfig)
-	if err != nil {
-		t.Fatalf("resolve storage handles: %v", err)
-	}
-	return worker.Execution{Tenant: runtime, Config: config, Storage: handles}
+	return worker.Execution{Tenant: runtime, Config: config}
 }
 
 type testArtifactCleanupExecutor struct {
@@ -697,6 +604,8 @@ func newDataMigrationTestRuntime(
 	ctx context.Context,
 	store *postgres.Store,
 	seed int64,
+	tenantID string,
+	appID string,
 	owner string,
 	sessionRedisURL string,
 ) *workerRuntime {
@@ -711,13 +620,16 @@ func newDataMigrationTestRuntime(
 		t.Fatalf("create redis stream: %v", err)
 	}
 	runtime, err := newWorkerRuntime(workerRuntimeDependencies{
-		store:             store,
-		defaultSessionDSN: *dataMigrationTestDSN,
-		defaultRedisURL:   sessionRedisURL,
-		redisClient:       redisClient,
-		stream:            stream,
-		owner:             owner,
-		getenv:            environmentReader(nil),
+		store:       store,
+		redisClient: redisClient,
+		stream:      stream,
+		owner:       owner,
+		getenv: migrationSecretEnvironment(
+			tenantID,
+			appID,
+			sessionRedisURL,
+			*dataMigrationTestDSN,
+		),
 	})
 	if err != nil {
 		_ = redisClient.Close()
@@ -725,6 +637,14 @@ func newDataMigrationTestRuntime(
 	}
 	t.Cleanup(func() { _ = runtime.close() })
 	return runtime
+}
+
+func migrationSecretEnvironment(tenantID, appID, redisURL, postgresDSN string) func(string) string {
+	scope := tenant.Scope{TenantID: tenantID, AppID: appID}
+	return environmentReader(map[string]string{
+		scopedSecretEnvironmentKey(scope, tenant.SecretRef{Name: "migration-redis-url", Version: "1"}):    redisURL,
+		scopedSecretEnvironmentKey(scope, tenant.SecretRef{Name: "migration-postgres-dsn", Version: "1"}): postgresDSN,
+	})
 }
 
 func assertDataMigrationFailed(

@@ -9,7 +9,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/google/uuid"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -38,27 +37,10 @@ type ReplyCapabilityResolver interface {
 	ResolveReplyCapability(context.Context, Execution) (channels.ProviderCapability, error)
 }
 
-// ReplyCapabilityResolverFunc adapts a function to ReplyCapabilityResolver.
-type ReplyCapabilityResolverFunc func(context.Context, Execution) (channels.ProviderCapability, error)
-
-// ResolveReplyCapability implements ReplyCapabilityResolver.
-func (f ReplyCapabilityResolverFunc) ResolveReplyCapability(ctx context.Context, exec Execution) (channels.ProviderCapability, error) {
-	if f == nil {
-		return channels.ProviderCapability{}, errors.New("reply capability resolver is not initialized")
-	}
-	return f(ctx, exec)
-}
-
 // ReplyEventBuilder converts user-visible Runner output into platform Reply
 // values. It has no persistence or provider lifecycle responsibility.
 type ReplyEventBuilder struct {
 	capabilities ReplyCapabilityResolver
-}
-
-// ReplyEventBuilderSource is the small contract consumed by the durable event
-// journal. Implementations only build values; the journal owns persistence.
-type ReplyEventBuilderSource interface {
-	Build(context.Context, Execution, int64, *event.Event) ([]channels.Reply, error)
 }
 
 // NewReplyEventBuilder creates a Runner-event to Reply builder.
@@ -68,8 +50,6 @@ func NewReplyEventBuilder(resolver ReplyCapabilityResolver) (*ReplyEventBuilder,
 	}
 	return &ReplyEventBuilder{capabilities: resolver}, nil
 }
-
-var _ ReplyEventBuilderSource = (*ReplyEventBuilder)(nil)
 
 // Build returns platform replies for one persisted execution event. Events
 // without user-visible assistant text return no replies and are still expected
@@ -173,7 +153,7 @@ func (b *ReplyEventBuilder) Build(
 			Text:            part,
 			ContentDelta:    contentDelta,
 		}
-		reply.ReplyID = stableReplyID(reply)
+		reply.ReplyID = reply.StableID()
 		replies = append(replies, reply)
 	}
 	return replies, nil
@@ -520,13 +500,6 @@ func visibleAssistantText(evt *event.Event) (string, bool) {
 		message := choice.Message
 		if isDelta {
 			message = choice.Delta
-		} else if message.Content == "" {
-			// Preserve compatibility with integrations that omit IsPartial while
-			// exposing only the incremental Delta field.
-			message = choice.Message
-			if message.Content == "" {
-				message = choice.Delta
-			}
 		}
 		if message.Role != "" && message.Role != model.RoleAssistant {
 			continue
@@ -566,13 +539,4 @@ func splitReplyText(value string, maxBytes int) ([]string, error) {
 		return []string{""}, nil
 	}
 	return parts, nil
-}
-
-func stableReplyID(reply channels.Reply) string {
-	identity := strings.Join([]string{
-		reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID,
-		reply.SourceEventID, reply.LogicalReplyID,
-		fmt.Sprintf("%d", reply.PartNo), fmt.Sprintf("%d", reply.Revision), string(reply.Operation),
-	}, "\x1f")
-	return uuid.NewSHA1(uuid.Nil, []byte(identity)).String()
 }

@@ -64,10 +64,6 @@ const (
 	CleanupPending CleanupStatus = "PENDING"
 	// CleanupRunning is leased by one worker.
 	CleanupRunning CleanupStatus = "RUNNING"
-	// CleanupSucceeded retained the completed cleanup audit record.
-	CleanupSucceeded CleanupStatus = "SUCCEEDED"
-	// CleanupFailed requires manual reconciliation and is never claimable.
-	CleanupFailed CleanupStatus = "FAILED"
 )
 
 // CleanupRecord identifies one artifact object cleanup operation. The
@@ -119,17 +115,13 @@ func (r CleanupRecord) Validate() error {
 		r.SessionPrincipalID == "" || r.SessionID == "" || strings.TrimSpace(r.Filename) == "" {
 		return errors.New("artifact cleanup identity is required")
 	}
-	if r.Version < -1 {
-		return errors.New("artifact cleanup version is invalid")
-	}
-	if r.Status != CleanupFailed && (r.ObjectKey == "" || r.Version < 0) {
+	if r.ObjectKey == "" || r.Version < 0 {
 		return errors.New("artifact cleanup requires an exact object version")
 	}
 	if r.Attempt < 0 {
 		return errors.New("artifact cleanup attempt must not be negative")
 	}
-	if r.Status != CleanupPending && r.Status != CleanupRunning &&
-		r.Status != CleanupSucceeded && r.Status != CleanupFailed {
+	if r.Status != CleanupPending && r.Status != CleanupRunning {
 		return errors.New("artifact cleanup status is invalid")
 	}
 	if r.LeaseOwner == "" && (!r.LeaseUntil.IsZero() || r.RunToken != "") {
@@ -161,6 +153,14 @@ type VersionedStorage interface {
 	frameworkartifact.Service
 	SaveArtifactVersion(context.Context, frameworkartifact.SessionInfo, string, int, *frameworkartifact.Artifact) error
 	DeleteArtifactVersion(context.Context, frameworkartifact.SessionInfo, string, int) error
+}
+
+// ExactObjectStorage is implemented by object stores that can load and delete
+// the object key recorded by platform metadata. It is used for inbound media,
+// which is uploaded before the final session identity is allocated.
+type ExactObjectStorage interface {
+	LoadArtifactObject(context.Context, string, string, int64) (*frameworkartifact.Artifact, error)
+	DeleteArtifactObject(context.Context, string) error
 }
 
 // StorageResolver resolves the configured backing artifact service for one
@@ -267,6 +267,12 @@ func (r *ExecutionResolver) DeleteCleanup(
 	if err != nil {
 		return err
 	}
+	if exact, ok := storage.(ExactObjectStorage); ok {
+		if err := exact.DeleteArtifactObject(ctx, record.ObjectKey); err != nil {
+			return fmt.Errorf("delete artifact object: %w", err)
+		}
+		return nil
+	}
 	info, storageFilename, err := service.storageRequest(record.Filename)
 	if err != nil {
 		return err
@@ -371,6 +377,9 @@ func (s *Service) LoadArtifact(
 	if err != nil {
 		return nil, err
 	}
+	if exact, ok := s.storage.(ExactObjectStorage); ok {
+		return exact.LoadArtifactObject(ctx, record.ObjectKey, record.MIMEType, record.Size)
+	}
 	resolvedVersion := record.Version
 	return s.storage.LoadArtifact(ctx, storageInfo, storageFilename, &resolvedVersion)
 }
@@ -406,7 +415,13 @@ func (s *Service) DeleteArtifact(ctx context.Context, info frameworkartifact.Ses
 	}
 	var failures []error
 	for _, record := range records {
-		if err := s.deleteArtifactVersion(ctx, storageInfo, storageFilename, record.Version); err != nil {
+		var err error
+		if exact, ok := s.storage.(ExactObjectStorage); ok {
+			err = exact.DeleteArtifactObject(ctx, record.ObjectKey)
+		} else {
+			err = s.deleteArtifactVersion(ctx, storageInfo, storageFilename, record.Version)
+		}
+		if err != nil {
 			failures = append(failures, s.enqueueVersionCleanup(ctx, record, fmt.Errorf("delete artifact storage: %w", err)))
 		}
 	}

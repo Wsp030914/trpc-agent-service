@@ -45,10 +45,6 @@ type dataMigrationRepository interface {
 	BeginDataMigration(context.Context, string, string, string, string, time.Time, time.Duration) (migration.Record, error)
 }
 
-type knowledgeGenerationRepository interface {
-	RebuildKnowledgeGeneration(context.Context, string, string, string) error
-}
-
 // ToolPolicyValidator checks whether an application tool policy can be backed
 // by the tools registered in the deployed runtime.
 type ToolPolicyValidator interface {
@@ -56,25 +52,29 @@ type ToolPolicyValidator interface {
 	ValidateToolPolicy(context.Context, tenant.ToolPolicy) error
 }
 
-type channelBindingInputError struct {
+// AppConfigToolPolicyValidator is used when tool availability also depends on
+// immutable application backends, such as the knowledge-search tool.
+type AppConfigToolPolicyValidator interface {
+	ValidateAppConfigTools(context.Context, tenant.AppConfig) error
+}
+
+type inputError struct {
 	cause error
 }
 
-func (e *channelBindingInputError) Error() string {
+func (e *inputError) Error() string {
 	return e.cause.Error()
 }
 
-func (e *channelBindingInputError) Unwrap() error {
+func (e *inputError) Unwrap() error {
 	return e.cause
 }
 
-// CreateChannelBinding validates and persists an IM account binding owned by
-// one tenant application. It is a compatibility convenience that discards the
-// generated route and revision returned by ProvisionChannelBinding. It does
-// not enable an IM callback by itself.
-func (a API) CreateChannelBinding(ctx context.Context, binding channels.Binding) error {
-	_, err := a.ProvisionChannelBinding(ctx, binding)
-	return err
+func invalidInput(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &inputError{cause: err}
 }
 
 // ProvisionChannelBinding is the canonical channel binding creation path. It
@@ -89,20 +89,24 @@ func (a API) ProvisionChannelBinding(
 	if err != nil {
 		return channels.Binding{}, err
 	}
-	if err := a.persistChannelBinding(ctx, prepared); err != nil {
+	repository, err := a.repository()
+	if err != nil {
 		return channels.Binding{}, err
+	}
+	if err := repository.CreateChannelBinding(ctx, prepared); err != nil {
+		return channels.Binding{}, fmt.Errorf("create channel binding: %w", err)
 	}
 	return prepared, nil
 }
 
 func prepareChannelBinding(binding channels.Binding) (channels.Binding, error) {
 	if binding.PublicRouteID != "" {
-		return channels.Binding{}, &channelBindingInputError{
+		return channels.Binding{}, &inputError{
 			cause: errors.New("public_route_id must be omitted when creating a channel binding"),
 		}
 	}
 	if binding.BindingRevision != 0 {
-		return channels.Binding{}, &channelBindingInputError{
+		return channels.Binding{}, &inputError{
 			cause: errors.New("binding_revision must be omitted when creating a channel binding"),
 		}
 	}
@@ -113,20 +117,9 @@ func prepareChannelBinding(binding channels.Binding) (channels.Binding, error) {
 	binding.PublicRouteID = publicRouteID
 	binding.BindingRevision = 1
 	if err := binding.Validate(); err != nil {
-		return channels.Binding{}, &channelBindingInputError{cause: err}
+		return channels.Binding{}, &inputError{cause: err}
 	}
 	return binding, nil
-}
-
-func (a API) persistChannelBinding(ctx context.Context, binding channels.Binding) error {
-	repository, err := a.repository()
-	if err != nil {
-		return err
-	}
-	if err := repository.CreateChannelBinding(ctx, binding); err != nil {
-		return fmt.Errorf("create channel binding: %w", err)
-	}
-	return nil
 }
 
 // API validates tenant application configuration before publishing it.
@@ -146,7 +139,13 @@ func (a API) ValidateAppConfig(ctx context.Context, cfg tenant.AppConfig) error 
 		return fmt.Errorf("session backend provider: %w", err)
 	}
 	if a.ToolPolicyValidator != nil {
-		if err := a.ToolPolicyValidator.ValidateToolPolicy(ctx, cfg.Tools); err != nil {
+		var err error
+		if validator, ok := a.ToolPolicyValidator.(AppConfigToolPolicyValidator); ok {
+			err = validator.ValidateAppConfigTools(ctx, cfg)
+		} else {
+			err = a.ToolPolicyValidator.ValidateToolPolicy(ctx, cfg.Tools)
+		}
+		if err != nil {
 			return fmt.Errorf("tool policy runtime: %w", err)
 		}
 	}
@@ -177,7 +176,7 @@ func (a API) ValidateAppConfig(ctx context.Context, cfg tenant.AppConfig) error 
 // CreateTenant validates and persists a new tenant control-plane record.
 func (a API) CreateTenant(ctx context.Context, value tenant.Tenant) error {
 	if err := value.Validate(); err != nil {
-		return err
+		return invalidInput(err)
 	}
 	repository, err := a.repository()
 	if err != nil {
@@ -197,16 +196,19 @@ func (a API) CreateAgentApp(
 	initial tenant.AppConfig,
 ) error {
 	if err := app.Validate(); err != nil {
-		return err
+		return invalidInput(err)
 	}
 	if err := a.ValidateAppConfig(ctx, initial); err != nil {
-		return fmt.Errorf("initial app config: %w", err)
+		return invalidInput(fmt.Errorf("initial app config: %w", err))
+	}
+	if len(initial.KnowledgeBaseIDs) != 0 {
+		return invalidInput(errors.New("initial app config cannot bind knowledge bases before the app exists"))
 	}
 	if app.TenantID != initial.TenantID || app.AppID != initial.AppID {
-		return errors.New("initial app config does not match agent app scope")
+		return invalidInput(errors.New("initial app config does not match agent app scope"))
 	}
 	if app.ActiveConfigVersion != initial.Version {
-		return errors.New("active_config_version does not match initial app config")
+		return invalidInput(errors.New("active_config_version does not match initial app config"))
 	}
 	repository, err := a.repository()
 	if err != nil {
@@ -222,7 +224,7 @@ func (a API) CreateAgentApp(
 // version. It does not change the active version.
 func (a API) PublishAppConfig(ctx context.Context, cfg tenant.AppConfig) error {
 	if err := a.ValidateAppConfig(ctx, cfg); err != nil {
-		return err
+		return invalidInput(err)
 	}
 	repository, err := a.repository()
 	if err != nil {
@@ -238,10 +240,10 @@ func (a API) PublishAppConfig(ctx context.Context, cfg tenant.AppConfig) error {
 // application scope. Existing jobs retain their admitted config version.
 func (a API) ActivateAppConfig(ctx context.Context, scope tenant.Scope, version string) error {
 	if err := scope.Validate(); err != nil {
-		return err
+		return invalidInput(err)
 	}
 	if version == "" {
-		return errors.New("config version is required")
+		return invalidInput(errors.New("config version is required"))
 	}
 	repository, err := a.repository()
 	if err != nil {
@@ -249,29 +251,6 @@ func (a API) ActivateAppConfig(ctx context.Context, scope tenant.Scope, version 
 	}
 	if err := repository.ActivateAppConfig(ctx, scope.TenantID, scope.AppID, version); err != nil {
 		return fmt.Errorf("activate app config: %w", err)
-	}
-	return nil
-}
-
-// RebuildKnowledgeGeneration restarts a terminally failed Knowledge build for
-// one inactive configuration version.
-func (a API) RebuildKnowledgeGeneration(ctx context.Context, scope tenant.Scope, version string) error {
-	if err := scope.Validate(); err != nil {
-		return err
-	}
-	if version == "" {
-		return errors.New("config version is required")
-	}
-	repository, err := a.repository()
-	if err != nil {
-		return err
-	}
-	builds, ok := repository.(knowledgeGenerationRepository)
-	if !ok {
-		return errors.New("admin repository does not support knowledge generation rebuilds")
-	}
-	if err := builds.RebuildKnowledgeGeneration(ctx, scope.TenantID, scope.AppID, version); err != nil {
-		return fmt.Errorf("rebuild knowledge generation: %w", err)
 	}
 	return nil
 }
@@ -284,7 +263,7 @@ func (a API) CreateDataMigration(
 	sourceVersion, targetVersion string,
 ) (migration.Record, error) {
 	if err := scope.Validate(); err != nil {
-		return migration.Record{}, err
+		return migration.Record{}, invalidInput(err)
 	}
 	repository, err := a.dataMigrationRepository()
 	if err != nil {
@@ -299,7 +278,7 @@ func (a API) CreateDataMigration(
 		Status:              migration.StatusPending,
 	}
 	if err := record.Validate(); err != nil {
-		return migration.Record{}, err
+		return migration.Record{}, invalidInput(err)
 	}
 	if err := repository.CreateDataMigration(ctx, record); err != nil {
 		return migration.Record{}, fmt.Errorf("create data migration: %w", err)
@@ -317,13 +296,13 @@ func (a API) BeginDataMigration(
 	leaseDuration time.Duration,
 ) (migration.Record, error) {
 	if err := scope.Validate(); err != nil {
-		return migration.Record{}, err
+		return migration.Record{}, invalidInput(err)
 	}
 	if migrationID == "" || owner == "" || leaseDuration <= 0 {
-		return migration.Record{}, errors.New("data migration id, owner, and lease duration are required")
+		return migration.Record{}, invalidInput(errors.New("data migration id, owner, and lease duration are required"))
 	}
 	if !drainDeadline.After(time.Now()) {
-		return migration.Record{}, errors.New("data migration drain deadline must be in the future")
+		return migration.Record{}, invalidInput(errors.New("data migration drain deadline must be in the future"))
 	}
 	repository, err := a.dataMigrationRepository()
 	if err != nil {
@@ -353,10 +332,10 @@ func (a API) IssueCredential(
 	expiresAt time.Time,
 ) (IssuedCredential, error) {
 	if err := scope.Validate(); err != nil {
-		return IssuedCredential{}, err
+		return IssuedCredential{}, invalidInput(err)
 	}
 	if !expiresAt.IsZero() && !expiresAt.After(time.Now()) {
-		return IssuedCredential{}, errors.New("credential expiry must be in the future")
+		return IssuedCredential{}, invalidInput(errors.New("credential expiry must be in the future"))
 	}
 	apiKey, credentialID, err := generateCredentialValues(rand.Reader)
 	if err != nil {
@@ -374,6 +353,9 @@ func (a API) IssueCredential(
 		Status:    auth.CredentialActive,
 		ExpiresAt: expiresAt,
 	}
+	if err := credential.Validate(); err != nil {
+		return IssuedCredential{}, invalidInput(err)
+	}
 	repository, err := a.repository()
 	if err != nil {
 		return IssuedCredential{}, err
@@ -388,10 +370,10 @@ func (a API) IssueCredential(
 // application scope.
 func (a API) RevokeCredential(ctx context.Context, scope tenant.Scope, credentialID string) error {
 	if err := scope.Validate(); err != nil {
-		return err
+		return invalidInput(err)
 	}
 	if credentialID == "" {
-		return errors.New("credential_id is required")
+		return invalidInput(errors.New("credential_id is required"))
 	}
 	repository, err := a.repository()
 	if err != nil {

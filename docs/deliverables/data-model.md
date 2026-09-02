@@ -87,7 +87,7 @@ summary.up_to_event_seq <= session.last_event_seq
 | tool_approval | `approval_id`、`tenant_id`、`app_id`、`request_id`、`turn_seq`、`user_id`、`tool_name`、`tool_call_id`、`arguments_enc`、`arguments_digest`、`status`、`expires_at`、`decided_by`、`execution_owner`、`executed_at`、`resolved_by`、`resolved_at` | 一次确定参数的危险 Tool 审批；`approval_id` 是 Tool 结果写入的幂等键，状态为待定、批准、拒绝、过期、取消、执行中、已执行、结果未知或人工已处置 |
 | role_binding | `tenant_id`、`app_id`、`user_id`、`role`、`status`、`created_at`、`updated_at` | 平台用户角色映射；外部群角色不能直接替代它 |
 | usage_entry | `tenant_id`、`app_id`、`request_id`、`user_id`、`metric`、`reserved_amount`、`actual_amount`、`settled_at`、`released_at` | 幂等用量账本；只有需要并发下严格不超额时才使用预留与释放 |
-| data_migration | `migration_id`、`tenant_id`、`app_id`、`source_config_version`、`target_config_version`、`status`、`lease_owner`、`lease_until`、`run_token`、`drain_deadline`、`progress`、`validation_result`、`failure_reason`、`created_at`、`updated_at` | 维护窗口内唯一权威迁移记录；状态为 `PENDING`、`DRAINING`、`COPYING`、`VERIFYING`、`SUCCEEDED`、`FAILED`。前三个非终态直接构成准入门禁 |
+| data_migration | `migration_id`、`tenant_id`、`app_id`、`source_config_version`、`target_config_version`、`status`、`lease_owner`、`lease_until`、`run_token`、`drain_deadline`、`failure_reason`、`created_at`、`updated_at` | 维护窗口内唯一权威迁移记录；状态为 `PENDING`、`DRAINING`、`COPYING`、`VERIFYING`、`SUCCEEDED`、`FAILED`。前三个非终态直接构成准入门禁 |
 | rollout_rule | `tenant_id`、`app_id`、`stable_config_version`、`candidate_config_version`、`percentage`、`status`、`updated_at` | 灰度规则；同一规则和比例下由稳定 Session 分区键计算版本，不保存每个 Session 的分配记录 |
 
 审批批准后，Worker 用 `WHERE status = APPROVED` 的条件更新 Execution 原子领取为 `EXECUTING`；只有领取成功者执行 `arguments_enc` 对应且摘要匹配的一次 Tool 调用，不重新请求模型生成参数。Runner 请求审批时，先持久化原始 `tool_call_id` 对应的 Tool 调用，再将同一 `execution` 置为 `WAITING_APPROVAL`，并停止内存中的 Runner。审批状态机属于后续治理能力，接入时须继续使用 Execution 的条件更新和 Dispatch Outbox，不引入第二个 Job 表。迁移进行时，源和目标配置版本不得被原地修改。
@@ -99,7 +99,7 @@ summary.up_to_event_seq <= session.last_event_seq
 | memory | `tenant_id`、`app_id`、`memory_id`、`subject_id`、`source_kind`、`source_session_principal_id`、`source_session_id`、`source_event_from_seq`、`source_event_to_seq`、`content`、`indexed_at` | 长期记忆权威记录；会话提取记录来源 Event 范围，人工或外部导入使用不同 `source_kind` |
 | knowledge_base | `tenant_id`、`knowledge_base_id`、`name`、`owner_scope`、`backend_config`、`status` | 租户知识库 |
 | knowledge_binding | `tenant_id`、`app_id`、`config_version`、`knowledge_base_id`、`binding_scope`、`channel_binding_id`、`conversation_id`、`user_id`、`retrieval_policy`、`priority`、`status` | 知识库与 Agent 配置的绑定关系 |
-| knowledge_document | `tenant_id`、`knowledge_base_id`、`document_id`、`version`、`object_key`、`parser`、`acl_policy`、`status`、`index_generation` | 知识库文档 metadata |
+| knowledge_document | `tenant_id`、`knowledge_base_id`、`document_id`、`version`、`object_key`、`parser`、`status`、`index_generation` | 知识库文档 metadata；SQL 文档状态和租户/应用绑定是授权入口 |
 | artifact | `tenant_id`、`app_id`、`artifact_id`、`object_key`、`owner_scope`、`owner_id`、`session_principal_id`、`session_id`、`mime`、`size`、`checksum`、`status`、`scan_status`、`access_policy` | 上传或生成的文件 metadata；关联 Session 时两个 Session 字段同时存在 |
 
 会话提取的 Memory 通过 `source_session_principal_id + source_session_id + source_event_from_seq..source_event_to_seq` 关联来源；单条 Event 时起止序号相同。人工创建或外部导入的 Memory 不伪造 Session Event 来源。Knowledge 和 Artifact 的原文通常放对象存储，SQL metadata 是权限入口。向量库只保存派生索引，不能作为唯一权威数据源。
@@ -108,7 +108,7 @@ summary.up_to_event_seq <= session.last_event_seq
 
 | 实体 | 核心字段 | 说明 |
 | --- | --- | --- |
-| message_inbox | `tenant_id`、`app_id`、`binding_id`、`external_message_id`、`request_id`、`payload_hash`、`status`、`created_at` | 入站消息幂等；已验证的撤回事件将其标记为撤回并定位关联 Job |
+| message_inbox | `tenant_id`、`app_id`、`binding_id`、`external_message_id`、`request_id`、`payload_hash`、`status`、`created_at` | 入站消息幂等；拒绝原因与入站记录一起保存，避免为同一投递建立第二个状态表 |
 | message_outbox | `tenant_id`、`app_id`、`request_id`、`binding_id`、`part_no`、`payload`、`status`、`retry_count`、`next_retry_at` | 出站回复重试；IM 最终回复与 Job/Execution 终态在平台协调库同一事务创建 |
 | audit_log | `tenant_id`、`app_id`、`channel`、`user_id`、`session_principal_id`、`session_id`、`agent_name`、`tool_name`、`decision`、`latency`、`error_type`、`cost`、`trace_id`、`created_at` | 平台 SQL 中的追加型权威审计记录；租户策略只控制保留、脱敏和查询权限 |
 

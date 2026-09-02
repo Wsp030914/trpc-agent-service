@@ -173,10 +173,10 @@ func (s *Store) Retry(ctx context.Context, claim queue.Claim, cause error) error
 		return fmt.Errorf("lock execution retry: %w", err)
 	}
 	if attempt >= maxExecutionAttempts {
-		_, err = tx.Exec(ctx, `UPDATE platform.execution SET status='FAILED', last_error=$4, lease_owner=NULL, run_token=NULL, lease_until=NULL, finished_at=clock_timestamp(), updated_at=clock_timestamp() WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), truncateExecutionError(cause))
+		_, err = tx.Exec(ctx, `UPDATE platform.execution SET status='FAILED', last_error=$4, lease_owner=NULL, run_token=NULL, lease_until=NULL, finished_at=clock_timestamp(), updated_at=clock_timestamp() WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), platformlog.SafeError(cause))
 	} else {
 		delay := time.Duration(attempt) * time.Second
-		_, err = tx.Exec(ctx, `UPDATE platform.execution SET status='PENDING', last_error=$4, lease_owner=NULL, run_token=NULL, lease_until=NULL, next_attempt_at=clock_timestamp()+$5::interval, updated_at=clock_timestamp() WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), truncateExecutionError(cause), intervalLiteral(delay))
+		_, err = tx.Exec(ctx, `UPDATE platform.execution SET status='PENDING', last_error=$4, lease_owner=NULL, run_token=NULL, lease_until=NULL, next_attempt_at=clock_timestamp()+$5::interval, updated_at=clock_timestamp() WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), platformlog.SafeError(cause), intervalLiteral(delay))
 		if err == nil {
 			_, err = tx.Exec(ctx, `INSERT INTO platform.dispatch_outbox (tenant_id, app_id, request_id, next_attempt_at) VALUES ($1,$2,$3,clock_timestamp()+$4::interval)`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), intervalLiteral(delay))
 		}
@@ -260,7 +260,7 @@ func (s *Store) RetryDispatch(ctx context.Context, dispatch queue.Dispatch, owne
 	if err := dispatch.Validate(); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE platform.dispatch_outbox SET status='PENDING', lease_owner=NULL, lease_until=NULL, last_error=$6, next_attempt_at=clock_timestamp()+interval '1 second', updated_at=clock_timestamp() WHERE outbox_id=$1 AND tenant_id=$2 AND app_id=$3 AND request_id=$4 AND status='PUBLISHING' AND lease_owner=$5`, dispatch.OutboxID, dispatch.TenantID, dispatch.AppID, dispatch.RequestID, owner, truncateExecutionError(cause))
+	tag, err := s.pool.Exec(ctx, `UPDATE platform.dispatch_outbox SET status='PENDING', lease_owner=NULL, lease_until=NULL, last_error=$6, next_attempt_at=clock_timestamp()+interval '1 second', updated_at=clock_timestamp() WHERE outbox_id=$1 AND tenant_id=$2 AND app_id=$3 AND request_id=$4 AND status='PUBLISHING' AND lease_owner=$5`, dispatch.OutboxID, dispatch.TenantID, dispatch.AppID, dispatch.RequestID, owner, platformlog.SafeError(cause))
 	if err != nil {
 		return fmt.Errorf("retry dispatch: %w", err)
 	}
@@ -354,7 +354,10 @@ func (v storedExecution) executionJob() (execution.Job, error) {
 		SessionID:          v.sessionID,
 		UserID:             v.userID,
 		TraceID:            v.traceID,
-	}, gateway.Message{Text: c.Text, ArtifactRefs: c.ArtifactRefs})
+	}, gateway.Message{
+		Text:         c.Text,
+		ArtifactRefs: c.ArtifactRefs,
+	})
 }
 func consumeDispatch(ctx context.Context, tx pgx.Tx, dispatch queue.Dispatch) error {
 	if err := dispatch.Validate(); err != nil {
@@ -384,6 +387,3 @@ func deferDispatch(ctx context.Context, tx pgx.Tx, d queue.Dispatch, next time.T
 	return nil
 }
 func intervalLiteral(v time.Duration) string { return fmt.Sprintf("%d microseconds", v.Microseconds()) }
-func truncateExecutionError(err error) string {
-	return platformlog.SafeError(err)
-}

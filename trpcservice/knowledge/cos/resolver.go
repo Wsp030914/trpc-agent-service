@@ -17,17 +17,11 @@ import (
 	sharedcos "github.com/liuzengh/trpc-agent-service/internal/cosclient"
 	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	cosclient "github.com/tencentyun/cos-go-sdk-v5"
 )
-
-// SecretProvider resolves scoped COS credentials. Values must not be persisted
-// or logged by callers.
-type SecretProvider interface {
-	ResolveSecret(context.Context, tenant.Scope, tenant.SecretRef) (string, error)
-}
 
 // EndpointResolver resolves one operator-controlled COS endpoint by its
 // logical backend name. It must not consume tenant-provided network addresses.
@@ -37,7 +31,7 @@ type EndpointResolver interface {
 
 // Resolver owns COS clients for trusted Knowledge source access.
 type Resolver struct {
-	secrets   SecretProvider
+	secrets   platformsecret.SecretProvider
 	endpoints EndpointResolver
 
 	mu      sync.Mutex
@@ -47,7 +41,7 @@ type Resolver struct {
 
 // NewResolver creates a Knowledge source resolver backed by the configured
 // Artifact COS backend.
-func NewResolver(secrets SecretProvider, endpoints EndpointResolver) (*Resolver, error) {
+func NewResolver(secrets platformsecret.SecretProvider, endpoints EndpointResolver) (*Resolver, error) {
 	if secrets == nil {
 		return nil, errors.New("secret provider is required")
 	}
@@ -232,15 +226,9 @@ func (r *Resolver) resolveClient(ctx context.Context, exec worker.Execution) (*c
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := exec.Tenant.Validate(); err != nil {
-		return nil, err
-	}
 	ref := exec.Config.BackendConfig.Artifact
 	if err := artifactcos.ValidateBackend(ref); err != nil {
 		return nil, fmt.Errorf("knowledge source artifact backend: %w", err)
-	}
-	if err := exec.Storage.Artifact.Validate(exec.Tenant.Scope(), storage.CapabilityArtifact, ref); err != nil {
-		return nil, fmt.Errorf("knowledge source artifact storage handle: %w", err)
 	}
 	endpoint, err := r.endpoints.ResolveCOSEndpoint(ctx, ref.Name)
 	if err != nil {
@@ -286,9 +274,6 @@ func (r *Resolver) resolveClient(ctx context.Context, exec worker.Execution) (*c
 
 func validateDocumentExecution(exec worker.Execution, document platformknowledge.Document) error {
 	if err := document.Validate(); err != nil {
-		return err
-	}
-	if err := exec.Tenant.Validate(); err != nil {
 		return err
 	}
 	if document.Scope != exec.Tenant.Scope() {

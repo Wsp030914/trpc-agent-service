@@ -22,7 +22,7 @@ const executionEventPollInterval = 200 * time.Millisecond
 // tenant-scoped stream for protocol adapters.
 type ExecutionEventJournal struct {
 	store        *Store
-	replyBuilder worker.ReplyEventBuilderSource
+	replyBuilder *worker.ReplyEventBuilder
 }
 
 // ExecutionEventJournalOption configures optional durable event projections.
@@ -30,7 +30,7 @@ type ExecutionEventJournalOption func(*ExecutionEventJournal) error
 
 // WithReplyEventBuilder enables the IM Reply Projection inside the same
 // PostgreSQL transaction as execution_event insertion.
-func WithReplyEventBuilder(builder worker.ReplyEventBuilderSource) ExecutionEventJournalOption {
+func WithReplyEventBuilder(builder *worker.ReplyEventBuilder) ExecutionEventJournalOption {
 	return func(journal *ExecutionEventJournal) error {
 		if builder == nil {
 			return errors.New("reply event builder is required")

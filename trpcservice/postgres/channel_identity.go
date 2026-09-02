@@ -90,7 +90,7 @@ func (r IdentityMappingRequest) Validate() error {
 
 // IdentityMapper persists binding-scoped external identities and conversation
 // principals. Each Map call uses one PostgreSQL transaction for the mapping
-// rows and membership upsert.
+// rows.
 type IdentityMapper struct {
 	store               *Store
 	hasher              channels.ExternalIDHasher
@@ -138,7 +138,7 @@ func NewIdentityMapper(
 }
 
 // Map resolves or creates the Identity and, for group/topic messages, the
-// Conversation and Membership for one provider message.
+// Conversation for one provider message.
 func (m *IdentityMapper) Map(ctx context.Context, request IdentityMappingRequest) (channels.MappedPrincipal, error) {
 	if m == nil || m.store == nil || m.hasher == nil || m.protector == nil {
 		return channels.MappedPrincipal{}, errors.New("identity mapper is not initialized")
@@ -203,7 +203,7 @@ func (m *IdentityMapper) externalIDHashes(
 		if version == activeVersion {
 			continue
 		}
-		legacyHash, err := m.hasher.HashWithVersion(
+		candidateHash, err := m.hasher.HashWithVersion(
 			ctx,
 			request.Scope,
 			request.BindingID,
@@ -214,7 +214,7 @@ func (m *IdentityMapper) externalIDHashes(
 		if err != nil {
 			return nil, err
 		}
-		keyHashes = append(keyHashes, externalKeyHash{hash: legacyHash, keyVersion: version})
+		keyHashes = append(keyHashes, externalKeyHash{hash: candidateHash, keyVersion: version})
 	}
 	return keyHashes, nil
 }
@@ -405,12 +405,7 @@ func (m *IdentityMapper) mapNormalizedTx(
 	if err != nil {
 		return channels.MappedPrincipal{}, err
 	}
-	membership, err := upsertMembershipTx(ctx, tx, request, conversation.ConversationID, identity.UserID)
-	if err != nil {
-		return channels.MappedPrincipal{}, err
-	}
 	mapped.Conversation = &conversation
-	mapped.Membership = &membership
 	mapped.SessionPrincipalID = conversation.SessionPrincipalID
 	if err := mapped.Validate(); err != nil {
 		return channels.MappedPrincipal{}, err
@@ -597,38 +592,6 @@ ON CONFLICT (tenant_id, app_id, binding_id, external_chat_key_hash, thread_key_h
 		return channels.Conversation{}, errors.New("channel conversation was not available after insert")
 	}
 	return conversation, nil
-}
-
-func upsertMembershipTx(
-	ctx context.Context,
-	tx pgx.Tx,
-	request IdentityMappingRequest,
-	conversationID string,
-	userID string,
-) (channels.Membership, error) {
-	if _, err := tx.Exec(ctx, `
-INSERT INTO platform.channel_membership (
-    tenant_id, app_id, conversation_id, user_id, role, status
-) VALUES ($1, $2, $3, $4, $5, $6)
-ON CONFLICT (tenant_id, app_id, conversation_id, user_id)
-DO UPDATE SET role = EXCLUDED.role, status = EXCLUDED.status, updated_at = clock_timestamp()`,
-		request.Scope.TenantID,
-		request.Scope.AppID,
-		conversationID,
-		userID,
-		channels.MembershipRoleMember,
-		channels.MembershipActive,
-	); err != nil {
-		return channels.Membership{}, fmt.Errorf("upsert channel membership: %w", err)
-	}
-	return channels.Membership{
-		TenantID:       request.Scope.TenantID,
-		AppID:          request.Scope.AppID,
-		ConversationID: conversationID,
-		UserID:         userID,
-		Role:           channels.MembershipRoleMember,
-		Status:         channels.MembershipActive,
-	}, nil
 }
 
 func validateMappingBindingTx(

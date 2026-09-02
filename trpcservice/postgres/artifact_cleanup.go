@@ -161,8 +161,8 @@ WHERE cleanup_id = $1 AND status = 'RUNNING' AND lease_owner = $2 AND run_token 
 	return nil
 }
 
-// CompleteArtifactCleanup records successful deletion for the current lease
-// holder and retains the cleanup row as an audit record.
+// CompleteArtifactCleanup removes a completed cleanup record for the current
+// lease holder. The artifact metadata row remains the durable audit record.
 func (s *Store) CompleteArtifactCleanup(ctx context.Context, record platformartifact.CleanupRecord) error {
 	if err := s.validate(); err != nil {
 		return err
@@ -174,9 +174,7 @@ func (s *Store) CompleteArtifactCleanup(ctx context.Context, record platformarti
 		return errors.New("artifact cleanup must be running to complete")
 	}
 	tag, err := s.pool.Exec(ctx, `
-UPDATE platform.artifact_cleanup
-SET status = 'SUCCEEDED', lease_owner = NULL, lease_until = NULL, run_token = NULL,
-    last_error = '', updated_at = clock_timestamp()
+DELETE FROM platform.artifact_cleanup
 WHERE cleanup_id = $1 AND status = 'RUNNING' AND lease_owner = $2 AND run_token = $3
   AND lease_until > clock_timestamp()`, record.ID, record.LeaseOwner, record.RunToken)
 	if err != nil {

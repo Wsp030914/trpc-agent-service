@@ -95,9 +95,6 @@ func TestIdentityMapperPersistsScopedPrincipals(t *testing.T) {
 	if group.Identity.UserID != direct.Identity.UserID || group.Conversation == nil || group.SessionPrincipalID != group.Conversation.ConversationID {
 		t.Fatalf("group mapping is invalid: %#v", group)
 	}
-	if group.Membership == nil || group.Membership.UserID != group.Identity.UserID {
-		t.Fatalf("group membership is invalid: %#v", group.Membership)
-	}
 	secondGroup, err := mapper.Map(ctx, platformpostgres.IdentityMappingRequest{
 		Scope:                      scope,
 		BindingID:                  binding.BindingID,
@@ -111,21 +108,9 @@ func TestIdentityMapperPersistsScopedPrincipals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("map second group member: %v", err)
 	}
-	if secondGroup.Conversation.ConversationID != group.Conversation.ConversationID || secondGroup.Membership.UserID != secondGroup.Identity.UserID {
+	if secondGroup.Conversation.ConversationID != group.Conversation.ConversationID {
 		t.Fatalf("second group member mapping is invalid: %#v", secondGroup)
 	}
-	var membershipCount int
-	if err := pool.QueryRow(ctx, `
-SELECT count(*)
-FROM platform.channel_membership
-WHERE tenant_id = $1 AND app_id = $2 AND conversation_id = $3`,
-		scope.TenantID, scope.AppID, group.Conversation.ConversationID).Scan(&membershipCount); err != nil {
-		t.Fatalf("count group memberships: %v", err)
-	}
-	if membershipCount != 2 {
-		t.Fatalf("group membership count = %d, want 2", membershipCount)
-	}
-
 	topic, err := mapper.Map(ctx, platformpostgres.IdentityMappingRequest{
 		Scope:                scope,
 		BindingID:            binding.BindingID,
@@ -369,17 +354,6 @@ WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`,
 	if identityCount != 1 {
 		t.Fatalf("identity count = %d, want 1", identityCount)
 	}
-	var membershipCount int
-	if err := pool.QueryRow(ctx, `
-SELECT count(*)
-FROM platform.channel_membership
-	WHERE tenant_id = $1 AND app_id = $2 AND conversation_id = $3`,
-		scope.TenantID, scope.AppID, conversationID).Scan(&membershipCount); err != nil {
-		t.Fatalf("count memberships: %v", err)
-	}
-	if membershipCount != 1 {
-		t.Fatalf("membership count = %d, want 1", membershipCount)
-	}
 }
 
 func seedIdentityMappingScope(
@@ -425,16 +399,23 @@ func seedIdentityMappingBinding(
 ) channels.Binding {
 	t.Helper()
 	binding := channels.Binding{
-		TenantID:         scope.TenantID,
-		AppID:            scope.AppID,
-		BindingID:        bindingID,
-		Channel:          channel,
-		ExternalAccount:  bindingID + "-account",
-		WebhookURL:       "https://example.com/" + bindingID,
-		TokenRef:         tenant.SecretRef{Name: bindingID + "-token", Version: "1"},
-		SigningSecretRef: tenant.SecretRef{Name: bindingID + "-signing", Version: "1"},
-		Status:           channels.BindingActive,
+		TenantID:             scope.TenantID,
+		AppID:                scope.AppID,
+		BindingID:            bindingID,
+		Channel:              channel,
+		ExternalAccount:      bindingID + "-account",
+		ExternalAccountScope: bindingID + "-scope",
+		WebhookURL:           "https://example.com/" + bindingID,
+		TokenRef:             tenant.SecretRef{Name: bindingID + "-token", Version: "1"},
+		SigningSecretRef:     tenant.SecretRef{Name: bindingID + "-signing", Version: "1"},
+		Status:               channels.BindingActive,
 	}
+	publicRouteID, err := channels.NewPublicRouteID()
+	if err != nil {
+		t.Fatalf("generate public route id: %v", err)
+	}
+	binding.PublicRouteID = publicRouteID
+	binding.BindingRevision = 1
 	if err := store.CreateChannelBinding(ctx, binding); err != nil {
 		t.Fatalf("create channel binding: %v", err)
 	}

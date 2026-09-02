@@ -1,20 +1,18 @@
 package feishu
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"mime"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/internal/callbackhttp"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -27,10 +25,6 @@ const (
 )
 
 var (
-	errInvalidFeishuPath     = errors.New("invalid feishu callback path")
-	errCallbackBodyRequired  = errors.New("feishu callback body is required")
-	errCallbackBodyTooLarge  = errors.New("feishu callback body is too large")
-	errCallbackContentType   = errors.New("feishu callback content type is invalid")
 	errCallbackUnavailable   = errors.New("feishu callback verification unavailable")
 	errAttachmentIngestorReq = errors.New("attachment ingestor is required")
 )
@@ -82,8 +76,9 @@ func WithAttachmentIngestor(ingestor channels.AttachmentIngestor) AdapterOption 
 	}
 }
 
-// WithRecallAdmitter registers the durable recall boundary. Authenticated
-// recall events are rejected for retry when no admitter is configured.
+// WithRecallAdmitter registers the durable, provider-neutral recall boundary.
+// A verified recall is rejected for retry when production has no persistence
+// path, so an event is never acknowledged and silently discarded.
 func WithRecallAdmitter(admitter channels.RecallAdmitter) AdapterOption {
 	return func(adapter *Adapter) error {
 		adapter.recallAdmitter = admitter
@@ -149,7 +144,7 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a == nil || w == nil || r == nil {
 		return
 	}
-	routeKey, err := callbackRouteKey(r)
+	routeKey, err := callbackhttp.RouteKey(r, channels.ChannelFeishu)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -161,7 +156,7 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		routeKey,
 	)
 	if err != nil {
-		writeRouteError(w, r, err)
+		callbackhttp.WriteRouteError(w, r, err)
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -174,19 +169,19 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route gateway.LocatedChannelBinding) {
 	if r.Body == nil {
-		writeProtocolError(w, r, errCallbackBodyRequired)
+		callbackhttp.WriteProtocolError(w, callbackhttp.ErrBodyRequired)
 		return
 	}
 	defer func() {
 		_ = r.Body.Close()
 	}()
-	if err := validateJSONContentType(r); err != nil {
-		writeProtocolError(w, r, err)
+	if err := callbackhttp.ValidateJSONContentType(r); err != nil {
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
-	body, err := readCallbackBody(w, r, a.maxCallbackBytes)
+	body, err := callbackhttp.ReadBody(w, r, a.maxCallbackBytes)
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	binding := route.Snapshot()
@@ -197,11 +192,11 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 	}
 	plain, metadata, err := decodeCallback(body, r.Header, encryptKey, a.now().UTC(), a.clockSkew)
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	if err := verifyCallbackMetadata(metadata, binding, verificationToken); err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	if metadata.RequestType == feishuChallengeType {
@@ -209,20 +204,7 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 		return
 	}
 	if metadata.EventType == feishuRecallEventType {
-		if a.recallAdmitter == nil {
-			http.Error(w, "recall processing unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		recall, err := normalizeRecallEvent(binding, metadata, plain)
-		if err != nil {
-			writeProtocolError(w, r, err)
-			return
-		}
-		if _, err := a.recallAdmitter.AdmitRecall(r.Context(), recall); err != nil {
-			writeAdmissionError(w, r, err)
-			return
-		}
-		writeEventAck(w)
+		a.handleRecall(w, r, binding, plain, metadata)
 		return
 	}
 	if metadata.EventType != feishuMessageEventType {
@@ -234,12 +216,12 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 	}
 	var received larkim.P2MessageReceiveV1
 	if err := json.Unmarshal(plain, &received); err != nil {
-		writeProtocolError(w, r, fmt.Errorf("%w: typed event", errFeishuCallbackEvent))
+		callbackhttp.WriteProtocolError(w, fmt.Errorf("%w: typed event", errFeishuCallbackEvent))
 		return
 	}
 	envelope, err := normalizeMessageEvent(binding, &received)
 	if err != nil {
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	input, err := a.channelInput(r.Context(), envelope)
@@ -248,7 +230,7 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 			http.Error(w, "attachment processing unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		writeProtocolError(w, r, err)
+		callbackhttp.WriteProtocolError(w, err)
 		return
 	}
 	requestID := uuid.NewString()
@@ -272,7 +254,36 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 		ChannelInput:   &input,
 	})
 	if err != nil {
-		writeAdmissionError(w, r, err)
+		callbackhttp.WriteAdmissionError(w, err)
+		return
+	}
+	writeEventAck(w)
+}
+
+func (a *Adapter) handleRecall(
+	w http.ResponseWriter,
+	r *http.Request,
+	binding channels.BindingSnapshot,
+	plain []byte,
+	metadata callbackMetadata,
+) {
+	if a.recallAdmitter == nil {
+		http.Error(w, "recall admission unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var recalled larkim.P2MessageRecalledV1
+	if err := json.Unmarshal(plain, &recalled); err != nil {
+		callbackhttp.WriteProtocolError(w, fmt.Errorf("%w: typed recall event", errFeishuRecallEvent))
+		return
+	}
+	payloadHash := sha256.Sum256(plain)
+	request, err := normalizeRecallEvent(binding, metadata, &recalled, payloadHash[:])
+	if err != nil {
+		callbackhttp.WriteProtocolError(w, err)
+		return
+	}
+	if _, err := a.recallAdmitter.AdmitRecall(r.Context(), request); err != nil {
+		callbackhttp.WriteAdmissionError(w, err)
 		return
 	}
 	writeEventAck(w)
@@ -337,49 +348,6 @@ func (a *Adapter) channelInput(ctx context.Context, envelope VerifiedProviderEnv
 	return input, nil
 }
 
-func callbackRouteKey(r *http.Request) (string, error) {
-	if r == nil || r.URL == nil {
-		return "", errInvalidFeishuPath
-	}
-	path := strings.TrimSuffix(r.URL.Path, "/")
-	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
-	if len(parts) != 3 || parts[0] != "im" || parts[1] != string(channels.ChannelFeishu) || parts[2] == "" {
-		return "", errInvalidFeishuPath
-	}
-	return parts[2], nil
-}
-
-func validateJSONContentType(r *http.Request) error {
-	value := strings.TrimSpace(r.Header.Get("Content-Type"))
-	if value == "" {
-		return errCallbackContentType
-	}
-	mediaType, _, err := mime.ParseMediaType(value)
-	if err != nil || mediaType != "application/json" {
-		return errCallbackContentType
-	}
-	return nil
-}
-
-func readCallbackBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, error) {
-	if maxBytes <= 0 {
-		return nil, errCallbackBodyTooLarge
-	}
-	limited := http.MaxBytesReader(w, r.Body, maxBytes)
-	body, err := io.ReadAll(limited)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			return nil, errCallbackBodyTooLarge
-		}
-		return nil, errCallbackBodyRequired
-	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, errCallbackBodyRequired
-	}
-	return body, nil
-}
-
 func writeChallenge(w http.ResponseWriter, challenge string) {
 	payload, err := json.Marshal(struct {
 		Challenge string `json:"challenge"`
@@ -399,34 +367,4 @@ func writeJSON(w http.ResponseWriter, status int, payload []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(payload)
-}
-
-func writeRouteError(w http.ResponseWriter, r *http.Request, err error) {
-	switch {
-	case errors.Is(err, channels.ErrBindingNotFound), errors.Is(err, channels.ErrBindingChannelMismatch):
-		http.NotFound(w, r)
-	case errors.Is(err, channels.ErrBindingInactive):
-		http.Error(w, "callback binding is inactive", http.StatusForbidden)
-	default:
-		http.Error(w, "callback route unavailable", http.StatusServiceUnavailable)
-	}
-}
-
-func writeProtocolError(w http.ResponseWriter, _ *http.Request, err error) {
-	if errors.Is(err, errCallbackBodyTooLarge) {
-		http.Error(w, "callback body is too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	http.Error(w, "invalid callback", http.StatusBadRequest)
-}
-
-func writeAdmissionError(w http.ResponseWriter, _ *http.Request, err error) {
-	switch {
-	case errors.Is(err, gateway.ErrIdempotencyConflict):
-		http.Error(w, "callback idempotency conflict", http.StatusConflict)
-	case errors.Is(err, channels.ErrBindingInactive), errors.Is(err, gateway.ErrChannelBindingSnapshotStale):
-		http.Error(w, "callback binding changed", http.StatusServiceUnavailable)
-	default:
-		http.Error(w, "callback admission unavailable", http.StatusServiceUnavailable)
-	}
 }

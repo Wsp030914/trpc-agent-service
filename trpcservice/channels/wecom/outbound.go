@@ -8,9 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
-	"time"
-	"unicode/utf8"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
@@ -21,10 +18,8 @@ const (
 )
 
 var (
-	errWeComReplyTooLarge         = errors.New("wecom reply is too large")
-	errWeComReplyUnsupported      = errors.New("wecom reply is unsupported")
-	errWeComPassiveReplyRequired  = errors.New("wecom stream reply requires current callback response")
-	errWeComPassiveResponseWriter = errors.New("wecom passive response writer is invalid")
+	errWeComReplyTooLarge    = errors.New("wecom reply is too large")
+	errWeComReplyUnsupported = errors.New("wecom reply is unsupported")
 )
 
 // ProviderSendError is the stable, body-redacted error returned by one
@@ -141,103 +136,6 @@ func (c *OutboundClient) SendOnce(
 		return channels.ProviderReceipt{}, err
 	}
 	return providerReceipt(reply, outboundContext, result), nil
-}
-
-// PassiveReplyOption configures a passive reply writer.
-type PassiveReplyOption func(*PassiveReplyWriter)
-
-// WithPassiveReplyClock supplies the timestamp source used for passive replies.
-func WithPassiveReplyClock(clock func() time.Time) PassiveReplyOption {
-	return func(writer *PassiveReplyWriter) {
-		if clock != nil {
-			writer.now = clock
-		}
-	}
-}
-
-// PassiveReplyWriter encodes one encrypted response for the current WeCom
-// callback. It performs no network I/O and must only write to the current
-// callback response.
-type PassiveReplyWriter struct {
-	codec callbackCodec
-	now   func() time.Time
-}
-
-// NewPassiveReplyWriter creates a passive WeCom callback response writer. The
-// caller must resolve token and EncodingAESKey through its scoped secret
-// provider before passing them here.
-func NewPassiveReplyWriter(
-	token string,
-	encodingAESKey string,
-	opts ...PassiveReplyOption,
-) (*PassiveReplyWriter, error) {
-	codec, err := newCallbackCodec(token, encodingAESKey)
-	if err != nil {
-		return nil, err
-	}
-	writer := &PassiveReplyWriter{codec: codec, now: time.Now}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(writer)
-		}
-	}
-	return writer, nil
-}
-
-// Write encrypts one passive WeCom streaming reply and writes it to the
-// current callback response. It does not make an HTTP request or manage Reply
-// Outbox state. The callback nonce must come from the current inbound request.
-func (writer *PassiveReplyWriter) Write(
-	responseWriter http.ResponseWriter,
-	reply channels.Reply,
-	nonce string,
-	outboundContext channels.OutboundContext,
-) (channels.ProviderReceipt, error) {
-	if writer == nil || writer.now == nil || responseWriter == nil {
-		return channels.ProviderReceipt{}, errWeComPassiveResponseWriter
-	}
-	if err := reply.Validate(); err != nil {
-		return channels.ProviderReceipt{}, fmt.Errorf("wecom reply: %w", err)
-	}
-	if reply.Channel != channels.ChannelWeCom {
-		return channels.ProviderReceipt{}, errors.New("wecom passive reply writer received another channel")
-	}
-	if nonce == "" || !utf8.ValidString(nonce) {
-		return channels.ProviderReceipt{}, errors.New("wecom passive reply nonce is invalid")
-	}
-	if outboundContext.StreamContext == "" {
-		return channels.ProviderReceipt{}, errWeComPassiveReplyRequired
-	}
-	payload, err := encodeReply(reply, outboundContext)
-	if err != nil {
-		return channels.ProviderReceipt{}, err
-	}
-	encrypted, err := writer.codec.encrypt(payload)
-	if err != nil {
-		return channels.ProviderReceipt{}, &ProviderSendError{cause: err}
-	}
-	timestampValue := writer.now().Unix()
-	timestamp := strconv.FormatInt(timestampValue, 10)
-	responsePayload, err := json.Marshal(struct {
-		Encrypt      string `json:"encrypt"`
-		MsgSignature string `json:"msgsignature"`
-		Timestamp    int64  `json:"timestamp"`
-		Nonce        string `json:"nonce"`
-	}{
-		Encrypt:      encrypted,
-		MsgSignature: writer.codec.signature(timestamp, nonce, encrypted),
-		Timestamp:    timestampValue,
-		Nonce:        nonce,
-	})
-	if err != nil {
-		return channels.ProviderReceipt{}, &ProviderSendError{cause: errors.New("encode wecom passive reply")}
-	}
-	responseWriter.Header().Set("Content-Type", "application/json")
-	responseWriter.WriteHeader(http.StatusOK)
-	if _, err := responseWriter.Write(responsePayload); err != nil {
-		return channels.ProviderReceipt{}, &ProviderSendError{cause: errors.New("write wecom passive response")}
-	}
-	return providerReceipt(reply, outboundContext, providerResponse{}), nil
 }
 
 func sendProviderPayload(

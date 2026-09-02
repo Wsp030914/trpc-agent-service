@@ -29,11 +29,17 @@ func (r RecallRequest) Validate() error {
 	if err := r.Channel.Validate(); err != nil {
 		return err
 	}
-	if _, err := NormalizeExternalID(r.ExternalEventID); err != nil {
-		return fmt.Errorf("recall external event id: %w", err)
-	}
-	if _, err := NormalizeExternalID(r.ExternalMessageID); err != nil {
-		return fmt.Errorf("recall external message id: %w", err)
+	for name, value := range map[string]string{
+		"external event id":   r.ExternalEventID,
+		"external message id": r.ExternalMessageID,
+	} {
+		normalized, err := NormalizeExternalID(value)
+		if err != nil {
+			return fmt.Errorf("recall %s: %w", name, err)
+		}
+		if normalized != value {
+			return fmt.Errorf("recall %s is not normalized", name)
+		}
 	}
 	if len(r.PayloadHash) != sha256.Size {
 		return errors.New("recall payload hash must be a sha256 digest")
@@ -42,8 +48,8 @@ func (r RecallRequest) Validate() error {
 }
 
 // RecallResult describes the durable result of one recall event. A running
-// execution needs a best-effort ManagedRunner cancellation after this method
-// commits; the database state remains authoritative.
+// execution is canceled by the worker after this method commits; PostgreSQL
+// remains the authoritative state machine.
 type RecallResult struct {
 	RequestID       string
 	ExecutionStatus string

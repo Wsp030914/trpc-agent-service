@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -235,7 +234,7 @@ SELECT EXISTS (
 			reply.Operation = channels.ReplyOperationSend
 		}
 	}
-	reply.ReplyID = stableReplyID(reply)
+	reply.ReplyID = reply.StableID()
 	if err := reply.Validate(); err != nil {
 		return nil, fmt.Errorf("projected reply: %w", err)
 	}
@@ -712,15 +711,6 @@ func replyEventSequence(sourceEventID, requestID string) (int64, error) {
 		return 0, errors.New("reply source event sequence is invalid")
 	}
 	return value, nil
-}
-
-func stableReplyID(reply channels.Reply) string {
-	identity := strings.Join([]string{
-		reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID,
-		reply.SourceEventID, reply.LogicalReplyID,
-		strconv.FormatInt(reply.PartNo, 10), strconv.FormatInt(reply.Revision, 10), string(reply.Operation),
-	}, "\x1f")
-	return uuid.NewSHA1(uuid.Nil, []byte(identity)).String()
 }
 
 var (

@@ -15,10 +15,9 @@ type SessionCatalog interface {
 	ListDataMigrationSessionKeys(context.Context, Record) ([]session.Key, error)
 }
 
-// Repository owns durable migration state transitions and reporting.
+// Repository owns durable migration state transitions.
 type Repository interface {
 	AdvanceDataMigration(context.Context, Record, Status) error
-	UpdateDataMigrationReport(context.Context, Record, Progress, Validation, string) error
 }
 
 // SessionCopier moves and verifies one logical Session between fixed source and
@@ -58,35 +57,25 @@ func (e Executor) Run(ctx context.Context, record Record) error {
 
 	keys, err := e.Catalog.ListDataMigrationSessionKeys(ctx, record)
 	if err != nil {
-		return e.fail(ctx, record, record.Progress, record.Validation, fmt.Errorf("list migration sessions: %w", err))
+		return e.fail(ctx, record, fmt.Errorf("list migration sessions: %w", err))
 	}
-	progress := record.Progress
-	progress.SessionCount = len(keys)
-	validation := record.Validation
 
 	if record.Status == StatusDraining {
 		if err := e.Repository.AdvanceDataMigration(ctx, record, StatusCopying); err != nil {
 			if errors.Is(err, ErrDrainDeadlineExceeded) {
-				return e.fail(ctx, record, progress, validation, err)
+				return e.fail(ctx, record, err)
 			}
 			return err
 		}
 		record.Status = StatusCopying
 	}
-	if err := e.Repository.UpdateDataMigrationReport(ctx, record, progress, validation, ""); err != nil {
-		return err
-	}
 	if record.Status == StatusCopying {
-		for index := progress.SessionsCopied; index < len(keys); index++ {
+		for index := range keys {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			if err := e.Copier.CopySession(ctx, keys[index]); err != nil {
-				return e.fail(ctx, record, progress, validation, fmt.Errorf("copy session %d: %w", index, err))
-			}
-			progress.SessionsCopied = index + 1
-			if err := e.Repository.UpdateDataMigrationReport(ctx, record, progress, validation, ""); err != nil {
-				return err
+				return e.fail(ctx, record, fmt.Errorf("copy session %d: %w", index, err))
 			}
 		}
 		if err := e.Repository.AdvanceDataMigration(ctx, record, StatusVerifying); err != nil {
@@ -95,17 +84,12 @@ func (e Executor) Run(ctx context.Context, record Record) error {
 		record.Status = StatusVerifying
 	}
 	if record.Status == StatusVerifying {
-		for index := progress.SessionsChecked; index < len(keys); index++ {
+		for index := range keys {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			if err := e.Copier.VerifySession(ctx, keys[index]); err != nil {
-				return e.fail(ctx, record, progress, validation, fmt.Errorf("verify session %d: %w", index, err))
-			}
-			progress.SessionsChecked = index + 1
-			validation.SessionsVerified = progress.SessionsChecked
-			if err := e.Repository.UpdateDataMigrationReport(ctx, record, progress, validation, ""); err != nil {
-				return err
+				return e.fail(ctx, record, fmt.Errorf("verify session %d: %w", index, err))
 			}
 		}
 		if err := e.Repository.AdvanceDataMigration(ctx, record, StatusSucceeded); err != nil {
@@ -115,13 +99,11 @@ func (e Executor) Run(ctx context.Context, record Record) error {
 	return nil
 }
 
-func (e Executor) fail(ctx context.Context, record Record, progress Progress, validation Validation, cause error) error {
+func (e Executor) fail(ctx context.Context, record Record, cause error) error {
 	if ctx.Err() != nil {
 		return cause
 	}
-	if err := e.Repository.UpdateDataMigrationReport(ctx, record, progress, validation, platformlog.SafeError(cause)); err != nil {
-		return errors.Join(cause, err)
-	}
+	record.FailureReason = platformlog.SafeError(cause)
 	if err := e.Repository.AdvanceDataMigration(ctx, record, StatusFailed); err != nil {
 		return errors.Join(cause, err)
 	}

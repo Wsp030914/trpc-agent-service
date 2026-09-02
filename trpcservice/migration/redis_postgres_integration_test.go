@@ -14,7 +14,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 	sessionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/session/postgres"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -88,7 +87,7 @@ func TestRedisPostgresCopierPreservesSessionSummary(t *testing.T) {
 	}
 
 	targetExec := integrationTargetExecution(t, key, schema)
-	resolver, err := sessionpostgres.NewSessionResolver(integrationDSN(*redisPostgresTestDSN))
+	resolver, err := sessionpostgres.NewSessionResolver(integrationSecret(*redisPostgresTestDSN))
 	if err != nil {
 		t.Fatalf("create postgres resolver: %v", err)
 	}
@@ -138,9 +137,9 @@ func (s summaryRedisSource) GetSession(
 	return value, nil
 }
 
-type integrationDSN string
+type integrationSecret string
 
-func (r integrationDSN) ResolveSessionDSN(context.Context, storage.Handle) (string, error) {
+func (r integrationSecret) ResolveSecret(context.Context, tenant.Scope, tenant.SecretRef) (string, error) {
 	return string(r), nil
 }
 
@@ -158,15 +157,12 @@ func integrationTargetExecution(t *testing.T, key session.Key, schema string) wo
 	backend := tenant.BackendConfig{
 		Name: "postgres-target",
 		Session: tenant.BackendRef{
-			Kind:     tenant.BackendSQL,
-			Provider: "postgres",
-			Name:     "postgres-target",
-			Options:  map[string]string{"schema": schema},
+			Kind:      tenant.BackendSQL,
+			Provider:  "postgres",
+			Name:      "postgres-target",
+			SecretRef: tenant.SecretRef{Name: "migration-postgres-dsn", Version: "1"},
+			Options:   map[string]string{"schema": schema},
 		},
-	}
-	handles, err := (storage.StaticResolver{}).Resolve(context.Background(), runtime, backend)
-	if err != nil {
-		t.Fatalf("resolve target storage: %v", err)
 	}
 	return worker.Execution{
 		Tenant: runtime,
@@ -176,7 +172,6 @@ func integrationTargetExecution(t *testing.T, key session.Key, schema string) wo
 			Version:       runtime.ConfigVersion,
 			BackendConfig: backend,
 		},
-		Storage: handles,
 	}
 }
 

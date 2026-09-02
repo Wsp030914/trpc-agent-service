@@ -29,12 +29,12 @@ type schemaMigration struct {
 	checksum [sha256.Size]byte
 }
 
-// Migrate applies embedded PostgreSQL platform-schema migrations in version
-// order. Each migration has its own transaction so an expand migration can be
-// committed before a later constraint migration. It does not move tenant data
-// between backend implementations. A PostgreSQL transaction-level advisory
-// lock serializes concurrent service nodes for each migration. Applied
-// migration contents are immutable and verified by checksum.
+// Migrate applies the embedded PostgreSQL platform schema. The development
+// history is represented by one immutable initialization migration; it does
+// not move tenant data between backend implementations. A PostgreSQL
+// transaction-level advisory lock serializes concurrent service nodes while
+// applying the schema. Applied migration contents are immutable and verified
+// by checksum.
 func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.validate(); err != nil {
 		return err

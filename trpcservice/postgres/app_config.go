@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
-	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -21,9 +19,6 @@ func (s *Store) InsertAppConfigVersion(ctx context.Context, cfg tenant.AppConfig
 	if err := s.validate(); err != nil {
 		return err
 	}
-	if err := config.ValidateAppConfigBindings(ctx, cfg, s); err != nil {
-		return fmt.Errorf("app config channel bindings: %w", err)
-	}
 	if err := s.validateKnowledgeBaseIDs(ctx, cfg); err != nil {
 		return err
 	}
@@ -32,8 +27,8 @@ func (s *Store) InsertAppConfigVersion(ctx context.Context, cfg tenant.AppConfig
 
 // ActivateAppConfig changes which immutable config version new admissions use.
 // Session, Memory, and Artifact backend changes require a data migration.
-// Knowledge is derived: a changed generation must be fully indexed before the
-// active version can switch.
+// Knowledge indexes are derived data and catch up asynchronously after the
+// active configuration switches.
 func (s *Store) ActivateAppConfig(ctx context.Context, tenantID, appID, version string) error {
 	if err := s.validate(); err != nil {
 		return err
@@ -70,7 +65,7 @@ FOR UPDATE`,
 	if activeVersion == version {
 		return tx.Commit(ctx)
 	}
-	blocked, err := activeDataMigrationExists(ctx, tx, tenantID, appID)
+	blocked, err := migrationBlocksAdmission(ctx, tx, tenantID, appID)
 	if err != nil {
 		return err
 	}
@@ -87,59 +82,6 @@ FOR UPDATE`,
 	}
 	if !sameAuthoritativeBackends(activeBackend, targetBackend) {
 		return errors.New("config activation changes authoritative backends; migrate the backends before switching the active version")
-	}
-	if !sameBackendRef(activeBackend.Knowledge, targetBackend.Knowledge) && !targetBackend.Knowledge.IsZero() {
-		generation := targetBackend.Knowledge.Options["index_generation"]
-		if generation == "" {
-			return errors.New("knowledge backend index_generation is required")
-		}
-		if !activeBackend.Knowledge.IsZero() && activeBackend.Knowledge.Options["index_generation"] == generation {
-			return errors.New("knowledge backend changes require a new index_generation")
-		}
-		scope := tenant.Scope{TenantID: tenantID, AppID: appID}
-		target, err := resolveAppConfigFrom(ctx, tx, tenantID, appID, version)
-		if err != nil {
-			return err
-		}
-		buildID, buildStatus, err := ensureKnowledgeGenerationBuild(ctx, tx, scope, version, generation)
-		if err != nil {
-			return err
-		}
-		if buildStatus == platformknowledge.IndexJobFailed {
-			if err := tx.Commit(ctx); err != nil {
-				return fmt.Errorf("commit failed knowledge generation: %w", err)
-			}
-			return fmt.Errorf("%w for config %q", tenant.ErrKnowledgeGenerationFailed, version)
-		}
-		if _, err := enqueueKnowledgeGeneration(ctx, tx, scope, version, buildID, target.KnowledgeBaseIDs, generation); err != nil {
-			return err
-		}
-		cause, failed, err := failedKnowledgeGenerationJob(ctx, tx, buildID)
-		if err != nil {
-			return err
-		}
-		if failed {
-			if err := failKnowledgeGenerationBuild(ctx, tx, buildID, cause); err != nil {
-				return err
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return fmt.Errorf("commit failed knowledge generation: %w", err)
-			}
-			return fmt.Errorf("%w for config %q", tenant.ErrKnowledgeGenerationFailed, version)
-		}
-		ready, err := knowledgeGenerationReady(ctx, tx, scope, version, buildID, target.KnowledgeBaseIDs, generation)
-		if err != nil {
-			return err
-		}
-		if !ready {
-			if err := tx.Commit(ctx); err != nil {
-				return fmt.Errorf("commit knowledge generation rebuild: %w", err)
-			}
-			return fmt.Errorf("%w for config %q", tenant.ErrKnowledgeGenerationPending, version)
-		}
-		if err := completeKnowledgeGenerationBuild(ctx, tx, buildID); err != nil {
-			return err
-		}
 	}
 	commandTag, err := tx.Exec(
 		ctx,
@@ -158,68 +100,6 @@ WHERE tenant_id = $1 AND app_id = $2`,
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit activate app config: %w", err)
-	}
-	return nil
-}
-
-// RebuildKnowledgeGeneration creates a fresh immutable build after a terminal
-// indexing failure. The target config remains inactive until ActivateAppConfig
-// observes that every source has completed the new build.
-func (s *Store) RebuildKnowledgeGeneration(ctx context.Context, tenantID, appID, version string) error {
-	if err := s.validate(); err != nil {
-		return err
-	}
-	if tenantID == "" || appID == "" || version == "" {
-		return errors.New("tenant_id, app_id, and config version are required")
-	}
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return fmt.Errorf("begin rebuild knowledge generation: %w", err)
-	}
-	defer func() { rollback(tx) }()
-	var activeVersion string
-	if err := tx.QueryRow(ctx, `
-SELECT active_config_version
-FROM platform.agent_app
-WHERE tenant_id = $1 AND app_id = $2
-FOR UPDATE`, tenantID, appID).Scan(&activeVersion); err != nil {
-		return fmt.Errorf("lock agent app: %w", resolveError("agent app", err))
-	}
-	if activeVersion == version {
-		return errors.New("active config does not require a knowledge rebuild")
-	}
-	target, err := resolveAppConfigFrom(ctx, tx, tenantID, appID, version)
-	if err != nil {
-		return err
-	}
-	if target.BackendConfig.Knowledge.IsZero() {
-		return errors.New("knowledge backend is not configured")
-	}
-	generation := target.BackendConfig.Knowledge.Options["index_generation"]
-	if generation == "" {
-		return errors.New("knowledge backend index_generation is required")
-	}
-	scope := tenant.Scope{TenantID: tenantID, AppID: appID}
-	_, status, err := ensureKnowledgeGenerationBuild(ctx, tx, scope, version, generation)
-	if err != nil {
-		return err
-	}
-	if status != platformknowledge.IndexJobFailed {
-		return errors.New("knowledge generation rebuild is not failed")
-	}
-	buildID := uuid.NewString()
-	if _, err := tx.Exec(ctx, `
-UPDATE platform.knowledge_generation_build
-SET build_id = $2, status = 'PENDING', last_error = '', updated_at = clock_timestamp()
-WHERE tenant_id = $1 AND app_id = $3 AND config_version = $4 AND status = 'FAILED'`,
-		tenantID, buildID, appID, version); err != nil {
-		return fmt.Errorf("restart knowledge generation build: %w", err)
-	}
-	if _, err := enqueueKnowledgeGeneration(ctx, tx, scope, version, buildID, target.KnowledgeBaseIDs, generation); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit rebuild knowledge generation: %w", err)
 	}
 	return nil
 }
@@ -260,7 +140,6 @@ func sameBackendRef(a, b tenant.BackendRef) bool {
 		a.Provider == b.Provider &&
 		a.Name == b.Name &&
 		a.SecretRef == b.SecretRef &&
-		a.DSNRef == b.DSNRef &&
 		reflect.DeepEqual(a.Options, b.Options)
 }
 
@@ -337,9 +216,6 @@ type appConfigColumns struct {
 }
 
 func insertAppConfig(ctx context.Context, db databaseExecutor, cfg tenant.AppConfig) error {
-	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("app config: %w", err)
-	}
 	modelConfig, toolPolicy, backendConfig, auditPolicy, secretRefs, bindings, knowledgeBaseIDs, err :=
 		marshalAppConfig(cfg)
 	if err != nil {
@@ -421,10 +297,9 @@ type backendConfigDocument struct {
 
 type backendRefDocument struct {
 	Kind      tenant.BackendKind `json:"kind,omitempty"`
-	Provider  string             `json:"provider,omitempty"`
+	Provider  string             `json:"provider"`
 	Name      string             `json:"name,omitempty"`
 	SecretRef secretRefDocument  `json:"secret_ref,omitempty"`
-	DSNRef    string             `json:"dsn_ref,omitempty"`
 	Options   map[string]string  `json:"options,omitempty"`
 }
 
@@ -621,7 +496,6 @@ func newBackendRefDocument(ref tenant.BackendRef) backendRefDocument {
 		Provider:  ref.Provider,
 		Name:      ref.Name,
 		SecretRef: newSecretRefDocument(ref.SecretRef),
-		DSNRef:    ref.DSNRef,
 		Options:   ref.Options,
 	}
 }
@@ -642,7 +516,6 @@ func (d backendRefDocument) value() tenant.BackendRef {
 		Provider:  d.Provider,
 		Name:      d.Name,
 		SecretRef: d.SecretRef.value(),
-		DSNRef:    d.DSNRef,
 		Options:   d.Options,
 	}
 }

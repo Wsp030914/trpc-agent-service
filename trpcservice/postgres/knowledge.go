@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"strconv"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
 )
@@ -102,7 +101,7 @@ WHERE tenant_id = $1 AND app_id = $2
 FOR UPDATE`, value.Scope.TenantID, value.Scope.AppID).Scan(&activeConfigVersion); err != nil {
 		return fmt.Errorf("lock knowledge import app: %w", resolveError("agent app", err))
 	}
-	if job.ConfigVersion != activeConfigVersion || job.BuildID != activeConfigVersion {
+	if job.ConfigVersion != activeConfigVersion {
 		return errors.New("knowledge import config is no longer active")
 	}
 	if err := upsertKnowledgeDocument(ctx, tx, value); err != nil {
@@ -111,57 +110,8 @@ FOR UPDATE`, value.Scope.TenantID, value.Scope.AppID).Scan(&activeConfigVersion)
 	if err := insertKnowledgeIndexJob(ctx, tx, job); err != nil {
 		return err
 	}
-	if err := enqueuePendingKnowledgeGenerationJobs(ctx, tx, value); err != nil {
-		return err
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit create knowledge document: %w", err)
-	}
-	return nil
-}
-
-func enqueuePendingKnowledgeGenerationJobs(
-	ctx context.Context,
-	tx pgx.Tx,
-	value platformknowledge.Document,
-) error {
-	rows, err := tx.Query(ctx, `
-SELECT build.build_id, build.config_version, build.index_generation
-FROM platform.knowledge_generation_build AS build
-JOIN platform.app_config_version AS config
-  ON config.tenant_id = build.tenant_id
- AND config.app_id = build.app_id
- AND config.version = build.config_version
-WHERE build.tenant_id = $1
-  AND build.app_id = $2
-  AND build.status = 'PENDING'
-  AND config.knowledge_base_ids @> jsonb_build_array($3::text)`,
-		value.Scope.TenantID, value.Scope.AppID, value.KnowledgeBaseID)
-	if err != nil {
-		return fmt.Errorf("list pending knowledge generation builds: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var buildID string
-		var configVersion string
-		var generation string
-		if err := rows.Scan(&buildID, &configVersion, &generation); err != nil {
-			return fmt.Errorf("read pending knowledge generation build: %w", err)
-		}
-		targetDocument := value.Clone()
-		targetDocument.IndexGeneration = generation
-		if err := insertKnowledgeIndexJob(ctx, tx, platformknowledge.IndexJob{
-			ID:            uuid.NewString(),
-			Document:      targetDocument,
-			ConfigVersion: configVersion,
-			BuildID:       buildID,
-			Status:        platformknowledge.IndexJobPending,
-		}); err != nil {
-			return err
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate pending knowledge generation builds: %w", err)
 	}
 	return nil
 }

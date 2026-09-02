@@ -10,7 +10,6 @@ import (
 	"time"
 
 	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
@@ -235,7 +234,12 @@ func TestEnvironmentSecretsAreScoped(t *testing.T) {
 	scope := tenant.Scope{TenantID: "tenant-a", AppID: "app-a"}
 	ref := tenant.SecretRef{Name: "model-key", Version: "v1"}
 	key := scopedSecretEnvironmentKey(scope, ref)
-	provider := environmentSecretProvider{getenv: environmentReader(map[string]string{key: "secret"})}
+	sessionRef := tenant.SecretRef{Name: "session-dsn", Version: "v1"}
+	sessionKey := scopedSecretEnvironmentKey(scope, sessionRef)
+	provider := environmentSecretProvider{getenv: environmentReader(map[string]string{
+		key:        "secret",
+		sessionKey: "postgres://metadata",
+	})}
 
 	value, err := provider.ResolveSecret(context.Background(), scope, ref)
 	if err != nil || value != "secret" {
@@ -246,10 +250,9 @@ func TestEnvironmentSecretsAreScoped(t *testing.T) {
 		t.Fatal("secret resolved for another tenant scope")
 	}
 
-	resolver := sessionDSNResolver{defaultDSN: "postgres://metadata", secrets: provider}
-	value, err = resolver.ResolveSessionDSN(context.Background(), storage.Handle{Scope: scope})
+	value, err = provider.ResolveSecret(context.Background(), scope, sessionRef)
 	if err != nil || value != "postgres://metadata" {
-		t.Fatalf("resolve default session dsn = %q, %v", value, err)
+		t.Fatalf("resolve session dsn = %q, %v", value, err)
 	}
 }
 

@@ -25,9 +25,19 @@ func TestBindingValidateAcceptsFeishu(t *testing.T) {
 	binding.WebhookURL = "https://example.com/im/feishu/binding-1"
 	binding.TokenRef = tenant.SecretRef{Name: "feishu-token", Version: "v1"}
 	binding.SigningSecretRef = tenant.SecretRef{Name: "feishu-signing-secret", Version: "v1"}
+	binding.Secret = tenant.SecretRef{Name: "feishu-app-secret", Version: "v1"}
 
 	if err := binding.Validate(); err != nil {
 		t.Fatalf("validate Feishu binding: %v", err)
+	}
+}
+
+func TestBindingValidateRequiresFeishuOutboundSecret(t *testing.T) {
+	binding := validBinding()
+	binding.Channel = channels.ChannelFeishu
+	binding.ExternalAccountScope = "feishu-tenant-1"
+	if err := binding.Validate(); err == nil {
+		t.Fatal("validate Feishu binding succeeded without outbound app secret")
 	}
 }
 
@@ -100,12 +110,6 @@ func TestNewPublicRouteIDIsURLSafeAndUnpredictable(t *testing.T) {
 		if err := channels.ValidatePublicRouteID(route); err != nil {
 			t.Fatalf("validate generated public route %q: %v", route, err)
 		}
-		if err := channels.ValidateGeneratedPublicRouteID(route); err != nil {
-			t.Fatalf("validate generated public route format %q: %v", route, err)
-		}
-	}
-	if err := channels.ValidateGeneratedPublicRouteID("route-human-readable"); err == nil {
-		t.Fatal("validate generated public route accepted a caller-chosen route")
 	}
 }
 

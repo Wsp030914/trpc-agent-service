@@ -308,7 +308,7 @@ SET status = 'DELETED', updated_at = now()
 WHERE tenant_id = $1 AND app_id = $2
   AND session_principal_id = $3 AND session_id = $4
   AND filename = $5 AND status = 'AVAILABLE'
-RETURNING artifact_id, tenant_id, app_id, session_principal_id, session_id,
+	RETURNING artifact_id, tenant_id, app_id, session_principal_id, session_id,
           filename, version, object_key, mime_type, size_bytes, status,
           created_at, updated_at`,
 		access.Scope.TenantID,
