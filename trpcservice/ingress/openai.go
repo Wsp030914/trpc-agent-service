@@ -11,6 +11,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	openaiserver "trpc.group/trpc-go/trpc-agent-go/server/openai"
 )
 
@@ -74,6 +75,10 @@ func (h openAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.next.ServeHTTP(w, r)
 		return
 	}
+	r = r.WithContext(platformtelemetry.ExtractHTTP(r.Context(), map[string]string{
+		"traceparent": r.Header.Get("traceparent"),
+		"tracestate":  r.Header.Get("tracestate"),
+	}))
 	request, err := h.authenticatedRequest(r)
 	if err != nil {
 		writeAuthenticationError(w, err)

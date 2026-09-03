@@ -7,14 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
 
 	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
+	platformegress "github.com/liuzengh/trpc-agent-service/trpcservice/egress"
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
 	memorytencentdb "github.com/liuzengh/trpc-agent-service/trpcservice/memory/tencentdb"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	platformsession "github.com/liuzengh/trpc-agent-service/trpcservice/session"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -59,7 +61,7 @@ type ModelEndpointPolicy interface {
 type DefaultEndpointPolicy struct{}
 
 func (DefaultEndpointPolicy) ResolveModelBaseURL(
-	_ context.Context,
+	ctx context.Context,
 	_ worker.Execution,
 	configuredURL string,
 ) (string, error) {
@@ -71,26 +73,11 @@ func (DefaultEndpointPolicy) ResolveModelBaseURL(
 	if parsed.Scheme != "https" || host == "" {
 		return "", errors.New("model base url must use https")
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		if blockedEndpointIP(ip) {
-			return "", errors.New("model base url resolves to a blocked address")
-		}
-		return configuredURL, nil
-	}
-	addresses, err := net.LookupIP(host)
+	_, err = platformegress.ResolveAllowedIPs(ctx, host)
 	if err != nil {
 		return "", fmt.Errorf("resolve model base url host: %w", err)
 	}
-	for _, address := range addresses {
-		if blockedEndpointIP(address) {
-			return "", errors.New("model base url resolves to a blocked address")
-		}
-	}
 	return configuredURL, nil
-}
-
-func blockedEndpointIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
 }
 
 var _ ModelEndpointPolicy = DefaultEndpointPolicy{}
@@ -163,7 +150,12 @@ func (r *OpenAIModelResolver) ResolveModel(ctx context.Context, exec worker.Exec
 	if apiKey == "" {
 		return ModelRuntime{}, errors.New("model api key is required")
 	}
-	opts := []modelopenai.Option{modelopenai.WithAPIKey(apiKey)}
+	opts := []modelopenai.Option{
+		modelopenai.WithAPIKey(apiKey),
+		modelopenai.WithHTTPClientOptions(
+			modelopenai.WithHTTPClientTransport(platformegress.NewHTTPTransport()),
+		),
+	}
 	if baseURL != "" {
 		opts = append(opts, modelopenai.WithBaseURL(baseURL))
 	}
@@ -183,6 +175,18 @@ type Runtime struct {
 	artifacts *platformartifact.ExecutionResolver
 	knowledge *knowledgeqdrant.Resolver
 	tools     *ToolCatalog
+	audit     platformaudit.Sink
+	metrics   *platformmetrics.Recorder
+}
+
+// SetObservability attaches the process audit sink and low-cardinality metric
+// recorder used by per-execution callbacks.
+func (r *Runtime) SetObservability(auditSink platformaudit.Sink, metricsRecorder *platformmetrics.Recorder) {
+	if r == nil {
+		return
+	}
+	r.audit = auditSink
+	r.metrics = metricsRecorder
 }
 
 // NewRuntime creates a runner builder that assembles LLMAgent,
@@ -252,6 +256,9 @@ func (r *Runtime) BuildRunner(
 		if err != nil {
 			return nil, fmt.Errorf("resolve session ingestor: %w", err)
 		}
+		if ingestor != nil {
+			ingestor = &tracedSessionIngestor{Ingestor: ingestor, exec: exec}
+		}
 	}
 	var artifactService frameworkartifact.Service
 	if !exec.Config.BackendConfig.Artifact.IsZero() {
@@ -298,9 +305,21 @@ func (r *Runtime) BuildRunner(
 			sessionexternalization.Config{Enabled: true},
 		)
 	}
+	sessionService = &tracedSessionService{
+		Service: sessionService,
+		exec:    exec,
+		metrics: r.metrics,
+	}
 	agentOptions := []llmagent.Option{
 		llmagent.WithModel(modelRuntime.Model),
 		llmagent.WithGenerationConfig(modelRuntime.GenerationConfig),
+	}
+	if callbacks := addModelObservabilityCallbacks(
+		newBudgetCallbacks(exec.Config.Budget),
+		exec,
+		r.metrics,
+	); callbacks != nil {
+		agentOptions = append(agentOptions, llmagent.WithModelCallbacks(callbacks))
 	}
 	if knowledgeService != nil {
 		agentOptions = append(agentOptions, llmagent.WithKnowledge(knowledgeService))
@@ -315,7 +334,10 @@ func (r *Runtime) BuildRunner(
 			return nil, err
 		}
 		agentOptions = append(agentOptions, llmagent.WithTools(visible))
-	} else if len(exec.Config.Tools.VisibleTools) > 0 || len(exec.Config.Tools.ExecutableTools) > 0 {
+		if len(visible) > 0 {
+			agentOptions = append(agentOptions, llmagent.WithToolCallbacks(r.toolCallbacks(exec)))
+		}
+	} else if len(exec.Config.Tools.VisibleTools) > 0 || len(exec.Config.Tools.ExecutableTools) > 0 || len(exec.Config.Tools.ReviewRequiredTools) > 0 {
 		return nil, errors.New("tool resolver is required for configured tools")
 	}
 	agent := llmagent.New(runtimeAgentName, agentOptions...)
@@ -358,6 +380,11 @@ func visibleTools(policy tenant.ToolPolicy, tools []frameworktool.Tool) ([]frame
 	for _, name := range policy.ExecutableTools {
 		if _, ok := available[name]; !ok {
 			return nil, fmt.Errorf("configured executable tool %q is not available", name)
+		}
+	}
+	for _, name := range policy.ReviewRequiredTools {
+		if _, ok := available[name]; !ok {
+			return nil, fmt.Errorf("configured review-required tool %q is not available", name)
 		}
 	}
 	return visible, nil

@@ -144,6 +144,56 @@ func TestToolPolicyDefaultsToDeny(t *testing.T) {
 	}
 }
 
+func TestToolPolicyReviewRequiresExecutionPermission(t *testing.T) {
+	policy := tenant.ToolPolicy{
+		VisibleTools:        []string{"search", "delete"},
+		ExecutableTools:     []string{"search", "delete"},
+		ReviewRequiredTools: []string{"delete"},
+	}
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("validate tool policy: %v", err)
+	}
+	if !policy.CanView("delete") || !policy.CanExecute("delete") || !policy.RequiresReview("delete") {
+		t.Fatal("review-required tool did not retain visible/executable/review permissions")
+	}
+	if policy.RequiresReview("search") {
+		t.Fatal("ordinary executable tool unexpectedly requires review")
+	}
+
+	policy.ReviewRequiredTools = []string{"hidden"}
+	if err := policy.Validate(); err == nil {
+		t.Fatal("review-required non-executable tool was accepted")
+	}
+}
+
+func TestIMAccessPolicyEmptyAndAllowlistedSemantics(t *testing.T) {
+	if !(tenant.IMAccessPolicy{}).Allows("user-a", "conversation-a") {
+		t.Fatal("empty IM access policy imposed an unexpected restriction")
+	}
+	policy := tenant.IMAccessPolicy{
+		AllowedUsers:         []string{"user-a"},
+		AllowedConversations: []string{"conversation-b"},
+	}
+	if !policy.Allows("user-a", "conversation-x") {
+		t.Fatal("allowlisted user was rejected")
+	}
+	if !policy.Allows("user-x", "conversation-b") {
+		t.Fatal("allowlisted conversation was rejected")
+	}
+	if policy.Allows("user-x", "conversation-x") {
+		t.Fatal("unlisted user and conversation were accepted")
+	}
+}
+
+func TestBudgetPolicyValidation(t *testing.T) {
+	if err := (tenant.BudgetPolicy{}).Validate(); err != nil {
+		t.Fatalf("validate unlimited budget: %v", err)
+	}
+	if err := (tenant.BudgetPolicy{MaxTokensPerExecution: -1}).Validate(); err == nil {
+		t.Fatal("negative token budget was accepted")
+	}
+}
+
 func validAppConfig() tenant.AppConfig {
 	return tenant.AppConfig{
 		TenantID: "tenant-a",

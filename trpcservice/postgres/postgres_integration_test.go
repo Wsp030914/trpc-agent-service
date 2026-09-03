@@ -85,6 +85,7 @@ func TestPostgresMigrationFromEmptySchema(t *testing.T) {
 		"channel_inbox",
 		"channel_recall_inbox",
 		"reply_outbox",
+		"audit_event",
 	} {
 		var exists bool
 		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "platform."+table).Scan(&exists); err != nil {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
@@ -133,6 +134,10 @@ type recordingRepository struct {
 	revokedTenantID     string
 	revokedAppID        string
 	revokedCredentialID string
+	auditEvents         []platformaudit.Event
+	auditTenantID       string
+	auditAppID          string
+	auditLimit          int
 }
 
 func (r *recordingRepository) CreateTenant(_ context.Context, value tenant.Tenant) error {
@@ -198,4 +203,21 @@ func (r *recordingRepository) RevokeCredential(
 	r.revokedAppID = appID
 	r.revokedCredentialID = credentialID
 	return nil
+}
+
+func (r *recordingRepository) ListAuditEvents(
+	_ context.Context,
+	tenantID, appID string,
+	limit int,
+) ([]platformaudit.Event, error) {
+	r.auditTenantID = tenantID
+	r.auditAppID = appID
+	r.auditLimit = limit
+	result := make([]platformaudit.Event, 0)
+	for _, event := range r.auditEvents {
+		if event.TenantID == tenantID && event.AppID == appID {
+			result = append(result, event)
+		}
+	}
+	return result, nil
 }

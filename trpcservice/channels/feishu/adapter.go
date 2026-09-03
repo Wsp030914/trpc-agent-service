@@ -14,8 +14,11 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/internal/callbackhttp"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const (
@@ -86,6 +89,14 @@ func WithRecallAdmitter(admitter channels.RecallAdmitter) AdapterOption {
 	}
 }
 
+// WithMetrics attaches the low-cardinality IM callback metrics recorder.
+func WithMetrics(recorder *platformmetrics.Recorder) AdapterOption {
+	return func(adapter *Adapter) error {
+		adapter.metrics = recorder
+		return nil
+	}
+}
+
 // Adapter verifies Feishu callbacks and submits normalized ChannelInput
 // values to Gateway. It does not call Runner or own Reply Outbox delivery.
 type Adapter struct {
@@ -97,6 +108,7 @@ type Adapter struct {
 	maxCallbackBytes   int64
 	clockSkew          time.Duration
 	now                func() time.Time
+	metrics            *platformmetrics.Recorder
 }
 
 // NewAdapter creates a Feishu callback Adapter. Binding.TokenRef is the
@@ -144,9 +156,31 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a == nil || w == nil || r == nil {
 		return
 	}
+	callbackCtx, span := platformtelemetry.StartSpan(
+		platformtelemetry.Extract(r.Context(), map[string]string{
+			"traceparent": r.Header.Get("traceparent"),
+			"tracestate":  r.Header.Get("tracestate"),
+		}),
+		"channel.callback",
+		attribute.String("channel", string(channels.ChannelFeishu)),
+	)
+	response := callbackhttp.NewStatusRecorder(w)
+	defer span.End()
+	defer func() {
+		errorType := callbackhttp.CallbackErrorType(response.Status())
+		if errorType != "" {
+			platformtelemetry.MarkError(span, errorType, errors.New(errorType))
+		}
+		if a.metrics != nil {
+			a.metrics.RecordIMCallback(callbackCtx, platformmetrics.Labels{
+				Channel: string(channels.ChannelFeishu),
+			}, errorType)
+		}
+	}()
+	r = r.WithContext(callbackCtx)
 	routeKey, err := callbackhttp.RouteKey(r, channels.ChannelFeishu)
 	if err != nil {
-		http.NotFound(w, r)
+		http.NotFound(response, r)
 		return
 	}
 	route, err := gateway.ResolveChannelBindingRoute(
@@ -156,15 +190,15 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		routeKey,
 	)
 	if err != nil {
-		callbackhttp.WriteRouteError(w, r, err)
+		callbackhttp.WriteRouteError(response, r, err)
 		return
 	}
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		response.Header().Set("Allow", http.MethodPost)
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	a.handleCallback(w, r, route)
+	a.handleCallback(response, r, route)
 }
 
 func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route gateway.LocatedChannelBinding) {

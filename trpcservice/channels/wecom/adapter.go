@@ -19,8 +19,11 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/internal/callbackhttp"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const (
@@ -90,6 +93,14 @@ func WithAttachmentIngestor(ingestor channels.AttachmentIngestor) AdapterOption 
 	}
 }
 
+// WithMetrics attaches the low-cardinality IM callback metrics recorder.
+func WithMetrics(recorder *platformmetrics.Recorder) AdapterOption {
+	return func(adapter *Adapter) error {
+		adapter.metrics = recorder
+		return nil
+	}
+}
+
 // Adapter verifies Enterprise WeChat AI Bot callbacks and submits normalized
 // channel inputs to the tenant-aware Gateway. It does not call Runner or own
 // reply outbox delivery.
@@ -101,6 +112,7 @@ type Adapter struct {
 	maxCallbackBytes   int64
 	clockSkew          time.Duration
 	now                func() time.Time
+	metrics            *platformmetrics.Recorder
 }
 
 // NewAdapter creates an Enterprise WeChat AI Bot callback Adapter.
@@ -145,9 +157,31 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a == nil || w == nil || r == nil {
 		return
 	}
+	callbackCtx, span := platformtelemetry.StartSpan(
+		platformtelemetry.Extract(r.Context(), map[string]string{
+			"traceparent": r.Header.Get("traceparent"),
+			"tracestate":  r.Header.Get("tracestate"),
+		}),
+		"channel.callback",
+		attribute.String("channel", string(channels.ChannelWeCom)),
+	)
+	response := callbackhttp.NewStatusRecorder(w)
+	defer span.End()
+	defer func() {
+		errorType := callbackhttp.CallbackErrorType(response.Status())
+		if errorType != "" {
+			platformtelemetry.MarkError(span, errorType, errors.New(errorType))
+		}
+		if a.metrics != nil {
+			a.metrics.RecordIMCallback(callbackCtx, platformmetrics.Labels{
+				Channel: string(channels.ChannelWeCom),
+			}, errorType)
+		}
+	}()
+	r = r.WithContext(callbackCtx)
 	routeKey, err := callbackhttp.RouteKey(r, channels.ChannelWeCom)
 	if err != nil {
-		http.NotFound(w, r)
+		http.NotFound(response, r)
 		return
 	}
 	route, err := gateway.ResolveChannelBindingRoute(
@@ -157,17 +191,17 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		routeKey,
 	)
 	if err != nil {
-		callbackhttp.WriteRouteError(w, r, err)
+		callbackhttp.WriteRouteError(response, r, err)
 		return
 	}
 	switch r.Method {
 	case http.MethodGet:
-		a.handleURLVerification(w, r, route.Snapshot())
+		a.handleURLVerification(response, r, route.Snapshot())
 	case http.MethodPost:
-		a.handleCallback(w, r, route)
+		a.handleCallback(response, r, route)
 	default:
-		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		response.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 

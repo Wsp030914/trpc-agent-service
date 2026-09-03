@@ -11,9 +11,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -44,6 +46,8 @@ func (s *Store) Admit(
 		// message ID. Do not let a caller-supplied key alias another message.
 		request.IdempotencyKey = request.ChannelInput.ExternalMessageID
 	}
+	request.Identity.Tenant.TraceParent = request.TraceParent
+	request.Identity.Tenant.TraceState = request.TraceState
 	var command []byte
 	var payloadHash [sha256.Size]byte
 	var err error
@@ -120,7 +124,8 @@ func (s *Store) Admit(
 			return gateway.AdmissionResult{}, err
 		}
 	}
-	if _, err := resolveAppConfigFrom(ctx, tx, app.TenantID, app.AppID, app.ActiveConfigVersion); err != nil {
+	appConfig, err := resolveAppConfigFrom(ctx, tx, app.TenantID, app.AppID, app.ActiveConfigVersion)
+	if err != nil {
 		return gateway.AdmissionResult{}, err
 	}
 	admission := admissionTransaction{
@@ -227,6 +232,51 @@ func (s *Store) Admit(
 		admission.runtimeContext.SessionPrincipalID = mapped.SessionPrincipalID
 		admission.runtimeContext.SessionID = mapped.SessionID
 		admission.runtimeContext.UserID = mapped.Identity.UserID
+		admission.runtimeContext.TraceParent = request.TraceParent
+		admission.runtimeContext.TraceState = request.TraceState
+		if !appConfig.IMAccess.Allows(
+			admission.runtimeContext.UserID,
+			admission.runtimeContext.SessionPrincipalID,
+		) {
+			if err := rejectChannelInboxForAccess(
+				ctx,
+				tx,
+				request,
+			); err != nil {
+				return gateway.AdmissionResult{}, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return gateway.AdmissionResult{}, fmt.Errorf("commit denied channel admission: %w", err)
+			}
+			if appConfig.Audit.Enabled {
+				event := platformaudit.Event{
+					TenantID:      admission.runtimeContext.TenantID,
+					AppID:         admission.runtimeContext.AppID,
+					Channel:       admission.runtimeContext.Channel,
+					UserID:        admission.runtimeContext.UserID,
+					SessionID:     admission.runtimeContext.SessionID,
+					AgentName:     "assistant",
+					Decision:      "rejected",
+					ErrorType:     "im_access_denied",
+					TraceID:       admission.runtimeContext.TraceID,
+					RequestID:     request.RequestID,
+					ConfigVersion: app.ActiveConfigVersion,
+					EventType:     platformaudit.IMAccessDenied,
+				}
+				s.recordAuditBestEffort(ctx, event)
+			}
+			if s.metrics != nil {
+				s.metrics.RecordGovernanceRejected(ctx, platformmetrics.Labels{
+					TenantID: admission.runtimeContext.TenantID,
+					AppID:    admission.runtimeContext.AppID,
+					Channel:  admission.runtimeContext.Channel,
+				}, platformaudit.IMAccessDenied)
+			}
+			return gateway.AdmissionResult{
+				RequestID: request.RequestID,
+				Status:    gateway.AdmissionStatusRejected,
+			}, nil
+		}
 		admission.command, _, err = marshalAdmissionCommand(
 			admission.runtimeContext,
 			request.Message,
@@ -253,6 +303,35 @@ func (s *Store) Admit(
 		return admission.reconcileExisting(existing)
 	}
 	return admission.createExecution()
+}
+
+func rejectChannelInboxForAccess(
+	ctx context.Context,
+	tx pgx.Tx,
+	request gateway.AdmissionRequest,
+) error {
+	if request.ChannelInput == nil {
+		return errors.New("channel input is required")
+	}
+	tag, err := tx.Exec(ctx, `
+UPDATE platform.channel_inbox
+SET status = 'REJECTED', reject_reason = 'IM_ACCESS_DENIED',
+    provider_reply_target_envelope = NULL, reply_target_expires_at = NULL,
+    updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
+  AND external_message_id = $4 AND status = 'ADMITTED'`,
+		request.ChannelInput.TenantID,
+		request.ChannelInput.AppID,
+		request.ChannelInput.BindingID,
+		request.ChannelInput.ExternalMessageID,
+	)
+	if err != nil {
+		return fmt.Errorf("reject channel inbox for access: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("reject channel inbox for access: inbox row is unavailable")
+	}
+	return nil
 }
 
 type admissionTransaction struct {
@@ -409,13 +488,13 @@ func (a admissionTransaction) reconcileExisting(existing admissionExecution) (ga
 		return gateway.AdmissionResult{}, gateway.ErrAdmissionDraining
 	}
 	// A failed terminal execution is re-armed instead of replayed so
-	// clients can retry the same logical request. The retry runs with
-	// the currently active configuration and a fresh attempt budget;
+	// clients can retry the same logical request. The retry keeps the
+	// execution's pinned configuration and receives a fresh attempt budget;
 	// the relay recovery refills its dispatch record.
 	tag, err := a.tx.Exec(
 		a.ctx,
 		`UPDATE platform.execution
-SET status = 'PENDING', attempt = 0, config_version = $4, last_error = NULL,
+SET status = 'PENDING', attempt = 0, last_error = NULL,
     lease_owner = NULL, run_token = NULL, lease_until = NULL, finished_at = NULL,
     next_attempt_at = clock_timestamp(), updated_at = clock_timestamp()
 WHERE tenant_id = $1
@@ -425,7 +504,6 @@ WHERE tenant_id = $1
 		a.credential.TenantID,
 		a.credential.AppID,
 		existing.RequestID,
-		a.app.ActiveConfigVersion,
 	)
 	if err != nil {
 		return gateway.AdmissionResult{}, fmt.Errorf("re-arm failed execution: %w", err)
@@ -438,7 +516,7 @@ WHERE tenant_id = $1
 	}
 	return gateway.AdmissionResult{
 		RequestID:     existing.RequestID,
-		ConfigVersion: a.app.ActiveConfigVersion,
+		ConfigVersion: existing.ConfigVersion,
 		TurnSeq:       existing.TurnSeq,
 	}, nil
 }
@@ -503,8 +581,10 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
     payload_hash,
     command,
     status,
-    trace_id
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'PENDING', $14)`,
+    trace_id,
+    trace_parent,
+    trace_state
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'PENDING', $14, $15, $16)`,
 		a.credential.TenantID,
 		a.credential.AppID,
 		a.request.RequestID,
@@ -518,7 +598,9 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 		a.request.IdempotencyKey,
 		a.payloadHash[:],
 		a.command,
-		a.request.Identity.Tenant.TraceID,
+		runtimeContext.TraceID,
+		runtimeContext.TraceParent,
+		runtimeContext.TraceState,
 	); err != nil {
 		return gateway.AdmissionResult{}, admissionInsertError("insert execution", err)
 	}
@@ -600,16 +682,21 @@ func validateAdmissionCredential(
 
 func lockTenant(ctx context.Context, tx pgx.Tx, tenantID string) (tenant.Tenant, error) {
 	var value tenant.Tenant
+	var auditPolicy []byte
 	err := tx.QueryRow(
 		ctx,
-		`SELECT tenant_id, name, status
+		`SELECT tenant_id, name, status, audit_policy
 FROM platform.tenant
 WHERE tenant_id = $1
 FOR UPDATE`,
 		tenantID,
-	).Scan(&value.ID, &value.Name, &value.Status)
+	).Scan(&value.ID, &value.Name, &value.Status, &auditPolicy)
 	if err != nil {
 		return tenant.Tenant{}, resolveError("tenant", err)
+	}
+	value.Audit, err = unmarshalAuditPolicy(auditPolicy)
+	if err != nil {
+		return tenant.Tenant{}, err
 	}
 	if err := value.Validate(); err != nil {
 		return tenant.Tenant{}, fmt.Errorf("stored tenant: %w", err)
@@ -686,7 +773,7 @@ func resolveAppConfigFrom(
 	var encoded appConfigColumns
 	err := db.QueryRow(
 		ctx,
-		`SELECT model_config, tool_policy, backend_config,
+		`SELECT model_config, tool_policy, backend_config, audit_policy,
        secret_refs, channel_binding_ids, knowledge_base_ids
 FROM platform.app_config_version
 WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
@@ -697,6 +784,7 @@ WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 		&encoded.modelConfig,
 		&encoded.toolPolicy,
 		&encoded.backendConfig,
+		&encoded.auditPolicy,
 		&encoded.secretRefs,
 		&encoded.channelBindingIDs,
 		&encoded.knowledgeBaseIDs,

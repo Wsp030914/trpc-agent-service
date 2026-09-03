@@ -1,0 +1,258 @@
+package runtime
+
+import (
+	"context"
+	"time"
+
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"trpc.group/trpc-go/trpc-agent-go/event"
+	frameworksession "trpc.group/trpc-go/trpc-agent-go/session"
+)
+
+// tracedSessionService instruments the actual session backend calls. The
+// framework invocation tracing is disabled at the runner boundary because it
+// records payloads; these spans keep the required storage boundary visible
+// without exposing messages or state values.
+type tracedSessionService struct {
+	frameworksession.Service
+	exec    worker.Execution
+	metrics *platformmetrics.Recorder
+}
+
+func (s *tracedSessionService) start(ctx context.Context, method string) (context.Context, trace.Span, time.Time) {
+	opCtx, span := platformtelemetry.StartSpan(ctx, "session.operation",
+		attribute.String("tenant_id", s.exec.Tenant.TenantID),
+		attribute.String("app_id", s.exec.Tenant.AppID),
+		attribute.String("config_version", s.exec.Tenant.ConfigVersion),
+		attribute.String("request_id", s.exec.RequestID),
+		attribute.String("backend.provider", s.exec.Config.BackendConfig.Session.Provider),
+		attribute.String("session.method", method),
+	)
+	return opCtx, span, time.Now()
+}
+
+func (s *tracedSessionService) finish(
+	ctx context.Context,
+	span trace.Span,
+	started time.Time,
+	err error,
+) {
+	if err != nil {
+		platformtelemetry.MarkError(span, "session", err)
+	}
+	span.End()
+	if s.metrics == nil {
+		return
+	}
+	errorType := ""
+	if err != nil {
+		errorType = "session"
+	}
+	s.metrics.RecordSession(ctx, platformmetrics.Labels{
+		TenantID: s.exec.Tenant.TenantID,
+		AppID:    s.exec.Tenant.AppID,
+		Channel:  s.exec.Tenant.Channel,
+		Provider: s.exec.Config.BackendConfig.Session.Provider,
+	}, time.Since(started), errorType)
+}
+
+func (s *tracedSessionService) CreateSession(
+	ctx context.Context,
+	key frameworksession.Key,
+	state frameworksession.StateMap,
+	opts ...frameworksession.Option,
+) (result *frameworksession.Session, err error) {
+	opCtx, span, started := s.start(ctx, "create")
+	result, err = s.Service.CreateSession(opCtx, key, state, opts...)
+	s.finish(opCtx, span, started, err)
+	return result, err
+}
+
+func (s *tracedSessionService) GetSession(
+	ctx context.Context,
+	key frameworksession.Key,
+	opts ...frameworksession.Option,
+) (result *frameworksession.Session, err error) {
+	opCtx, span, started := s.start(ctx, "get")
+	result, err = s.Service.GetSession(opCtx, key, opts...)
+	s.finish(opCtx, span, started, err)
+	return result, err
+}
+
+func (s *tracedSessionService) ListSessions(
+	ctx context.Context,
+	key frameworksession.UserKey,
+	opts ...frameworksession.Option,
+) (result []*frameworksession.Session, err error) {
+	opCtx, span, started := s.start(ctx, "list")
+	result, err = s.Service.ListSessions(opCtx, key, opts...)
+	s.finish(opCtx, span, started, err)
+	return result, err
+}
+
+func (s *tracedSessionService) DeleteSession(
+	ctx context.Context,
+	key frameworksession.Key,
+	opts ...frameworksession.Option,
+) (err error) {
+	opCtx, span, started := s.start(ctx, "delete")
+	err = s.Service.DeleteSession(opCtx, key, opts...)
+	s.finish(opCtx, span, started, err)
+	return err
+}
+
+func (s *tracedSessionService) UpdateAppState(
+	ctx context.Context,
+	appName string,
+	state frameworksession.StateMap,
+) (err error) {
+	opCtx, span, started := s.start(ctx, "update_app_state")
+	err = s.Service.UpdateAppState(opCtx, appName, state)
+	s.finish(opCtx, span, started, err)
+	return err
+}
+
+func (s *tracedSessionService) DeleteAppState(
+	ctx context.Context,
+	appName string,
+	key string,
+) (err error) {
+	opCtx, span, started := s.start(ctx, "delete_app_state")
+	err = s.Service.DeleteAppState(opCtx, appName, key)
+	s.finish(opCtx, span, started, err)
+	return err
+}
+
+func (s *tracedSessionService) ListAppStates(
+	ctx context.Context,
+	appName string,
+) (result frameworksession.StateMap, err error) {
+	opCtx, span, started := s.start(ctx, "list_app_state")
+	result, err = s.Service.ListAppStates(opCtx, appName)
+	s.finish(opCtx, span, started, err)
+	return result, err
+}
+
+func (s *tracedSessionService) UpdateUserState(
+	ctx context.Context,
+	key frameworksession.UserKey,
+	state frameworksession.StateMap,
+) (err error) {
+	opCtx, span, started := s.start(ctx, "update_user_state")
+	err = s.Service.UpdateUserState(opCtx, key, state)
+	s.finish(opCtx, span, started, err)
+	return err
+}
+
+func (s *tracedSessionService) ListUserStates(
+	ctx context.Context,
+	key frameworksession.UserKey,
+) (result frameworksession.StateMap, err error) {
+	opCtx, span, started := s.start(ctx, "list_user_state")
+	result, err = s.Service.ListUserStates(opCtx, key)
+	s.finish(opCtx, span, started, err)
+	return result, err
+}
+
+func (s *tracedSessionService) DeleteUserState(
+	ctx context.Context,
+	key frameworksession.UserKey,
+	stateKey string,
+) (err error) {
+	opCtx, span, started := s.start(ctx, "delete_user_state")
+	err = s.Service.DeleteUserState(opCtx, key, stateKey)
+	s.finish(opCtx, span, started, err)
+	return err
+}
+
+func (s *tracedSessionService) UpdateSessionState(
+	ctx context.Context,
+	key frameworksession.Key,
+	state frameworksession.StateMap,
+) (err error) {
+	opCtx, span, started := s.start(ctx, "update_session_state")
+	err = s.Service.UpdateSessionState(opCtx, key, state)
+	s.finish(opCtx, span, started, err)
+	return err
+}
+
+func (s *tracedSessionService) AppendEvent(
+	ctx context.Context,
+	sess *frameworksession.Session,
+	evt *event.Event,
+	opts ...frameworksession.Option,
+) (err error) {
+	opCtx, span, started := s.start(ctx, "append_event")
+	err = s.Service.AppendEvent(opCtx, sess, evt, opts...)
+	s.finish(opCtx, span, started, err)
+	return err
+}
+
+func (s *tracedSessionService) CreateSessionSummary(
+	ctx context.Context,
+	sess *frameworksession.Session,
+	filterKey string,
+	force bool,
+) (err error) {
+	opCtx, span, started := s.start(ctx, "create_summary")
+	err = s.Service.CreateSessionSummary(opCtx, sess, filterKey, force)
+	s.finish(opCtx, span, started, err)
+	return err
+}
+
+func (s *tracedSessionService) EnqueueSummaryJob(
+	ctx context.Context,
+	sess *frameworksession.Session,
+	filterKey string,
+	force bool,
+) (err error) {
+	opCtx, span, started := s.start(ctx, "enqueue_summary")
+	err = s.Service.EnqueueSummaryJob(opCtx, sess, filterKey, force)
+	s.finish(opCtx, span, started, err)
+	return err
+}
+
+func (s *tracedSessionService) GetSessionSummaryText(
+	ctx context.Context,
+	sess *frameworksession.Session,
+	opts ...frameworksession.SummaryOption,
+) (result string, ok bool) {
+	opCtx, span, started := s.start(ctx, "get_summary")
+	result, ok = s.Service.GetSessionSummaryText(opCtx, sess, opts...)
+	s.finish(opCtx, span, started, nil)
+	return result, ok
+}
+
+func (s *tracedSessionService) Close() (err error) {
+	return s.Service.Close()
+}
+
+type tracedSessionIngestor struct {
+	frameworksession.Ingestor
+	exec worker.Execution
+}
+
+func (i *tracedSessionIngestor) IngestSession(
+	ctx context.Context,
+	sess *frameworksession.Session,
+	opts ...frameworksession.IngestOption,
+) (err error) {
+	opCtx, span := platformtelemetry.StartSpan(ctx, "memory.operation",
+		attribute.String("tenant_id", i.exec.Tenant.TenantID),
+		attribute.String("app_id", i.exec.Tenant.AppID),
+		attribute.String("config_version", i.exec.Tenant.ConfigVersion),
+		attribute.String("request_id", i.exec.RequestID),
+		attribute.String("backend.provider", i.exec.Config.BackendConfig.Memory.Provider),
+	)
+	defer func() {
+		if err != nil {
+			platformtelemetry.MarkError(span, "memory", err)
+		}
+		span.End()
+	}()
+	return i.Ingestor.IngestSession(opCtx, sess, opts...)
+}

@@ -157,7 +157,13 @@ WHERE o.reply_id = c.reply_id
 RETURNING o.reply_id, o.tenant_id, o.app_id, o.binding_id,
           o.binding_revision, o.channel, o.request_id, o.source_event_id,
           o.revision, o.target_ref, o.payload, o.attempt,
-          o.lease_owner, o.lease_until, o.provider_message_id`,
+          o.lease_owner, o.lease_until, o.provider_message_id,
+          (SELECT e.trace_id FROM platform.execution e
+           WHERE e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.request_id = o.request_id),
+          (SELECT e.trace_parent FROM platform.execution e
+           WHERE e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.request_id = o.request_id),
+          (SELECT e.trace_state FROM platform.execution e
+           WHERE e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.request_id = o.request_id)`,
 		owner, intervalLiteral(leaseDuration), limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim reply outbox: %w", err)
@@ -185,6 +191,7 @@ func scanReplyDelivery(row replyRowScanner) (worker.ReplyDelivery, error) {
 	var (
 		replyID, tenantID, appID, bindingID, channel, requestID string
 		sourceEventID, leaseOwner, providerMessageID            string
+		traceID, traceParent, traceState                        string
 		bindingRevision, revision, attempt                      int64
 		targetJSON, payloadJSON                                 []byte
 		leaseUntil                                              time.Time
@@ -192,7 +199,7 @@ func scanReplyDelivery(row replyRowScanner) (worker.ReplyDelivery, error) {
 	if err := row.Scan(
 		&replyID, &tenantID, &appID, &bindingID, &bindingRevision, &channel, &requestID,
 		&sourceEventID, &revision, &targetJSON, &payloadJSON, &attempt, &leaseOwner, &leaseUntil,
-		&providerMessageID,
+		&providerMessageID, &traceID, &traceParent, &traceState,
 	); err != nil {
 		return worker.ReplyDelivery{}, fmt.Errorf("scan reply outbox: %w", err)
 	}
@@ -226,6 +233,9 @@ func scanReplyDelivery(row replyRowScanner) (worker.ReplyDelivery, error) {
 		LeaseOwner:        leaseOwner,
 		LeaseUntil:        leaseUntil.UTC(),
 		ProviderMessageID: providerMessageID,
+		TraceID:           traceID,
+		TraceParent:       traceParent,
+		TraceState:        traceState,
 	}, nil
 }
 

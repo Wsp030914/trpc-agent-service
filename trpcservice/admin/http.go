@@ -7,9 +7,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -39,6 +41,7 @@ func NewHTTPHandler(api API, token string) (http.Handler, error) {
 	mux.HandleFunc("/admin/v1/data-migrations/begin", methodHandler(http.MethodPost, handler.beginDataMigration))
 	mux.HandleFunc("/admin/v1/credentials", methodHandler(http.MethodPost, handler.issueCredential))
 	mux.HandleFunc("/admin/v1/credentials/revoke", methodHandler(http.MethodPost, handler.revokeCredential))
+	mux.HandleFunc("/admin/v1/audit-events", methodHandler(http.MethodGet, handler.listAuditEvents))
 	return handler.authorize(mux), nil
 }
 
@@ -121,6 +124,10 @@ type credentialResponse struct {
 	KeyPrefix string     `json:"key_prefix"`
 	Status    string     `json:"status"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+type auditEventsResponse struct {
+	Events []platformaudit.Event `json:"events"`
 }
 
 func (h adminHTTPHandler) authorize(next http.Handler) http.Handler {
@@ -301,6 +308,28 @@ func (h adminHTTPHandler) revokeCredential(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h adminHTTPHandler) listAuditEvents(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	limit := 0
+	if rawLimit := strings.TrimSpace(query.Get("limit")); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed <= 0 || parsed > 1000 {
+			writeJSONError(w, http.StatusBadRequest, "invalid audit limit")
+			return
+		}
+		limit = parsed
+	}
+	events, err := h.api.ListAuditEvents(r.Context(), tenant.Scope{
+		TenantID: strings.TrimSpace(query.Get("tenant_id")),
+		AppID:    strings.TrimSpace(query.Get("app_id")),
+	}, limit)
+	if err != nil {
+		writeAdminOperationError(w, err, "list audit events failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, auditEventsResponse{Events: events})
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {

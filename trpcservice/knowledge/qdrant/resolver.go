@@ -5,14 +5,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 
+	platformegress "github.com/liuzengh/trpc-agent-service/trpcservice/egress"
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	openaiopt "github.com/openai/openai-go/option"
 	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
 	frameworkembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
@@ -292,6 +295,9 @@ func (r *Resolver) newEmbedder(
 		openai.WithAPIKey(embeddingKey),
 		openai.WithModel(settings.embeddingModel),
 		openai.WithDimensions(settings.embeddingDimensions),
+		openai.WithRequestOptions(openaiopt.WithHTTPClient(&http.Client{
+			Transport: platformegress.NewHTTPTransport(),
+		})),
 	}
 	if configuredURL := exec.Config.Model.Parameters["base_url"]; configuredURL != "" {
 		baseURL, err := r.policy.ResolveModelBaseURL(ctx, exec, configuredURL)

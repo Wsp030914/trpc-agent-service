@@ -8,6 +8,10 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
@@ -109,6 +113,9 @@ type ReplyDelivery struct {
 	LeaseOwner        string
 	LeaseUntil        time.Time
 	ProviderMessageID string
+	TraceID           string
+	TraceParent       string
+	TraceState        string
 }
 
 // Validate checks the identity and lease fields of a claimed reply.
@@ -143,6 +150,7 @@ type ReplySenderOptions struct {
 	PollInterval time.Duration
 	BatchSize    int
 	MaxAttempts  int
+	Metrics      *platformmetrics.Recorder
 }
 
 // ReplySender claims Reply Outbox rows, sends each row once, and records the
@@ -157,6 +165,7 @@ type ReplySender struct {
 	pollInterval time.Duration
 	batchSize    int
 	maxAttempts  int
+	metrics      *platformmetrics.Recorder
 }
 
 // NewReplySender creates a finite-retry Reply Outbox sender.
@@ -200,6 +209,7 @@ func NewReplySender(
 		pollInterval: options.PollInterval,
 		batchSize:    options.BatchSize,
 		maxAttempts:  options.MaxAttempts,
+		metrics:      options.Metrics,
 	}, nil
 }
 
@@ -255,7 +265,19 @@ func (s *ReplySender) sendOne(ctx context.Context, delivery ReplyDelivery) error
 	if err := delivery.Validate(); err != nil {
 		return err
 	}
-	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout)
+	parentCtx := platformtelemetry.Extract(ctx, map[string]string{
+		"traceparent": delivery.TraceParent,
+		"tracestate":  delivery.TraceState,
+	})
+	replyCtx, span := platformtelemetry.StartSpan(parentCtx, "reply.send",
+		attribute.String("tenant_id", delivery.Reply.TenantID),
+		attribute.String("app_id", delivery.Reply.AppID),
+		attribute.String("channel", string(delivery.Reply.Channel)),
+		attribute.String("request_id", delivery.Reply.RequestID),
+	)
+	defer span.End()
+	started := time.Now()
+	sendCtx, cancel := context.WithTimeout(replyCtx, s.sendTimeout)
 	defer cancel()
 	provider, err := s.providers(sendCtx, delivery)
 	if err != nil {
@@ -266,30 +288,37 @@ func (s *ReplySender) sendOne(ctx context.Context, delivery ReplyDelivery) error
 		} else if errorType == "provider_permanent" {
 			errorType = "provider_resolution"
 		}
-		return s.recordFailure(ctx, delivery, err, retryable, errorType)
+		return s.recordFailure(ctx, delivery, err, retryable, errorType, started, span)
 	}
 	if provider.Client == nil {
-		return s.recordFailure(ctx, delivery, errors.New("reply provider client is not initialized"), false, "provider_client")
+		return s.recordFailure(ctx, delivery, errors.New("reply provider client is not initialized"), false, "provider_client", started, span)
 	}
 	if provider.Limiter != nil {
 		if err := provider.Limiter.Allow(sendCtx, delivery); err != nil {
-			return s.recordFailure(ctx, delivery, err, true, "rate_limit")
+			return s.recordFailure(ctx, delivery, err, true, "rate_limit", started, span)
 		}
 	}
 	providerTarget, err := s.targets(sendCtx, delivery)
 	if err != nil {
-		return s.recordFailure(ctx, delivery, err, false, "target_resolution")
+		return s.recordFailure(ctx, delivery, err, false, "target_resolution", started, span)
 	}
 	receipt, err := provider.Client.SendOnce(sendCtx, delivery.Reply, providerTarget)
 	if err != nil {
 		retryable, errorType := classifyReplyError(err)
-		return s.recordFailure(ctx, delivery, err, retryable, errorType)
+		return s.recordFailure(ctx, delivery, err, retryable, errorType, started, span)
 	}
 	if err := receipt.Validate(); err != nil {
-		return s.recordFailure(ctx, delivery, err, false, "invalid_provider_receipt")
+		return s.recordFailure(ctx, delivery, err, false, "invalid_provider_receipt", started, span)
 	}
 	if err := s.outbox.CompleteReply(ctx, delivery, receipt); err != nil {
 		return fmt.Errorf("complete reply: %w", err)
+	}
+	if s.metrics != nil {
+		s.metrics.RecordReply(ctx, platformmetrics.Labels{
+			TenantID: delivery.Reply.TenantID,
+			AppID:    delivery.Reply.AppID,
+			Channel:  string(delivery.Reply.Channel),
+		}, time.Since(started), "")
 	}
 	return nil
 }
@@ -300,9 +329,19 @@ func (s *ReplySender) recordFailure(
 	cause error,
 	retryable bool,
 	errorType string,
+	started time.Time,
+	span trace.Span,
 ) error {
 	if errorType == "" {
 		errorType = "provider_send"
+	}
+	platformtelemetry.MarkError(span, errorType, cause)
+	if s.metrics != nil {
+		s.metrics.RecordReply(ctx, platformmetrics.Labels{
+			TenantID: delivery.Reply.TenantID,
+			AppID:    delivery.Reply.AppID,
+			Channel:  string(delivery.Reply.Channel),
+		}, time.Since(started), errorType)
 	}
 	if retryable && delivery.Attempt < s.maxAttempts {
 		delay := retryDelay(delivery.Attempt)

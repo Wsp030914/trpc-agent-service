@@ -9,6 +9,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 const (
@@ -148,7 +149,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		claim, found, err := c.jobs.Claim(claimCtx, delivery.Dispatch, queue.ClaimRequest{Owner: c.owner, LeaseDuration: c.leaseDuration})
+		deliveryCtx := platformtelemetry.Extract(claimCtx, map[string]string{
+			"traceparent": delivery.Dispatch.TraceParent,
+			"tracestate":  delivery.Dispatch.TraceState,
+		})
+		claim, found, err := c.jobs.Claim(deliveryCtx, delivery.Dispatch, queue.ClaimRequest{Owner: c.owner, LeaseDuration: c.leaseDuration})
 		if err != nil {
 			if c.claimingStopped() && errors.Is(err, context.Canceled) {
 				return runErr
@@ -170,10 +175,10 @@ func (c *Consumer) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 		wg.Add(1)
-		go func(claim queue.Claim, delivery queue.Delivery) {
+		go func(runContext context.Context, claim queue.Claim, delivery queue.Delivery) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			ack, err := c.executeClaim(ctx, claim)
+			ack, err := c.executeClaim(runContext, claim)
 			if err != nil {
 				fail(err)
 				return
@@ -183,7 +188,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 					fail(fmt.Errorf("ack execution: %w", err))
 				}
 			}
-		}(claim, delivery)
+		}(deliveryCtx, claim, delivery)
 	}
 }
 func (c *Consumer) claimContext(parent context.Context) (context.Context, context.CancelFunc, bool) {

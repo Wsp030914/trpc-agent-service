@@ -22,26 +22,32 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/ingress"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	platformredis "github.com/liuzengh/trpc-agent-service/trpcservice/redis"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/relay"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 const (
-	envRole              = "TRPC_AGENT_SERVICE_ROLE"
-	envPostgresDSN       = "TRPC_AGENT_SERVICE_POSTGRES_DSN"
-	envRedisURL          = "TRPC_AGENT_SERVICE_REDIS_URL"
-	envRedisStream       = "TRPC_AGENT_SERVICE_REDIS_STREAM"
-	envRedisGroup        = "TRPC_AGENT_SERVICE_REDIS_GROUP"
-	envDispatcherID      = "TRPC_AGENT_SERVICE_DISPATCHER_ID"
-	envHTTPAddr          = "TRPC_AGENT_SERVICE_HTTP_ADDR"
-	envWorkerID          = "TRPC_AGENT_SERVICE_WORKER_ID"
-	envAdminToken        = "TRPC_AGENT_SERVICE_ADMIN_TOKEN"
-	envTencentDBGateways = "TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS"
-	envShutdownTimeout   = "TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT"
-	envCOSEndpoints      = "TRPC_AGENT_SERVICE_COS_ENDPOINTS"
-	envQdrantEndpoints   = "TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS"
+	envRole                = "TRPC_AGENT_SERVICE_ROLE"
+	envPostgresDSN         = "TRPC_AGENT_SERVICE_POSTGRES_DSN"
+	envRedisURL            = "TRPC_AGENT_SERVICE_REDIS_URL"
+	envRedisStream         = "TRPC_AGENT_SERVICE_REDIS_STREAM"
+	envRedisGroup          = "TRPC_AGENT_SERVICE_REDIS_GROUP"
+	envDispatcherID        = "TRPC_AGENT_SERVICE_DISPATCHER_ID"
+	envHTTPAddr            = "TRPC_AGENT_SERVICE_HTTP_ADDR"
+	envWorkerID            = "TRPC_AGENT_SERVICE_WORKER_ID"
+	envAdminToken          = "TRPC_AGENT_SERVICE_ADMIN_TOKEN"
+	envTencentDBGateways   = "TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS"
+	envShutdownTimeout     = "TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT"
+	envCOSEndpoints        = "TRPC_AGENT_SERVICE_COS_ENDPOINTS"
+	envQdrantEndpoints     = "TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS"
+	envOTELProtocol        = "TRPC_AGENT_SERVICE_OTEL_PROTOCOL"
+	envOTELTracesEndpoint  = "TRPC_AGENT_SERVICE_OTEL_TRACES_ENDPOINT"
+	envOTELMetricsEndpoint = "TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT"
+	envModelPricing        = "TRPC_AGENT_SERVICE_MODEL_PRICING"
 
 	defaultHTTPAddr        = ":8080"
 	defaultRedisStream     = "trpc-agent-service:dispatch"
@@ -74,6 +80,8 @@ type serviceConfig struct {
 	WorkerID        string
 	AdminToken      string
 	ShutdownTimeout time.Duration
+	Telemetry       platformtelemetry.Config
+	Pricing         platformmetrics.PricingCatalog
 }
 
 func main() {
@@ -112,6 +120,11 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 		WorkerID:        getenv(envWorkerID),
 		AdminToken:      getenv(envAdminToken),
 		ShutdownTimeout: defaultShutdownTimeout,
+		Telemetry: platformtelemetry.Config{
+			Protocol:       getenv(envOTELProtocol),
+			TraceEndpoint:  getenv(envOTELTracesEndpoint),
+			MetricEndpoint: getenv(envOTELMetricsEndpoint),
+		},
 	}
 	if config.Role != roleGateway && config.Role != roleWorker && config.Role != roleAll {
 		return serviceConfig{}, fmt.Errorf("%s must be gateway, worker, or all", envRole)
@@ -147,6 +160,11 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 		}
 		config.ShutdownTimeout = duration
 	}
+	pricing, err := platformmetrics.ParsePricingJSON(getenv(envModelPricing))
+	if err != nil {
+		return serviceConfig{}, err
+	}
+	config.Pricing = pricing
 	return config, nil
 }
 
@@ -161,6 +179,22 @@ func (r serviceRole) runsGateway() bool {
 func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	config.Telemetry.ServiceName = "trpc-agent-service"
+	config.Telemetry.ServiceVersion = trpcservice.Version
+	telemetryRuntime, telemetryErr := platformtelemetry.Start(ctx, config.Telemetry)
+	if telemetryErr != nil {
+		log.Printf("telemetry initialization failed: %s", platformlog.SafeError(telemetryErr))
+		telemetryRuntime = platformtelemetry.NewNoop(ctx, config.Telemetry.ServiceName)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+		defer cancel()
+		serviceErr = errors.Join(serviceErr, telemetryRuntime.Close(shutdownCtx))
+	}()
+	metricsRecorder, metricsErr := platformmetrics.New(telemetryRuntime.MeterProvider, config.Pricing)
+	if metricsErr != nil {
+		log.Printf("metrics initialization failed: %s", platformlog.SafeError(metricsErr))
 	}
 	pool, err := pgxpool.New(ctx, config.PostgresDSN)
 	if err != nil {
@@ -186,6 +220,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	store, err := postgres.New(
 		pool,
 		postgres.WithChannelIdentityMapping(hasher, protector, []string{"v1"}),
+		postgres.WithMetrics(metricsRecorder),
 	)
 	if err != nil {
 		return err
@@ -251,6 +286,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 			artifacts:         artifacts,
 			defaultSessionDSN: config.PostgresDSN,
 			defaultRedisURL:   config.RedisURL,
+			metrics:           metricsRecorder,
 		})
 		if err != nil {
 			return err
@@ -286,6 +322,7 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 		return nil, err
 	}
 	admitter := gateway.New(store)
+	admitter.Metrics = store.Metrics()
 	queued, err := gateway.NewQueuedRunner(
 		admitter,
 		events,
@@ -314,6 +351,7 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 		admitter,
 		secrets,
 		wecom.WithAttachmentIngestor(attachmentIngestor),
+		wecom.WithMetrics(store.Metrics()),
 	)
 	if err != nil {
 		return nil, err
@@ -324,6 +362,7 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 		secrets,
 		feishu.WithAttachmentIngestor(attachmentIngestor),
 		feishu.WithRecallAdmitter(store),
+		feishu.WithMetrics(store.Metrics()),
 	)
 	if err != nil {
 		return nil, err

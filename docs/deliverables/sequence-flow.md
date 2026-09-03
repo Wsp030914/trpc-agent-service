@@ -25,9 +25,17 @@ Feishu / WeCom callback
 → Feishu / WeCom send; transient failure retries
 ```
 
+当前 IM 出站只承诺普通异步文本。stream/card 属于扩展能力，不改变当前 Reply
+Outbox、Binding Revision 和 transient retry 主链。
+
 Gateway 是入站线性化点。相同 Binding、外部消息 ID 和 payload hash 的重复回调只
-返回原 request；hash 冲突拒绝。队列只携带 tenant/app/request/config scope 和
-ArtifactRef，不携带媒体 bytes 或 Secret 原文。
+返回原 request；hash 冲突拒绝。队列只携带 tenant/app/request/config scope、
+W3C traceparent/tracestate 和 ArtifactRef，不携带媒体 bytes 或 Secret 原文。
+
+Gateway span 的 W3C context 持久化在 Execution，Worker 从 Execution 恢复后创建
+子 span；Reply Outbox 读取同一 context，因此 IM callback → Gateway → Worker →
+Runner/Tool → Reply 属于同一条 trace。Metrics 只使用 tenant/app/channel/provider/
+operation/result/error_type 等固定低基数标签。
 
 ## HTTP/RPC 排队执行
 

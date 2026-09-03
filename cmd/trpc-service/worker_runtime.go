@@ -13,6 +13,7 @@ import (
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	memorytencentdb "github.com/liuzengh/trpc-agent-service/trpcservice/memory/tencentdb"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 	migrationredispostgres "github.com/liuzengh/trpc-agent-service/trpcservice/migration/redispostgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
@@ -44,6 +45,7 @@ type workerRuntimeDependencies struct {
 	artifacts         *artifactcos.Resolver
 	defaultSessionDSN string
 	defaultRedisURL   string
+	metrics           *platformmetrics.Recorder
 }
 
 const (
@@ -106,6 +108,11 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	if err != nil {
 		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
 	}
+	metricsRecorder := deps.metrics
+	if metricsRecorder == nil {
+		metricsRecorder = deps.store.Metrics()
+	}
+	runtimeBuilder.SetObservability(deps.store, metricsRecorder)
 	locker, err := platformredis.NewSessionLocker(deps.redisClient, sessionLeaseDuration)
 	if err != nil {
 		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
@@ -130,7 +137,7 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		deps.store,
 		deps.store.ResolveReplyTarget,
 		replyProviders.ResolveReplyProvider,
-		worker.ReplySenderOptions{Owner: deps.owner},
+		worker.ReplySenderOptions{Owner: deps.owner, Metrics: metricsRecorder},
 	)
 	if err != nil {
 		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
@@ -142,6 +149,8 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		events,
 		deps.store.IsExecutionCanceled,
 	)
+	executor.Audit = deps.store
+	executor.Metrics = metricsRecorder
 	consumer, err := worker.NewConsumer(executor, deps.stream, deps.store, deps.owner)
 	if err != nil {
 		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)

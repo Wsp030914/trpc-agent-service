@@ -2,9 +2,11 @@
 
 ## 设计边界
 
-前三个需求只要求：多个 tenant/app 在多节点上执行固定版本的 Agent 配置，按
-配置选择共享 Session、Memory、Knowledge、Artifact 后端，并完成飞书/企业微信
-的安全收发。平台不在这些链路上加入审计、遥测、健康检查或知识导入调度系统。
+服务支持多个 tenant/app 在多节点上执行固定版本的 Agent 配置，按配置选择共享
+Session、Memory、Knowledge、Artifact 后端，并完成飞书/企业微信的安全收发。
+AuditPolicy、Audit Log 和租户治理策略接入执行链；服务使用标准 OTEL runtime，
+无 OTLP endpoint 时不导出，Collector 仍是可选外部组件，不加入独立审计 Worker、
+健康检查或知识导入调度系统。
 
 ## 主链
 
@@ -23,6 +25,11 @@ IM / HTTP
 → Binding Revision recheck
 → Feishu / WeCom send
 ```
+
+Callback、Gateway、Worker、Runner、Tool、Session/Memory 和 Reply 边界使用安全
+metadata span；W3C trace context 随 Execution 持久化并跨 Redis Stream 传播。审计
+事件只保存身份、决策、耗时、错误类型、token/cost 和关联 ID，不保存消息、Prompt、
+Tool arguments、Provider target 或 Secret。
 
 Gateway 在一个事务中复核 tenant/app/binding、读取 active config version、处理
 Inbox 幂等、分配 Session `turn_seq`，并同时写 Execution 与 Dispatch Outbox。
@@ -61,8 +68,9 @@ ArtifactRef/version 读取；媒体 bytes 在模型调用边界恢复。
 
 Feishu 和 WeCom Adapter 各自负责协议验签、解密、身份映射和入站标准化。出站
 Reply 是普通文本：Runner event → Reply Outbox → 当前 Binding Revision 的 target
-resolve/decrypt → provider send。provider transient failure 按 Reply Outbox 的
-重试策略处理，其他 channel 细节不进入 Gateway 或 Worker。
+resolve/decrypt → provider send。当前选择普通异步文本；stream/card 只作为后续
+扩展能力，不进入当前主链。provider transient failure 按 Reply Outbox 的重试策略
+处理，其他 channel 细节不进入 Gateway 或 Worker。
 
 ## 多后端切换
 

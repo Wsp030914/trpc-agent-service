@@ -23,6 +23,85 @@ var (
 	errInvalidPath        = errors.New("invalid callback path")
 )
 
+// StatusRecorder preserves the response status so adapters can classify a
+// callback after all verification and admission work has completed. It
+// forwards the underlying writer through Unwrap for HTTP response helpers.
+type StatusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+// NewStatusRecorder wraps a callback response writer.
+func NewStatusRecorder(w http.ResponseWriter) *StatusRecorder {
+	return &StatusRecorder{ResponseWriter: w}
+}
+
+// WriteHeader records the first response status, matching net/http behavior.
+func (w *StatusRecorder) WriteHeader(status int) {
+	if w == nil || w.ResponseWriter == nil || w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+// Write records the implicit successful status used by net/http.
+func (w *StatusRecorder) Write(payload []byte) (int, error) {
+	if w == nil || w.ResponseWriter == nil {
+		return 0, errors.New("response writer is unavailable")
+	}
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(payload)
+}
+
+// Status returns the emitted status, defaulting to 200 when no header was
+// written yet.
+func (w *StatusRecorder) Status() int {
+	if w == nil || w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+// Unwrap exposes the original writer to http.ResponseController.
+func (w *StatusRecorder) Unwrap() http.ResponseWriter {
+	if w == nil {
+		return nil
+	}
+	return w.ResponseWriter
+}
+
+// CallbackErrorType maps the finite callback response classes to stable,
+// low-cardinality metric error types.
+func CallbackErrorType(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_callback"
+	case http.StatusForbidden:
+		return "binding_forbidden"
+	case http.StatusNotFound:
+		return "route_not_found"
+	case http.StatusMethodNotAllowed:
+		return "method_not_allowed"
+	case http.StatusConflict:
+		return "idempotency_conflict"
+	case http.StatusRequestEntityTooLarge:
+		return "body_too_large"
+	case http.StatusUnauthorized:
+		return "unauthenticated"
+	default:
+		if status >= http.StatusInternalServerError {
+			return "callback_unavailable"
+		}
+		if status >= http.StatusBadRequest {
+			return "callback_rejected"
+		}
+		return ""
+	}
+}
+
 // RouteKey extracts the public route key from a channel callback path.
 func RouteKey(r *http.Request, channel channels.Channel) (string, error) {
 	if r == nil || r.URL == nil {

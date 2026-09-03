@@ -17,6 +17,16 @@ Session Provider 必须是共享资源，才能支持无 sticky session 的 Work
 Router 保留实际存在的 PostgreSQL/Redis 两条路，并在服务生命周期内复用 service。
 Memory、Qdrant、COS client 也由各自 owner 关闭；这些缓存不保存请求级 Runner。
 
+## 一致性、延迟、成本与运维取舍
+
+| 后端 | 一致性 | 延迟 | 成本 | 运维取舍 |
+| --- | --- | --- | --- | --- |
+| PostgreSQL / SQL | 事务和条件更新提供强一致 | 中等 | 中等 | 备份、索引、连接池和容量规划成熟；承载权威协调记录 |
+| Redis | 单 key/Lua 内原子；跨 key 非强一致 | 低 | 中等至高 | 适合 Stream、Lock、限流和热数据；需管理持久化、故障转移和内存淘汰 |
+| Qdrant / Vector DB | 派生索引最终一致 | 低至中等 | 中等 | 需维护 collection、索引和重建；不能替代 SQL 权威数据 |
+| Object Storage | bytes 持久；业务 metadata 由 SQL 保证一致 | 中等 | 存储低，读写/出网另计 | 适合媒体和原文；需管理生命周期、权限和 orphan 补偿 |
+| InMemory | 单进程内一致 | 最低 | 基础设施低 | 只用于测试和本地开发；无跨节点共享和恢复能力 |
+
 ## Knowledge
 
 Qdrant 是运行时检索 Provider。每次执行按 `tenant_id`、`app_id`、固定

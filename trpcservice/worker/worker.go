@@ -8,10 +8,14 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
+	"go.opentelemetry.io/otel/attribute"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -63,6 +67,10 @@ type RunResult struct {
 	Execution       Execution
 	EventCount      int
 	RunnerCompleted bool
+	InputTokens     int
+	OutputTokens    int
+	TotalTokens     int
+	Cost            *float64
 }
 
 // Worker prepares jobs for execution without owning session state locally.
@@ -73,6 +81,8 @@ type Worker struct {
 	Events           EventSink
 	EventSinkTimeout time.Duration
 	Cancellation     CancellationCheck
+	Audit            platformaudit.Sink
+	Metrics          *platformmetrics.Recorder
 }
 
 // New creates a Worker with all execution dependencies explicitly attached.
@@ -152,6 +162,50 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		return RunResult{}, err
 	}
 	result = RunResult{Execution: exec}
+	executionStartedAt := time.Now()
+	if exec.Config.Audit.Enabled {
+		defer func() {
+			if !errors.Is(err, tenant.ErrBudgetExceeded) {
+				return
+			}
+			w.recordAudit(ctx, exec, platformaudit.Event{
+				Decision:  "rejected",
+				ErrorType: "budget_exceeded",
+				EventType: platformaudit.BudgetRejected,
+			})
+			if w.Metrics != nil {
+				w.Metrics.RecordGovernanceRejected(ctx, platformmetrics.Labels{
+					TenantID: exec.Tenant.TenantID,
+					AppID:    exec.Tenant.AppID,
+					Channel:  exec.Tenant.Channel,
+				}, platformaudit.BudgetRejected)
+			}
+		}()
+	}
+	if exec.Config.Audit.Enabled && exec.Config.Audit.RecordExecutions {
+		w.recordAudit(ctx, exec, platformaudit.Event{
+			Decision:  "started",
+			EventType: platformaudit.ExecutionStarted,
+		})
+		defer func() {
+			eventType := platformaudit.ExecutionCompleted
+			decision := "completed"
+			if err != nil {
+				eventType = platformaudit.ExecutionFailed
+				decision = "failed"
+			}
+			w.recordAudit(ctx, exec, platformaudit.Event{
+				Decision:     decision,
+				EventType:    eventType,
+				ErrorType:    executionErrorType(err),
+				InputTokens:  result.InputTokens,
+				OutputTokens: result.OutputTokens,
+				TotalTokens:  result.TotalTokens,
+				Cost:         result.Cost,
+				Latency:      time.Since(executionStartedAt),
+			})
+		}()
+	}
 	if w.Runner == nil {
 		return result, errors.New("runner builder is required")
 	}
@@ -182,7 +236,26 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	if runCtx == nil {
 		return result, errors.New("session lock context is required")
 	}
-	r, err := w.Runner(runCtx, exec)
+	runCtx = platformtelemetry.Extract(runCtx, map[string]string{
+		"traceparent": exec.Tenant.TraceParent,
+		"tracestate":  exec.Tenant.TraceState,
+	})
+	workerCtx, workerSpan := platformtelemetry.StartSpan(runCtx, "worker.execute",
+		attribute.String("tenant_id", exec.Tenant.TenantID),
+		attribute.String("app_id", exec.Tenant.AppID),
+		attribute.String("config_version", exec.Tenant.ConfigVersion),
+		attribute.String("request_id", exec.RequestID),
+		attribute.String("channel", exec.Tenant.Channel),
+	)
+	defer workerSpan.End()
+	modelAttempted := false
+	defer func() {
+		if !modelAttempted || w.Metrics == nil {
+			return
+		}
+		result.Cost = w.Metrics.EstimateCost(exec.Config.Model.Provider, exec.Config.Model.Model, result.InputTokens, result.OutputTokens)
+	}()
+	r, err := w.Runner(workerCtx, exec)
 	if err != nil {
 		return result, err
 	}
@@ -194,8 +267,16 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 			err = errors.Join(err, fmt.Errorf("close runner: %w", closeErr))
 		}
 	}()
+	runnerCtx, runnerSpan := platformtelemetry.StartSpan(workerCtx, "runner.run",
+		attribute.String("tenant_id", exec.Tenant.TenantID),
+		attribute.String("app_id", exec.Tenant.AppID),
+		attribute.String("config_version", exec.Tenant.ConfigVersion),
+		attribute.String("request_id", exec.RequestID),
+	)
+	defer runnerSpan.End()
+	modelAttempted = true
 	events, err := r.Run(
-		runCtx,
+		runnerCtx,
 		exec.Tenant.SessionPrincipalID,
 		exec.Tenant.SessionID,
 		message,
@@ -203,6 +284,10 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		agent.WithAppName(appName),
 		agent.MergeRuntimeState(runnerRuntimeState(exec)),
 		agent.WithToolPermissionPolicy(w.toolPermissionPolicy(exec)),
+		// Framework payload tracing is disabled at this boundary because this
+		// service owns the safe metadata-only spans above. It prevents raw
+		// prompts, tool arguments, and provider errors from entering spans.
+		agent.WithDisableTracing(true),
 	)
 	if err != nil {
 		return result, err
@@ -210,7 +295,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	if events == nil {
 		return result, errors.New("runner event channel is nil")
 	}
-	stopManagedCancel := cancelManagedRunnerOnContextDone(runCtx, r, exec.RequestID)
+	stopManagedCancel := cancelManagedRunnerOnContextDone(runnerCtx, r, exec.RequestID)
 	defer stopManagedCancel()
 	var sinkErr error
 	var runnerErr error
@@ -226,10 +311,11 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		if runnerErr == nil && evt.IsTerminalError() {
 			runnerErr = fmt.Errorf("runner event: %w", evt.Error)
 		}
-		if w.Events == nil || sinkTimedOut || runCtx.Err() != nil {
+		w.accumulateUsage(&result, evt)
+		if w.Events == nil || sinkTimedOut || runnerCtx.Err() != nil {
 			continue
 		}
-		if err := w.handleRunnerEvent(runCtx, exec, evt); err != nil {
+		if err := w.handleRunnerEvent(runnerCtx, exec, evt); err != nil {
 			if sinkErr == nil {
 				sinkErr = err
 			}
@@ -238,7 +324,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 			}
 		}
 	}
-	if err := runCtx.Err(); err != nil {
+	if err := runnerCtx.Err(); err != nil {
 		return result, err
 	}
 	if sinkErr != nil {
@@ -272,14 +358,27 @@ func cancelManagedRunnerOnContextDone(
 
 func (w Worker) toolPermissionPolicy(exec Execution) frameworktool.PermissionPolicy {
 	return frameworktool.PermissionPolicyFunc(func(
-		_ context.Context,
+		ctx context.Context,
 		request *frameworktool.PermissionRequest,
 	) (frameworktool.PermissionDecision, error) {
+		started := time.Now()
 		name := permissionToolName(request)
 		if err := platformtool.AuthorizeExecution(exec.Config.Tools, name); err != nil {
-			return frameworktool.DenyPermission("tool is not authorized"), nil
+			decision := frameworktool.DenyPermission("tool is not authorized")
+			w.recordToolDecision(ctx, exec, name, decision, started)
+			return decision, nil
 		}
-		return frameworktool.NormalizePermissionDecision(frameworktool.AllowPermission())
+		if exec.Config.Tools.RequiresReview(name) {
+			decision := frameworktool.AskPermission("human review is required")
+			w.recordToolDecision(ctx, exec, name, decision, started)
+			return decision, nil
+		}
+		decision, err := frameworktool.NormalizePermissionDecision(frameworktool.AllowPermission())
+		if err != nil {
+			return frameworktool.PermissionDecision{}, err
+		}
+		w.recordToolDecision(ctx, exec, name, decision, started)
+		return decision, nil
 	})
 }
 

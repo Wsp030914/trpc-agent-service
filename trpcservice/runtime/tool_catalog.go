@@ -58,8 +58,8 @@ func (*ToolCatalog) ValidateToolPolicy(_ context.Context, policy tenant.ToolPoli
 
 func runtimeToolNames(policy tenant.ToolPolicy) []string {
 	seen := make(map[string]struct{}, len(policy.VisibleTools)+len(policy.ExecutableTools))
-	names := make([]string, 0, len(policy.VisibleTools)+len(policy.ExecutableTools))
-	for _, values := range [][]string{policy.VisibleTools, policy.ExecutableTools} {
+	names := make([]string, 0, len(policy.VisibleTools)+len(policy.ExecutableTools)+len(policy.ReviewRequiredTools))
+	for _, values := range [][]string{policy.VisibleTools, policy.ExecutableTools, policy.ReviewRequiredTools} {
 		for _, name := range values {
 			if _, ok := seen[name]; ok {
 				continue

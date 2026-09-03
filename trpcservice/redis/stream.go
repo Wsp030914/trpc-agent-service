@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -23,6 +24,8 @@ type Stream struct {
 	name         string
 	group        string
 	claimMinIdle time.Duration
+	mu           sync.Mutex
+	owned        map[string]string
 }
 
 // NewStream creates a stream Consumer Group. Existing groups are reused.
@@ -41,6 +44,7 @@ func NewStream(client *Client, name, group string, claimMinIdle time.Duration) (
 		name:         name,
 		group:        group,
 		claimMinIdle: claimMinIdle,
+		owned:        make(map[string]string),
 	}, nil
 }
 
@@ -100,8 +104,23 @@ func (s *Stream) Receive(ctx context.Context, consumer string, block time.Durati
 		return queue.Delivery{}, fmt.Errorf("claim pending redis dispatch: %w", err)
 	}
 	if len(claimed) > 0 {
-		return decodeDelivery(claimed[0])
+		delivery, err := decodeDelivery(claimed[0])
+		if err != nil {
+			return queue.Delivery{}, err
+		}
+		if s.isOwnedBy(delivery.ID, consumer) {
+			// XAUTOCLAIM cannot distinguish a crashed consumer from this
+			// process still working on a long-running delivery. Keep the
+			// latter pending and read a fresh message instead.
+			return s.receiveNew(ctx, consumer, block)
+		}
+		s.remember(delivery.ID, consumer)
+		return delivery, nil
 	}
+	return s.receiveNew(ctx, consumer, block)
+}
+
+func (s *Stream) receiveNew(ctx context.Context, consumer string, block time.Duration) (queue.Delivery, error) {
 	result, err := s.client.XReadGroup(ctx, &goredis.XReadGroupArgs{
 		Group:    s.group,
 		Consumer: consumer,
@@ -118,7 +137,12 @@ func (s *Stream) Receive(ctx context.Context, consumer string, block time.Durati
 	if len(result) == 0 || len(result[0].Messages) == 0 {
 		return queue.Delivery{}, context.DeadlineExceeded
 	}
-	return decodeDelivery(result[0].Messages[0])
+	delivery, err := decodeDelivery(result[0].Messages[0])
+	if err != nil {
+		return queue.Delivery{}, err
+	}
+	s.remember(delivery.ID, consumer)
+	return delivery, nil
 }
 
 // Ack acknowledges one delivery after its PostgreSQL execution transition.
@@ -129,6 +153,7 @@ func (s *Stream) Ack(ctx context.Context, delivery queue.Delivery) error {
 	if err := s.client.XAck(ctx, s.name, s.group, delivery.ID).Err(); err != nil {
 		return fmt.Errorf("ack redis dispatch: %w", err)
 	}
+	s.forget(delivery.ID)
 	return nil
 }
 
@@ -152,7 +177,26 @@ func (s *Stream) Dead(ctx context.Context, delivery queue.Delivery, cause error)
 	if err := s.client.XAck(ctx, s.name, s.group, delivery.ID).Err(); err != nil {
 		return fmt.Errorf("ack redis dead-letter delivery: %w", err)
 	}
+	s.forget(delivery.ID)
 	return nil
+}
+
+func (s *Stream) isOwnedBy(id, consumer string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.owned[id] == consumer
+}
+
+func (s *Stream) remember(id, consumer string) {
+	s.mu.Lock()
+	s.owned[id] = consumer
+	s.mu.Unlock()
+}
+
+func (s *Stream) forget(id string) {
+	s.mu.Lock()
+	delete(s.owned, id)
+	s.mu.Unlock()
 }
 
 func decodeDelivery(message goredis.XMessage) (queue.Delivery, error) {

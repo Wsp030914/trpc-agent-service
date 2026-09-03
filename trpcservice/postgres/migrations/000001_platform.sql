@@ -6,6 +6,7 @@ CREATE TABLE platform.tenant (
     tenant_id TEXT PRIMARY KEY,
     name TEXT NOT NULL CHECK (name <> ''),
     status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'SUSPENDED')),
+    audit_policy JSONB NOT NULL DEFAULT '{}'::JSONB CHECK (jsonb_typeof(audit_policy) = 'object'),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -28,6 +29,7 @@ CREATE TABLE platform.app_config_version (
     model_config JSONB NOT NULL CHECK (jsonb_typeof(model_config) = 'object'),
     tool_policy JSONB NOT NULL CHECK (jsonb_typeof(tool_policy) = 'object'),
     backend_config JSONB NOT NULL CHECK (jsonb_typeof(backend_config) = 'object'),
+    audit_policy JSONB NOT NULL CHECK (jsonb_typeof(audit_policy) = 'object'),
     secret_refs JSONB NOT NULL DEFAULT '[]'::JSONB CHECK (jsonb_typeof(secret_refs) IN ('array', 'null')),
     channel_binding_ids JSONB NOT NULL DEFAULT '[]'::JSONB CHECK (jsonb_typeof(channel_binding_ids) IN ('array', 'null')),
     knowledge_base_ids JSONB NOT NULL DEFAULT '[]'::JSONB CHECK (jsonb_typeof(knowledge_base_ids) = 'array'),

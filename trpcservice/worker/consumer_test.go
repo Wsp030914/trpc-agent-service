@@ -9,6 +9,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
 
@@ -51,15 +52,56 @@ func TestConsumerRetriesAndAcknowledgesFailedRun(t *testing.T) {
 	}
 }
 
+func TestConsumerExtractsTraceContextFromDispatch(t *testing.T) {
+	runtime := platformtelemetry.NewNoop(context.Background(), "consumer-test")
+	t.Cleanup(func() { _ = runtime.Close(context.Background()) })
+	parentCtx, parentSpan := platformtelemetry.StartSpan(context.Background(), "gateway")
+	defer parentSpan.End()
+	wantTraceID := platformtelemetry.TraceID(parentCtx)
+	carrier := platformtelemetry.Inject(parentCtx)
+	if wantTraceID == "" || carrier["traceparent"] == "" {
+		t.Fatal("parent trace context was not created")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claim := testQueueClaim(t, "request-consumer-trace")
+	stream := &testStream{delivery: queue.Delivery{
+		ID: "3-0",
+		Dispatch: queue.Dispatch{
+			OutboxID:    3,
+			TenantID:    "tenant-a",
+			AppID:       "support",
+			RequestID:   claim.Job.RequestID(),
+			TraceParent: carrier["traceparent"],
+			TraceState:  carrier["tracestate"],
+		},
+	}, cancel: cancel}
+	store := &testExecutionStore{claim: claim}
+	executor := &consumerExecutor{result: worker.RunResult{RunnerCompleted: true}}
+	consumer, err := worker.NewConsumer(executor, stream, store, "worker-1")
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v", err)
+	}
+	if executor.traceID != wantTraceID {
+		t.Fatalf("executor trace id = %q, want %q", executor.traceID, wantTraceID)
+	}
+}
+
 type consumerExecutor struct {
-	result worker.RunResult
-	err    error
+	result  worker.RunResult
+	err     error
+	traceID string
 }
 
 func (e *consumerExecutor) Run(ctx context.Context, _ execution.Job) (worker.RunResult, error) {
 	if _, ok := worker.JobLeaseFromContext(ctx); !ok {
 		return worker.RunResult{}, errors.New("lease is missing")
 	}
+	e.traceID = platformtelemetry.TraceID(ctx)
 	return e.result, e.err
 }
 

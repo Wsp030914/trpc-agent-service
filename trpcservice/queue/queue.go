@@ -21,6 +21,11 @@ type Dispatch struct {
 	TenantID  string
 	AppID     string
 	RequestID string
+	// TraceParent and TraceState carry the W3C Trace Context through the
+	// durable Redis boundary. They are metadata only and never contain
+	// request payloads.
+	TraceParent string `json:"traceparent,omitempty"`
+	TraceState  string `json:"tracestate,omitempty"`
 }
 
 // Validate checks the persistent execution identity carried by a stream entry.

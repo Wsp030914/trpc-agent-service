@@ -21,6 +21,10 @@ flowchart LR
     CFG --> GW
     CFG --> WK
     KMS[SecretProvider] --> RT
+    TEL[Optional OTLP Collector]
+    CA -. OTEL .-> TEL
+    GW -. OTEL .-> TEL
+    WK -. OTEL .-> TEL
 ```
 
 ## 组件职责
@@ -38,6 +42,7 @@ flowchart LR
 | Artifact Provider | object storage + SQL metadata；按 ArtifactRef/version 恢复媒体 |
 | Reply Sender | Claim Reply Outbox、校验 Binding Revision、发送普通文本并处理 transient retry |
 | Admin API | 创建并发布 Tenant、App、Binding 和 immutable AppConfig |
+| OTLP Collector（可选） | 接收服务标准 OTEL trace/metrics；无 endpoint 时服务使用无 exporter SDK provider，不属于 Audit Log 权威源 |
 
 ## 执行约束
 

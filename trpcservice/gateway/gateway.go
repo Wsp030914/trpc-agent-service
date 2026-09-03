@@ -12,7 +12,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // TenantSource identifies the trusted boundary that supplied tenant routing.
@@ -251,6 +254,8 @@ type AdmissionRequest struct {
 	Identity       AdmissionIdentity
 	Message        Message
 	ChannelInput   *channels.ChannelInput
+	TraceParent    string
+	TraceState     string
 }
 
 // Validate checks the fields that must be stable before the admission
@@ -365,6 +370,7 @@ type Admitter interface {
 // Gateway converts trusted requests into atomic admission commands.
 type Gateway struct {
 	admitter Admitter
+	Metrics  *platformmetrics.Recorder
 }
 
 // New creates a Gateway backed by the authoritative admission store.
@@ -374,7 +380,7 @@ func New(admitter Admitter) *Gateway {
 
 // Handle validates a request and submits it to the authoritative admission
 // backend. It never performs a separate in-memory enqueue.
-func (g Gateway) Handle(ctx context.Context, req Request) (AdmissionResult, error) {
+func (g Gateway) Handle(ctx context.Context, req Request) (result AdmissionResult, err error) {
 	if g.admitter == nil {
 		return AdmissionResult{}, ErrAdmitterRequired
 	}
@@ -389,6 +395,37 @@ func (g Gateway) Handle(ctx context.Context, req Request) (AdmissionResult, erro
 	if err != nil {
 		return AdmissionResult{}, err
 	}
+	admitCtx, span := platformtelemetry.StartSpan(ctx, "gateway.admit",
+		attribute.String("tenant_id", identity.Tenant.TenantID),
+		attribute.String("app_id", identity.Tenant.AppID),
+		attribute.String("channel", identity.Tenant.Channel),
+	)
+	defer span.End()
+	defer func() {
+		if g.Metrics == nil {
+			return
+		}
+		labels := platformmetrics.Labels{
+			TenantID: identity.Tenant.TenantID,
+			AppID:    identity.Tenant.AppID,
+			Channel:  identity.Tenant.Channel,
+			Result:   "accepted",
+		}
+		errorType := ""
+		if err != nil {
+			labels.Result = "error"
+			errorType = "admission"
+		} else if result.Status == AdmissionStatusRejected {
+			labels.Result = "rejected"
+			errorType = "governance"
+		}
+		g.Metrics.RecordRequest(ctx, labels, errorType)
+	}()
+	if traceID := platformtelemetry.TraceID(admitCtx); traceID != "" {
+		identity.Tenant.TraceID = traceID
+	}
+	identity.Tenant.TraceParent = platformtelemetry.TraceParent(admitCtx)
+	identity.Tenant.TraceState = platformtelemetry.TraceState(admitCtx)
 	var channelInput *channels.ChannelInput
 	message := Message{
 		Text:         req.Message.Text,
@@ -408,11 +445,13 @@ func (g Gateway) Handle(ctx context.Context, req Request) (AdmissionResult, erro
 		Identity:       identity,
 		Message:        message,
 		ChannelInput:   channelInput,
+		TraceParent:    identity.Tenant.TraceParent,
+		TraceState:     identity.Tenant.TraceState,
 	}
 	if err := admissionRequest.Validate(); err != nil {
 		return AdmissionResult{}, err
 	}
-	result, err := g.admitter.Admit(ctx, admissionRequest)
+	result, err = g.admitter.Admit(admitCtx, admissionRequest)
 	if err != nil {
 		return AdmissionResult{}, err
 	}

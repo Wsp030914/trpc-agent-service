@@ -46,6 +46,11 @@ func (s *Store) Claim(ctx context.Context, dispatch queue.Dispatch, request queu
 	if err != nil {
 		return queue.Claim{}, false, err
 	}
+	if stored.requestID != "" {
+		if err := validateDispatchTraceContext(dispatch, stored); err != nil {
+			return queue.Claim{}, false, err
+		}
+	}
 	if !active || stored.status == "SUCCEEDED" || stored.status == "FAILED" || stored.status == "CANCELED" {
 		if err := consumeDispatch(ctx, tx, dispatch); err != nil {
 			return queue.Claim{}, false, err
@@ -205,11 +210,13 @@ func (s *Store) ClaimDispatches(ctx context.Context, owner string, leaseDuration
 		limit = defaultDispatchBatch
 	}
 	rows, err := s.pool.Query(ctx, `WITH candidates AS (
- SELECT o.outbox_id FROM platform.dispatch_outbox o JOIN platform.execution e USING (tenant_id,app_id,request_id)
+ SELECT o.outbox_id, e.trace_parent, e.trace_state
+ FROM platform.dispatch_outbox o JOIN platform.execution e USING (tenant_id,app_id,request_id)
  WHERE o.status='PENDING' AND o.next_attempt_at <= clock_timestamp() AND e.status='PENDING'
  ORDER BY o.outbox_id FOR UPDATE SKIP LOCKED LIMIT $3
 ) UPDATE platform.dispatch_outbox o SET status='PUBLISHING', lease_owner=$1, lease_until=clock_timestamp()+$2::interval, attempt=attempt+1, updated_at=clock_timestamp()
-FROM candidates c WHERE o.outbox_id=c.outbox_id RETURNING o.outbox_id,o.tenant_id,o.app_id,o.request_id`, owner, intervalLiteral(leaseDuration), limit)
+FROM candidates c WHERE o.outbox_id=c.outbox_id
+RETURNING o.outbox_id,o.tenant_id,o.app_id,o.request_id,c.trace_parent,c.trace_state`, owner, intervalLiteral(leaseDuration), limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim dispatch outbox: %w", err)
 	}
@@ -217,7 +224,7 @@ FROM candidates c WHERE o.outbox_id=c.outbox_id RETURNING o.outbox_id,o.tenant_i
 	var result []queue.Dispatch
 	for rows.Next() {
 		var d queue.Dispatch
-		if err := rows.Scan(&d.OutboxID, &d.TenantID, &d.AppID, &d.RequestID); err != nil {
+		if err := rows.Scan(&d.OutboxID, &d.TenantID, &d.AppID, &d.RequestID, &d.TraceParent, &d.TraceState); err != nil {
 			return nil, fmt.Errorf("scan dispatch outbox: %w", err)
 		}
 		result = append(result, d)
@@ -313,7 +320,7 @@ type storedExecution struct {
 	configVersion                                                     string
 	tenantSource                                                      gateway.TenantSource
 	command                                                           []byte
-	traceID, status                                                   string
+	traceID, traceParent, traceState, status                          string
 	attempt                                                           int
 	nextAttemptAt, leaseUntil                                         time.Time
 	hasEarlier                                                        bool
@@ -321,7 +328,7 @@ type storedExecution struct {
 
 func lockExecutionForClaim(ctx context.Context, tx pgx.Tx, d queue.Dispatch) (storedExecution, bool, error) {
 	var v storedExecution
-	err := tx.QueryRow(ctx, `SELECT e.tenant_id,e.app_id,e.request_id,e.session_principal_id,e.session_id,e.user_id,e.turn_seq,e.config_version,e.tenant_source,e.command,e.trace_id,e.status,e.attempt,e.next_attempt_at,COALESCE(e.lease_until,'epoch'::timestamptz),EXISTS(SELECT 1 FROM platform.execution x WHERE x.tenant_id=e.tenant_id AND x.app_id=e.app_id AND x.session_principal_id=e.session_principal_id AND x.session_id=e.session_id AND x.turn_seq<e.turn_seq AND x.status IN ('PENDING','RUNNING')) FROM platform.execution e JOIN platform.tenant t ON t.tenant_id=e.tenant_id JOIN platform.agent_app a ON a.tenant_id=e.tenant_id AND a.app_id=e.app_id WHERE e.tenant_id=$1 AND e.app_id=$2 AND e.request_id=$3 FOR UPDATE OF e`, d.TenantID, d.AppID, d.RequestID).Scan(&v.tenantID, &v.appID, &v.requestID, &v.sessionPrincipalID, &v.sessionID, &v.userID, &v.turnSeq, &v.configVersion, &v.tenantSource, &v.command, &v.traceID, &v.status, &v.attempt, &v.nextAttemptAt, &v.leaseUntil, &v.hasEarlier)
+	err := tx.QueryRow(ctx, `SELECT e.tenant_id,e.app_id,e.request_id,e.session_principal_id,e.session_id,e.user_id,e.turn_seq,e.config_version,e.tenant_source,e.command,e.trace_id,e.trace_parent,e.trace_state,e.status,e.attempt,e.next_attempt_at,COALESCE(e.lease_until,'epoch'::timestamptz),EXISTS(SELECT 1 FROM platform.execution x WHERE x.tenant_id=e.tenant_id AND x.app_id=e.app_id AND x.session_principal_id=e.session_principal_id AND x.session_id=e.session_id AND x.turn_seq<e.turn_seq AND x.status IN ('PENDING','RUNNING')) FROM platform.execution e JOIN platform.tenant t ON t.tenant_id=e.tenant_id JOIN platform.agent_app a ON a.tenant_id=e.tenant_id AND a.app_id=e.app_id WHERE e.tenant_id=$1 AND e.app_id=$2 AND e.request_id=$3 FOR UPDATE OF e`, d.TenantID, d.AppID, d.RequestID).Scan(&v.tenantID, &v.appID, &v.requestID, &v.sessionPrincipalID, &v.sessionID, &v.userID, &v.turnSeq, &v.configVersion, &v.tenantSource, &v.command, &v.traceID, &v.traceParent, &v.traceState, &v.status, &v.attempt, &v.nextAttemptAt, &v.leaseUntil, &v.hasEarlier)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return v, false, nil
 	}
@@ -335,6 +342,17 @@ func lockExecutionForClaim(ctx context.Context, tx pgx.Tx, d queue.Dispatch) (st
 	}
 	return v, active, nil
 }
+
+func validateDispatchTraceContext(dispatch queue.Dispatch, stored storedExecution) error {
+	if dispatch.TraceParent != "" && dispatch.TraceParent != stored.traceParent {
+		return errors.New("dispatch traceparent does not match stored execution")
+	}
+	if dispatch.TraceState != "" && dispatch.TraceState != stored.traceState {
+		return errors.New("dispatch tracestate does not match stored execution")
+	}
+	return nil
+}
+
 func (v storedExecution) executionJob() (execution.Job, error) {
 	var c admissionCommand
 	if err := json.Unmarshal(v.command, &c); err != nil {
@@ -354,6 +372,8 @@ func (v storedExecution) executionJob() (execution.Job, error) {
 		SessionID:          v.sessionID,
 		UserID:             v.userID,
 		TraceID:            v.traceID,
+		TraceParent:        v.traceParent,
+		TraceState:         v.traceState,
 	}, gateway.Message{
 		Text:         c.Text,
 		ArtifactRefs: c.ArtifactRefs,

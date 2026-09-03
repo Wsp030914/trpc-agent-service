@@ -32,7 +32,14 @@ func TestStreamPublishesAndAcknowledgesDelivery(t *testing.T) {
 	if err := stream.Init(ctx); err != nil {
 		t.Fatalf("init stream: %v", err)
 	}
-	dispatch := queue.Dispatch{OutboxID: 1, TenantID: "tenant-a", AppID: "support", RequestID: "request-1"}
+	dispatch := queue.Dispatch{
+		OutboxID:    1,
+		TenantID:    "tenant-a",
+		AppID:       "support",
+		RequestID:   "request-1",
+		TraceParent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+		TraceState:  "vendor=value",
+	}
 	if err := stream.Publish(ctx, dispatch); err != nil {
 		t.Fatalf("publish: %v", err)
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	platformredis "github.com/liuzengh/trpc-agent-service/trpcservice/redis"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/relay"
+	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
@@ -34,6 +35,11 @@ func TestRelayDeliversAdmittedExecutionToWorker(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	telemetryRuntime := platformtelemetry.NewNoop(ctx, "relay-integration-test")
+	t.Cleanup(func() { _ = telemetryRuntime.Close(context.Background()) })
+	callbackCtx, callbackSpan := platformtelemetry.StartSpan(ctx, "channel.callback")
+	defer callbackSpan.End()
+	wantTraceID := platformtelemetry.TraceID(callbackCtx)
 
 	pool := openIntegrationPool(t)
 	if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS platform CASCADE`); err != nil {
@@ -62,7 +68,7 @@ func TestRelayDeliversAdmittedExecutionToWorker(t *testing.T) {
 	}
 
 	gatewayService := gateway.New(store)
-	result, err := gatewayService.Handle(ctx, gateway.Request{
+	result, err := gatewayService.Handle(callbackCtx, gateway.Request{
 		RequestID:      "request-relay-1",
 		IdempotencyKey: "client-relay-1",
 		Tenant:         relayIdentityResolver{identity: identity},
@@ -76,7 +82,7 @@ func TestRelayDeliversAdmittedExecutionToWorker(t *testing.T) {
 	}
 	assertExecutionAndOutboxStatus(t, ctx, pool, result.RequestID, "PENDING", "PENDING")
 
-	executor := &relayExecutor{executed: make(chan execution.Job, 1)}
+	executor := &relayExecutor{executed: make(chan execution.Job, 1), traceIDs: make(chan string, 1)}
 	trackedStream := &ackTrackingStream{Stream: stream}
 	consumer, err := worker.NewConsumer(executor, trackedStream, store, "worker-relay-test")
 	if err != nil {
@@ -101,6 +107,14 @@ func TestRelayDeliversAdmittedExecutionToWorker(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("worker did not execute admitted request: %v", ctx.Err())
+	}
+	select {
+	case gotTraceID := <-executor.traceIDs:
+		if gotTraceID != wantTraceID {
+			t.Fatalf("worker trace id = %q, want %q", gotTraceID, wantTraceID)
+		}
+	case <-ctx.Done():
+		t.Fatalf("worker did not propagate trace context: %v", ctx.Err())
 	}
 	assertExecutionAndOutboxStatus(t, ctx, pool, result.RequestID, "SUCCEEDED", "CONSUMED")
 	assertRedisAcknowledgements(t, ctx, &trackedStream.acks, 1)
@@ -222,12 +236,14 @@ func (r relayIdentityResolver) ResolveAdmissionIdentity(context.Context) (gatewa
 
 type relayExecutor struct {
 	executed chan execution.Job
+	traceIDs chan string
 	runs     atomic.Int32
 }
 
-func (e *relayExecutor) Run(_ context.Context, job execution.Job) (worker.RunResult, error) {
+func (e *relayExecutor) Run(ctx context.Context, job execution.Job) (worker.RunResult, error) {
 	e.runs.Add(1)
 	e.executed <- job
+	e.traceIDs <- platformtelemetry.TraceID(ctx)
 	return worker.RunResult{RunnerCompleted: true}, nil
 }
 

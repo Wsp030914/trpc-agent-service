@@ -39,6 +39,24 @@ func TestToolPermissionPolicyIsTenantScoped(t *testing.T) {
 	}
 }
 
+func TestToolPermissionPolicyReturnsAskForReviewRequiredTool(t *testing.T) {
+	w := Worker{}
+	exec := securityTestExecution()
+	exec.Config.Tools = tenant.ToolPolicy{
+		ExecutableTools:     []string{"delete"},
+		ReviewRequiredTools: []string{"delete"},
+	}
+	decision, err := w.toolPermissionPolicy(exec).CheckToolPermission(context.Background(), &frameworktool.PermissionRequest{
+		ToolName: "delete",
+	})
+	if err != nil {
+		t.Fatalf("check review-required tool: %v", err)
+	}
+	if decision.Action != frameworktool.PermissionActionAsk {
+		t.Fatalf("decision = %q, want %q", decision.Action, frameworktool.PermissionActionAsk)
+	}
+}
+
 func securityTestExecution() Execution {
 	return Execution{
 		RequestID: "request-1",

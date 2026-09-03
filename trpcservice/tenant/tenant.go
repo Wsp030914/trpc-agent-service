@@ -9,6 +9,11 @@ import (
 	"strings"
 )
 
+// ErrBudgetExceeded is returned when an execution has consumed its pinned
+// token budget. It is deliberately owned by the tenant policy package so the
+// runtime callback and worker completion path share one stable error class.
+var ErrBudgetExceeded = errors.New("execution token budget exceeded")
+
 // Status is the lifecycle state of a tenant or agent application.
 type Status string
 
@@ -21,9 +26,10 @@ const (
 
 // Tenant describes the top-level isolation boundary for platform data.
 type Tenant struct {
-	ID     string `json:"tenant_id"`
-	Name   string `json:"name"`
-	Status Status `json:"status"`
+	ID     string      `json:"tenant_id"`
+	Name   string      `json:"name"`
+	Status Status      `json:"status"`
+	Audit  AuditPolicy `json:"audit"`
 }
 
 // Validate checks the persisted tenant configuration. The zero value is invalid.
@@ -36,6 +42,9 @@ func (t Tenant) Validate() error {
 	}
 	if !validStatus(t.Status) {
 		return errors.New("tenant status is invalid")
+	}
+	if err := t.Audit.Validate(); err != nil {
+		return fmt.Errorf("audit policy: %w", err)
 	}
 	return nil
 }
@@ -76,15 +85,18 @@ func (a AgentApp) Validate() error {
 
 // AppConfig is an immutable version of tenant application configuration.
 type AppConfig struct {
-	TenantID         string        `json:"tenant_id"`
-	AppID            string        `json:"app_id"`
-	Version          string        `json:"version"`
-	Model            ModelConfig   `json:"model"`
-	Tools            ToolPolicy    `json:"tools"`
-	BackendConfig    BackendConfig `json:"backend_config"`
-	SecretRefs       []SecretRef   `json:"secret_refs"`
-	ChannelBinding   []string      `json:"channel_binding"`
-	KnowledgeBaseIDs []string      `json:"knowledge_base_ids"`
+	TenantID         string         `json:"tenant_id"`
+	AppID            string         `json:"app_id"`
+	Version          string         `json:"version"`
+	Model            ModelConfig    `json:"model"`
+	Tools            ToolPolicy     `json:"tools"`
+	IMAccess         IMAccessPolicy `json:"im_access"`
+	Budget           BudgetPolicy   `json:"budget"`
+	BackendConfig    BackendConfig  `json:"backend_config"`
+	Audit            AuditPolicy    `json:"audit"`
+	SecretRefs       []SecretRef    `json:"secret_refs"`
+	ChannelBinding   []string       `json:"channel_binding"`
+	KnowledgeBaseIDs []string       `json:"knowledge_base_ids"`
 }
 
 // Clone returns a deep copy of caller-owned slices and maps in the config.
@@ -92,6 +104,7 @@ func (c AppConfig) Clone() AppConfig {
 	cloned := c
 	cloned.Model = c.Model.Clone()
 	cloned.Tools = c.Tools.Clone()
+	cloned.IMAccess = c.IMAccess.Clone()
 	cloned.BackendConfig = c.BackendConfig.Clone()
 	cloned.SecretRefs = cloneSecretRefs(c.SecretRefs)
 	cloned.ChannelBinding = slices.Clone(c.ChannelBinding)
@@ -119,8 +132,17 @@ func (c AppConfig) Validate() error {
 	if err := c.Tools.Validate(); err != nil {
 		return fmt.Errorf("tool policy: %w", err)
 	}
+	if err := c.IMAccess.Validate(); err != nil {
+		return fmt.Errorf("im access policy: %w", err)
+	}
+	if err := c.Budget.Validate(); err != nil {
+		return fmt.Errorf("budget policy: %w", err)
+	}
 	if err := c.BackendConfig.Validate(); err != nil {
 		return fmt.Errorf("backend_config: %w", err)
+	}
+	if err := c.Audit.Validate(); err != nil {
+		return fmt.Errorf("audit policy: %w", err)
 	}
 	if err := validateUniqueStrings(c.KnowledgeBaseIDs, "knowledge base"); err != nil {
 		return err
@@ -194,15 +216,17 @@ func (c ModelConfig) Validate() error {
 
 // ToolPolicy declares the tool contract for a tenant application.
 type ToolPolicy struct {
-	VisibleTools    []string `json:"visible_tools"`
-	ExecutableTools []string `json:"executable_tools"`
+	VisibleTools        []string `json:"visible_tools"`
+	ExecutableTools     []string `json:"executable_tools"`
+	ReviewRequiredTools []string `json:"review_required_tools"`
 }
 
 // Clone returns a deep copy of the tool policy.
 func (p ToolPolicy) Clone() ToolPolicy {
 	return ToolPolicy{
-		VisibleTools:    slices.Clone(p.VisibleTools),
-		ExecutableTools: slices.Clone(p.ExecutableTools),
+		VisibleTools:        slices.Clone(p.VisibleTools),
+		ExecutableTools:     slices.Clone(p.ExecutableTools),
+		ReviewRequiredTools: slices.Clone(p.ReviewRequiredTools),
 	}
 }
 
@@ -215,6 +239,14 @@ func (p ToolPolicy) Validate() error {
 	if err := validateUniqueStrings(p.ExecutableTools, "executable tool"); err != nil {
 		return err
 	}
+	if err := validateUniqueStrings(p.ReviewRequiredTools, "review-required tool"); err != nil {
+		return err
+	}
+	for _, name := range p.ReviewRequiredTools {
+		if !p.CanExecute(name) {
+			return fmt.Errorf("review-required tool %q must be executable", name)
+		}
+	}
 	return nil
 }
 
@@ -226,6 +258,62 @@ func (p ToolPolicy) CanView(name string) bool {
 // CanExecute reports whether the tenant app may execute a tool.
 func (p ToolPolicy) CanExecute(name string) bool {
 	return containsString(p.ExecutableTools, name)
+}
+
+// RequiresReview reports whether an executable tool needs human approval.
+func (p ToolPolicy) RequiresReview(name string) bool {
+	return containsString(p.ReviewRequiredTools, name)
+}
+
+// IMAccessPolicy restricts verified channel messages using platform-owned
+// identity and conversation IDs. Provider IDs must never be stored here.
+type IMAccessPolicy struct {
+	AllowedUsers         []string `json:"allowed_users"`
+	AllowedConversations []string `json:"allowed_conversations"`
+}
+
+// Clone returns a deep copy of the access policy.
+func (p IMAccessPolicy) Clone() IMAccessPolicy {
+	return IMAccessPolicy{
+		AllowedUsers:         slices.Clone(p.AllowedUsers),
+		AllowedConversations: slices.Clone(p.AllowedConversations),
+	}
+}
+
+// Validate checks platform identity references and their uniqueness.
+func (p IMAccessPolicy) Validate() error {
+	if err := validateUniqueStrings(p.AllowedUsers, "allowed user"); err != nil {
+		return err
+	}
+	if err := validateUniqueStrings(p.AllowedConversations, "allowed conversation"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Allows applies the documented allowlist semantics: an empty policy imposes
+// no additional restriction; otherwise either the mapped user or conversation
+// must be listed.
+func (p IMAccessPolicy) Allows(userID, conversationID string) bool {
+	if len(p.AllowedUsers) == 0 && len(p.AllowedConversations) == 0 {
+		return true
+	}
+	return containsString(p.AllowedUsers, userID) ||
+		containsString(p.AllowedConversations, conversationID)
+}
+
+// BudgetPolicy controls the maximum model tokens consumed by one execution.
+// Zero means unlimited. The counter is per execution, never shared by tenant.
+type BudgetPolicy struct {
+	MaxTokensPerExecution int `json:"max_tokens_per_execution"`
+}
+
+// Validate checks the token limit. Zero disables the limit.
+func (p BudgetPolicy) Validate() error {
+	if p.MaxTokensPerExecution < 0 {
+		return errors.New("max_tokens_per_execution must be non-negative")
+	}
+	return nil
 }
 
 // BackendKind identifies a storage backend family.
@@ -333,6 +421,23 @@ func (c BackendConfig) Validate() error {
 	return nil
 }
 
+// AuditPolicy controls tenant audit behavior.
+type AuditPolicy struct {
+	Enabled             bool `json:"enabled"`
+	RecordToolDecisions bool `json:"record_tool_decisions"`
+	RecordExecutions    bool `json:"record_executions"`
+	RetentionDays       int  `json:"retention_days"`
+	RedactPII           bool `json:"redact_pii"`
+}
+
+// Validate checks audit retention values. The zero value disables audit.
+func (p AuditPolicy) Validate() error {
+	if p.RetentionDays < 0 {
+		return errors.New("retention_days must be non-negative")
+	}
+	return nil
+}
+
 // SecretRef points to a secret managed outside the database.
 type SecretRef struct {
 	Name    string `json:"name"`
@@ -367,6 +472,10 @@ type RuntimeContext struct {
 	UserID string `json:"user_id"`
 	// TraceID identifies the end-to-end trace for this request.
 	TraceID string `json:"trace_id"`
+	// TraceParent and TraceState carry the standard W3C context across the
+	// durable execution boundary. TraceID remains for operator correlation.
+	TraceParent string `json:"trace_parent,omitempty"`
+	TraceState  string `json:"trace_state,omitempty"`
 }
 
 // Scope returns the tenant and application scope for persistence keys.

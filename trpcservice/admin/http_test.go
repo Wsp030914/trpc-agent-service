@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -113,6 +114,35 @@ func TestHTTPHandlerRejectsUnknownFieldsBeforeRepositoryMutation(t *testing.T) {
 	}
 	if repository.tenant.ID != "" {
 		t.Fatalf("repository mutated: %#v", repository.tenant)
+	}
+}
+
+func TestHTTPHandlerListsAuditEventsByExactTenantAndAppScope(t *testing.T) {
+	repository := &recordingRepository{auditEvents: []platformaudit.Event{
+		{TenantID: "tenant-a", AppID: "support", EventType: platformaudit.ExecutionStarted},
+		{TenantID: "tenant-a", AppID: "billing", EventType: platformaudit.ExecutionFailed},
+		{TenantID: "tenant-b", AppID: "support", EventType: platformaudit.ExecutionCompleted},
+	}}
+	handler := newAdminHandler(t, repository)
+	request := httptest.NewRequest(http.MethodGet, "/admin/v1/audit-events?tenant_id=tenant-a&app_id=support&limit=25", nil)
+	request.Header.Set("Authorization", "Bearer "+testAdminToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var body struct {
+		Events []platformaudit.Event `json:"events"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode audit response: %v", err)
+	}
+	if len(body.Events) != 1 || body.Events[0].TenantID != "tenant-a" || body.Events[0].AppID != "support" {
+		t.Fatalf("audit events = %#v", body.Events)
+	}
+	if repository.auditTenantID != "tenant-a" || repository.auditAppID != "support" || repository.auditLimit != 25 {
+		t.Fatalf("audit scope = %q/%q limit=%d", repository.auditTenantID, repository.auditAppID, repository.auditLimit)
 	}
 }
 

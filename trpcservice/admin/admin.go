@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
@@ -38,6 +39,10 @@ type Repository interface {
 	ActivateAppConfig(ctx context.Context, tenantID, appID, version string) error
 	CreateCredential(ctx context.Context, digest auth.APIKeyDigest, credential auth.Credential) error
 	RevokeCredential(ctx context.Context, tenantID, appID, credentialID string) error
+}
+
+type auditReader interface {
+	ListAuditEvents(context.Context, string, string, int) ([]platformaudit.Event, error)
 }
 
 type dataMigrationRepository interface {
@@ -356,6 +361,23 @@ func (a API) RevokeCredential(ctx context.Context, scope tenant.Scope, credentia
 	return nil
 }
 
+// ListAuditEvents returns metadata-only audit events from exactly one tenant
+// application scope. The concrete repository owns the SQL scope predicate.
+func (a API) ListAuditEvents(ctx context.Context, scope tenant.Scope, limit int) ([]platformaudit.Event, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, invalidInput(err)
+	}
+	reader, err := a.auditReader()
+	if err != nil {
+		return nil, err
+	}
+	events, err := reader.ListAuditEvents(ctx, scope.TenantID, scope.AppID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list audit events: %w", err)
+	}
+	return events, nil
+}
+
 func (a API) repository() (Repository, error) {
 	if a.Repository == nil {
 		return nil, errors.New("admin repository is required")
@@ -373,6 +395,18 @@ func (a API) dataMigrationRepository() (dataMigrationRepository, error) {
 		return nil, errors.New("admin repository does not support data migrations")
 	}
 	return migrations, nil
+}
+
+func (a API) auditReader() (auditReader, error) {
+	repository, err := a.repository()
+	if err != nil {
+		return nil, err
+	}
+	reader, ok := repository.(auditReader)
+	if !ok {
+		return nil, errors.New("admin repository does not support audit queries")
+	}
+	return reader, nil
 }
 
 func generateCredentialValues(random io.Reader) (string, string, error) {

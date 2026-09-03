@@ -2,17 +2,208 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	platformsession "github.com/liuzengh/trpc-agent-service/trpcservice/session"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 	frameworksession "trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/noop"
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 	frameworktodo "trpc.group/trpc-go/trpc-agent-go/tool/todo"
 )
+
+func TestBudgetCallbacksStopLaterModelCalls(t *testing.T) {
+	callbacks := newBudgetCallbacks(tenant.BudgetPolicy{MaxTokensPerExecution: 3})
+	if callbacks == nil {
+		t.Fatal("budget callbacks were not created")
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("first model call was rejected: %v", err)
+	}
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{
+		Response: &model.Response{Usage: &model.Usage{PromptTokens: 2, CompletionTokens: 1, TotalTokens: 3}},
+	}); err != nil {
+		t.Fatalf("record usage: %v", err)
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("later model call error = %v, want ErrBudgetExceeded", err)
+	}
+}
+
+func TestBudgetCallbacksReserveConcurrentModelCall(t *testing.T) {
+	callbacks := newBudgetCallbacks(tenant.BudgetPolicy{MaxTokensPerExecution: 3})
+	if callbacks == nil {
+		t.Fatal("budget callbacks were not created")
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("first model call was rejected: %v", err)
+	}
+
+	secondCall := make(chan error, 1)
+	go func() {
+		_, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{})
+		secondCall <- err
+	}()
+	if err := <-secondCall; !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("concurrent model call error = %v, want ErrBudgetExceeded", err)
+	}
+
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{
+		Response: &model.Response{Usage: &model.Usage{TotalTokens: 1}},
+	}); err != nil {
+		t.Fatalf("record usage: %v", err)
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("model call after reservation release was rejected: %v", err)
+	}
+}
+
+func TestBudgetCallbacksKeepStreamingReservationUntilTerminalUsage(t *testing.T) {
+	callbacks := newBudgetCallbacks(tenant.BudgetPolicy{MaxTokensPerExecution: 3})
+	if callbacks == nil {
+		t.Fatal("budget callbacks were not created")
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("streaming model call was rejected: %v", err)
+	}
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{
+		Response: &model.Response{IsPartial: true},
+	}); err != nil {
+		t.Fatalf("partial model response was rejected: %v", err)
+	}
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{
+		Response: &model.Response{
+			Done:  true,
+			Usage: &model.Usage{TotalTokens: 2},
+		},
+	}); err != nil {
+		t.Fatalf("terminal model usage was rejected: %v", err)
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("remaining model budget was rejected: %v", err)
+	}
+}
+
+func TestBudgetCallbacksFailClosedWithoutTerminalUsage(t *testing.T) {
+	callbacks := newBudgetCallbacks(tenant.BudgetPolicy{MaxTokensPerExecution: 3})
+	if callbacks == nil {
+		t.Fatal("budget callbacks were not created")
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("model call was rejected: %v", err)
+	}
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{
+		Response: &model.Response{Done: true},
+	}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("unmetered model response error = %v, want ErrBudgetExceeded", err)
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("follow-up model call error = %v, want ErrBudgetExceeded", err)
+	}
+}
+
+func TestDefaultEndpointPolicyRejectsNonPublicAddresses(t *testing.T) {
+	policy := DefaultEndpointPolicy{}
+	for _, endpoint := range []string{
+		"https://10.0.0.1/v1",
+		"https://192.168.1.1/v1",
+		"https://[fd00::1]/v1",
+		"https://[::ffff:10.0.0.1]/v1",
+	} {
+		if _, err := policy.ResolveModelBaseURL(context.Background(), worker.Execution{}, endpoint); err == nil {
+			t.Errorf("private endpoint %q was accepted", endpoint)
+		}
+	}
+}
+
+func TestDefaultEndpointPolicyAllowsPublicLiteral(t *testing.T) {
+	endpoint := "https://8.8.8.8/v1"
+	resolved, err := (DefaultEndpointPolicy{}).ResolveModelBaseURL(context.Background(), worker.Execution{}, endpoint)
+	if err != nil {
+		t.Fatalf("public endpoint rejected: %v", err)
+	}
+	if resolved != endpoint {
+		t.Fatalf("resolved endpoint = %q, want %q", resolved, endpoint)
+	}
+}
+
+func TestModelObservabilityCallbacksFinishOnTerminalResponse(t *testing.T) {
+	metricsRecorder, err := platformmetrics.New(metricnoop.NewMeterProvider(), platformmetrics.PricingCatalog{})
+	if err != nil {
+		t.Fatalf("new metrics recorder: %v", err)
+	}
+	exec := worker.Execution{
+		RequestID: "request-1",
+		Tenant: tenant.RuntimeContext{
+			TenantID:      "tenant-a",
+			AppID:         "app-a",
+			ConfigVersion: "v1",
+			Channel:       "openai",
+		},
+		Config: tenant.AppConfig{Model: tenant.ModelConfig{
+			Provider: "openai",
+			Model:    "gpt-test",
+		}},
+	}
+	callbacks := addModelObservabilityCallbacks(nil, exec, metricsRecorder)
+	before, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{})
+	if err != nil || before == nil || before.Context == nil {
+		t.Fatalf("before model callback result = %#v, error = %v", before, err)
+	}
+	state, _ := before.Context.Value(modelSpanStateKey{}).(*modelSpanState)
+	if state == nil {
+		t.Fatal("model span state was not attached to callback context")
+	}
+	if _, err := callbacks.RunAfterModel(before.Context, &model.AfterModelArgs{
+		Response: &model.Response{IsPartial: true},
+	}); err != nil {
+		t.Fatalf("partial model response: %v", err)
+	}
+	state.mu.Lock()
+	finishedAfterPartial := state.finished
+	state.mu.Unlock()
+	if finishedAfterPartial {
+		t.Fatal("model span finished before terminal response")
+	}
+	if _, err := callbacks.RunAfterModel(before.Context, &model.AfterModelArgs{
+		Response: &model.Response{
+			Done:  true,
+			Usage: &model.Usage{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3},
+		},
+	}); err != nil {
+		t.Fatalf("terminal model response: %v", err)
+	}
+	state.mu.Lock()
+	finishedAfterTerminal := state.finished
+	state.mu.Unlock()
+	if !finishedAfterTerminal {
+		t.Fatal("model span did not finish on terminal response")
+	}
+
+	withoutMetrics := addModelObservabilityCallbacks(nil, exec, nil)
+	before, err = withoutMetrics.RunBeforeModel(context.Background(), &model.BeforeModelArgs{})
+	if err != nil || before == nil || before.Context == nil {
+		t.Fatalf("before model callback without metrics = %#v, error = %v", before, err)
+	}
+	if _, err := withoutMetrics.RunAfterModel(before.Context, &model.AfterModelArgs{
+		Response: &model.Response{Usage: &model.Usage{TotalTokens: 1}},
+	}); err != nil {
+		t.Fatalf("terminal model response without metrics: %v", err)
+	}
+	state, _ = before.Context.Value(modelSpanStateKey{}).(*modelSpanState)
+	state.mu.Lock()
+	finishedWithoutMetrics := state.finished
+	state.mu.Unlock()
+	if !finishedWithoutMetrics {
+		t.Fatal("model span did not finish when metrics were disabled")
+	}
+}
 
 func TestVisibleToolsFiltersBeforeAgentConstruction(t *testing.T) {
 	tools, err := visibleTools(tenant.ToolPolicy{VisibleTools: []string{"safe"}}, []frameworktool.Tool{

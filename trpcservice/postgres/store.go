@@ -15,6 +15,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -42,6 +43,7 @@ var (
 type Store struct {
 	pool           *pgxpool.Pool
 	identityMapper *IdentityMapper
+	metrics        *platformmetrics.Recorder
 }
 
 // StoreOption configures a Store before it is used concurrently.
@@ -63,6 +65,23 @@ func WithChannelIdentityMapping(
 		store.identityMapper = mapper
 		return nil
 	}
+}
+
+// WithMetrics attaches the process-wide low-cardinality metrics recorder.
+func WithMetrics(recorder *platformmetrics.Recorder) StoreOption {
+	return func(store *Store) error {
+		store.metrics = recorder
+		return nil
+	}
+}
+
+// Metrics returns the optional process metrics recorder for wiring adjacent
+// ingress and worker components.
+func (s *Store) Metrics() *platformmetrics.Recorder {
+	if s == nil {
+		return nil
+	}
+	return s.metrics
 }
 
 // New creates a Store using a caller-owned PostgreSQL pool.
@@ -87,13 +106,18 @@ func (s *Store) CreateTenant(ctx context.Context, value tenant.Tenant) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
+	auditPolicy, err := marshalAuditPolicy(value.Audit)
+	if err != nil {
+		return err
+	}
 	if _, err := s.pool.Exec(
 		ctx,
-		`INSERT INTO platform.tenant (tenant_id, name, status)
-VALUES ($1, $2, $3)`,
+		`INSERT INTO platform.tenant (tenant_id, name, status, audit_policy)
+VALUES ($1, $2, $3, $4)`,
 		value.ID,
 		value.Name,
 		value.Status,
+		auditPolicy,
 	); err != nil {
 		return fmt.Errorf("create tenant: %w", err)
 	}
@@ -109,15 +133,20 @@ func (s *Store) ResolveTenant(ctx context.Context, tenantID string) (tenant.Tena
 		return tenant.Tenant{}, errors.New("tenant_id is required")
 	}
 	var value tenant.Tenant
+	var auditPolicy []byte
 	err := s.pool.QueryRow(
 		ctx,
-		`SELECT tenant_id, name, status
+		`SELECT tenant_id, name, status, audit_policy
 FROM platform.tenant
 WHERE tenant_id = $1`,
 		tenantID,
-	).Scan(&value.ID, &value.Name, &value.Status)
+	).Scan(&value.ID, &value.Name, &value.Status, &auditPolicy)
 	if err != nil {
 		return tenant.Tenant{}, resolveError("tenant", err)
+	}
+	value.Audit, err = unmarshalAuditPolicy(auditPolicy)
+	if err != nil {
+		return tenant.Tenant{}, err
 	}
 	if err := value.Validate(); err != nil {
 		return tenant.Tenant{}, fmt.Errorf("stored tenant: %w", err)
