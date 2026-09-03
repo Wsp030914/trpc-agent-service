@@ -39,6 +39,7 @@ type Resolver struct {
 	mu       sync.Mutex
 	closed   bool
 	services map[string]artifact.Service
+	clients  map[string]*cosclient.Client
 }
 
 // NewResolver creates a COS artifact resolver.
@@ -53,6 +54,7 @@ func NewResolver(secrets platformsecret.SecretProvider, endpoints EndpointResolv
 		secrets:   secrets,
 		endpoints: endpoints,
 		services:  make(map[string]artifact.Service),
+		clients:   make(map[string]*cosclient.Client),
 	}, nil
 }
 
@@ -72,15 +74,9 @@ func (r *Resolver) ResolveArtifact(ctx context.Context, exec worker.Execution) (
 	if ref.IsZero() {
 		return nil, nil
 	}
-	if err := ValidateBackend(ref); err != nil {
-		return nil, err
-	}
 	scope := exec.Tenant.Scope()
-	endpoint, err := r.endpoints.ResolveCOSEndpoint(ctx, ref.Name)
+	endpoint, err := r.resolveEndpoint(ctx, ref)
 	if err != nil {
-		return nil, fmt.Errorf("resolve cos endpoint: %w", err)
-	}
-	if err := sharedcos.ValidateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
 	serviceKey, err := artifactServiceKey(scope, exec.Tenant.ConfigVersion, ref, endpoint)
@@ -98,11 +94,7 @@ func (r *Resolver) ResolveArtifact(ctx context.Context, exec worker.Execution) (
 	}
 	r.mu.Unlock()
 
-	credential, err := r.secrets.ResolveSecret(ctx, scope, ref.SecretRef)
-	if err != nil {
-		return nil, fmt.Errorf("resolve cos credentials: %w", err)
-	}
-	client, err := sharedcos.New(endpoint, credential)
+	client, err := r.resolveClient(ctx, scope, ref, endpoint, serviceKey)
 	if err != nil {
 		return nil, err
 	}
@@ -158,21 +150,15 @@ func (r *Resolver) ResolveInboundStore(
 	if configVersion == "" {
 		return nil, errors.New("artifact config version is required")
 	}
-	if err := ValidateBackend(ref); err != nil {
+	endpoint, err := r.resolveEndpoint(ctx, ref)
+	if err != nil {
 		return nil, err
 	}
-	endpoint, err := r.endpoints.ResolveCOSEndpoint(ctx, ref.Name)
+	serviceKey, err := artifactServiceKey(scope, configVersion, ref, endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("resolve cos endpoint: %w", err)
-	}
-	if err := sharedcos.ValidateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
-	credential, err := r.secrets.ResolveSecret(ctx, scope, ref.SecretRef)
-	if err != nil {
-		return nil, fmt.Errorf("resolve cos credentials: %w", err)
-	}
-	client, err := sharedcos.New(endpoint, credential)
+	client, err := r.resolveClient(ctx, scope, ref, endpoint, serviceKey)
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +167,58 @@ func (r *Resolver) ResolveInboundStore(
 		return nil, err
 	}
 	return &InboundObjectStore{client: client, prefix: prefix}, nil
+}
+
+func (r *Resolver) resolveEndpoint(ctx context.Context, ref tenant.BackendRef) (string, error) {
+	if err := ValidateBackend(ref); err != nil {
+		return "", err
+	}
+	endpoint, err := r.endpoints.ResolveCOSEndpoint(ctx, ref.Name)
+	if err != nil {
+		return "", fmt.Errorf("resolve cos endpoint: %w", err)
+	}
+	if err := sharedcos.ValidateEndpoint(endpoint); err != nil {
+		return "", err
+	}
+	return endpoint, nil
+}
+
+func (r *Resolver) resolveClient(
+	ctx context.Context,
+	scope tenant.Scope,
+	ref tenant.BackendRef,
+	endpoint string,
+	serviceKey string,
+) (*cosclient.Client, error) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errors.New("cos artifact resolver is closed")
+	}
+	if client := r.clients[serviceKey]; client != nil {
+		r.mu.Unlock()
+		return client, nil
+	}
+	r.mu.Unlock()
+
+	credential, err := r.secrets.ResolveSecret(ctx, scope, ref.SecretRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve cos credentials: %w", err)
+	}
+	client, err := sharedcos.New(endpoint, credential)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, errors.New("cos artifact resolver is closed")
+	}
+	if existing := r.clients[serviceKey]; existing != nil {
+		return existing, nil
+	}
+	r.clients[serviceKey] = client
+	return client, nil
 }
 
 // Put stores one pre-admission object under an internally generated key.
@@ -346,8 +384,8 @@ func ValidateBackend(ref tenant.BackendRef) error {
 	return nil
 }
 
-// Close releases cached service references. COS services do not own a
-// closeable connection, so callers may safely call Close multiple times.
+// Close releases cached service and client references. COS clients do not own
+// a closeable connection, so callers may safely call Close multiple times.
 func (r *Resolver) Close() error {
 	if r == nil {
 		return nil
@@ -359,6 +397,7 @@ func (r *Resolver) Close() error {
 	}
 	r.closed = true
 	r.services = nil
+	r.clients = nil
 	return nil
 }
 

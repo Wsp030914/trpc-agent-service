@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
@@ -151,38 +151,11 @@ func parseArtifactRef(ref *model.ContentRef) (string, int, error) {
 		return "", 0, errors.New("content ref is required")
 	}
 	if ref.ArtifactName != "" {
-		if err := validateArtifactName(ref.ArtifactName); err != nil {
-			return "", 0, err
-		}
-		if ref.ArtifactVersion < 0 {
-			return "", 0, errors.New("artifact version is invalid")
-		}
-		return ref.ArtifactName, ref.ArtifactVersion, nil
+		return gateway.ParseArtifactRef(
+			"artifact://" + ref.ArtifactName + "@" + strconv.Itoa(ref.ArtifactVersion),
+		)
 	}
-	if !strings.HasPrefix(ref.ArtifactRef, "artifact://") {
-		return "", 0, errors.New("artifact ref must use artifact://")
-	}
-	rest := strings.TrimPrefix(ref.ArtifactRef, "artifact://")
-	separator := strings.LastIndex(rest, "@")
-	if separator <= 0 || separator == len(rest)-1 {
-		return "", 0, errors.New("artifact ref must pin a version")
-	}
-	name := rest[:separator]
-	if err := validateArtifactName(name); err != nil {
-		return "", 0, err
-	}
-	version, err := strconv.Atoi(rest[separator+1:])
-	if err != nil || version < 0 {
-		return "", 0, errors.New("artifact ref version is invalid")
-	}
-	return name, version, nil
-}
-
-func validateArtifactName(name string) error {
-	if name == "" || strings.ContainsAny(name, "@\x00\r\n\t") || strings.Contains(name, "..") {
-		return errors.New("artifact ref name is invalid")
-	}
-	return nil
+	return gateway.ParseArtifactRef(ref.ArtifactRef)
 }
 
 func validateLoadedArtifact(ref *model.ContentRef, data []byte) error {

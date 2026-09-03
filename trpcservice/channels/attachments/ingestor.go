@@ -1,4 +1,5 @@
-package main
+// Package attachments implements the production IM media-to-artifact path.
+package attachments
 
 import (
 	"context"
@@ -8,7 +9,6 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"strings"
 	"time"
@@ -25,16 +25,33 @@ import (
 
 const productionInboundMediaLimit int64 = 32 << 20
 
-// productionMediaDownloader resolves media only through the verified binding
-// selected by ChannelInput. WeCom uses its provider URL; Feishu uses the
-// official message-resource API and the binding's app credentials.
-type productionMediaDownloader struct {
+// NewIngestor creates the production media ingestor. Media is downloaded only
+// after binding authorization, stored in COS, and represented downstream by an
+// ArtifactRef.
+func NewIngestor(
+	store *postgres.Store,
+	secrets platformsecret.SecretProvider,
+	resolver *artifactcos.Resolver,
+) (channels.AttachmentIngestor, error) {
+	if store == nil || secrets == nil || resolver == nil {
+		return nil, errors.New("attachment ingestor dependencies are required")
+	}
+	return channels.NewArtifactIngestor(
+		mediaDownloader{store: store, secrets: secrets},
+		inboundArtifactWriter{store: store, resolver: resolver},
+	)
+}
+
+// mediaDownloader resolves media only through the verified binding selected
+// by ChannelInput. WeCom uses its provider URL; Feishu uses the official
+// message-resource API and the binding's app credentials.
+type mediaDownloader struct {
 	store   *postgres.Store
 	secrets platformsecret.SecretProvider
 	http    *http.Client
 }
 
-func (d productionMediaDownloader) Download(
+func (d mediaDownloader) Download(
 	ctx context.Context,
 	input channels.ChannelInput,
 	media channels.ProviderMediaRef,
@@ -64,7 +81,7 @@ func (d productionMediaDownloader) Download(
 	}
 }
 
-func (d productionMediaDownloader) downloadWeCom(
+func (d mediaDownloader) downloadWeCom(
 	ctx context.Context,
 	media channels.ProviderMediaRef,
 ) (channels.DownloadedMedia, error) {
@@ -120,12 +137,12 @@ func (d productionMediaDownloader) downloadWeCom(
 	return channels.DownloadedMedia{Filename: filename, MIMEType: mimeType, Data: data}, nil
 }
 
-type productionInboundArtifactWriter struct {
+type inboundArtifactWriter struct {
 	store    *postgres.Store
 	resolver *artifactcos.Resolver
 }
 
-func (w productionInboundArtifactWriter) WriteInboundArtifact(
+func (w inboundArtifactWriter) WriteInboundArtifact(
 	ctx context.Context,
 	input channels.InboundArtifact,
 ) (string, error) {
@@ -189,28 +206,4 @@ func (w productionInboundArtifactWriter) WriteInboundArtifact(
 		}
 	}
 	return staged.ArtifactRef, nil
-}
-
-func newProductionAttachmentIngestor(
-	store *postgres.Store,
-	secrets platformsecret.SecretProvider,
-) (channels.AttachmentIngestor, error) {
-	if store == nil || secrets == nil {
-		return nil, errors.New("attachment ingestor dependencies are required")
-	}
-	resolver, err := artifactcos.NewResolver(
-		secrets,
-		environmentCOSEndpointResolver{getenv: os.Getenv},
-	)
-	if err != nil {
-		return nil, err
-	}
-	ingestor, err := channels.NewArtifactIngestor(
-		productionMediaDownloader{store: store, secrets: secrets},
-		productionInboundArtifactWriter{store: store, resolver: resolver},
-	)
-	if err != nil {
-		return nil, err
-	}
-	return ingestor, nil
 }

@@ -31,7 +31,6 @@ func TestArtifactReservationsAllocateDistinctVersionsAndDeleteExactTargets(t *te
 	config.TenantID, config.AppID = scope.TenantID, scope.AppID
 	if err := store.CreateTenant(ctx, tenant.Tenant{
 		ID: scope.TenantID, Name: id, Status: tenant.StatusActive,
-		Audit: tenant.AuditPolicy{Enabled: true, RetentionDays: 30, RedactPII: true},
 	}); err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}

@@ -3,15 +3,12 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
 
 func TestConfigFromEnvironmentRequiresExplicitWorkerIdentity(t *testing.T) {
@@ -20,14 +17,14 @@ func TestConfigFromEnvironmentRequiresExplicitWorkerIdentity(t *testing.T) {
 		envPostgresDSN:     "postgres://example",
 		envRedisURL:        "redis://example:6379/0",
 		envWorkerID:        "worker-a",
-		envHealthAddr:      "127.0.0.1:8081",
+		envHTTPAddr:        "127.0.0.1:8081",
 		envShutdownTimeout: "45s",
 	}))
 	if err != nil {
 		t.Fatalf("config from environment: %v", err)
 	}
 	if config.Role != roleWorker || config.WorkerID != "worker-a" ||
-		config.HealthAddr != "127.0.0.1:8081" || config.ShutdownTimeout != 45*time.Second {
+		config.HTTPAddr != "127.0.0.1:8081" || config.ShutdownTimeout != 45*time.Second {
 		t.Fatalf("config = %#v", config)
 	}
 
@@ -86,34 +83,6 @@ func TestRenewLeaseBoundsRenewalCall(t *testing.T) {
 	}
 }
 
-func TestDeleteArtifactCleanupUsesBoundedContext(t *testing.T) {
-	t.Parallel()
-	executor := artifactCleanupExecutorFunc(func(ctx context.Context, _ worker.Execution, _ platformartifact.CleanupRecord) error {
-		deadline, ok := ctx.Deadline()
-		if !ok {
-			return errors.New("cleanup context has no deadline")
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 || remaining > artifactCleanupTimeout {
-			return fmt.Errorf("cleanup deadline remaining = %s", remaining)
-		}
-		return nil
-	})
-	if err := deleteArtifactCleanup(context.Background(), executor, worker.Execution{}, platformartifact.CleanupRecord{}); err != nil {
-		t.Fatalf("delete artifact cleanup: %v", err)
-	}
-}
-
-type artifactCleanupExecutorFunc func(context.Context, worker.Execution, platformartifact.CleanupRecord) error
-
-func (f artifactCleanupExecutorFunc) DeleteCleanup(
-	ctx context.Context,
-	exec worker.Execution,
-	record platformartifact.CleanupRecord,
-) error {
-	return f(ctx, exec, record)
-}
-
 func TestConfigFromEnvironmentRequiresAdminTokenForGateway(t *testing.T) {
 	_, err := configFromEnvironment(environmentReader(map[string]string{
 		envRole:        string(roleGateway),
@@ -136,31 +105,8 @@ func TestConfigFromEnvironmentRequiresAdminTokenForGateway(t *testing.T) {
 	}
 }
 
-func TestHealthHandlerReadinessTracksDependencies(t *testing.T) {
-	state := &healthState{}
-	handler := healthHandler(state)
-
-	assertHTTPStatus(t, handler, "/livez", http.StatusOK)
-	assertHTTPStatus(t, handler, "/readyz", http.StatusServiceUnavailable)
-
-	state.ready.Store(true)
-	assertHTTPStatus(t, handler, "/readyz", http.StatusOK)
-	state.check = func(context.Context) error { return errors.New("postgres unavailable") }
-	assertHTTPStatus(t, handler, "/readyz", http.StatusServiceUnavailable)
-}
-
-func TestReadinessCheckChecksPostgresAndRedis(t *testing.T) {
-	postgres := healthChecker(func(context.Context) error { return nil })
-	redis := healthChecker(func(context.Context) error { return errors.New("redis unavailable") })
-	if err := readinessCheck(postgres, redis)(context.Background()); err == nil {
-		t.Fatal("readiness check succeeded with unavailable redis")
-	}
-}
-
 func TestServiceHandlerRoutesGatewayIngress(t *testing.T) {
-	state := &healthState{}
-	state.ready.Store(true)
-	handler := serviceHandler(state, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := serviceHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
 			t.Fatalf("ingress path = %q", r.URL.Path)
 		}
@@ -172,7 +118,6 @@ func TestServiceHandlerRoutesGatewayIngress(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	assertHTTPStatus(t, handler, "/readyz", http.StatusOK)
 	assertHTTPStatus(t, handler, "/v1/chat/completions", http.StatusNoContent)
 	assertHTTPStatus(t, handler, "/admin/v1/tenants", http.StatusNoContent)
 }
@@ -281,10 +226,4 @@ func assertHTTPStatus(t *testing.T, handler http.Handler, path string, want int)
 	if response.Code != want {
 		t.Fatalf("GET %s status = %d, want %d", path, response.Code, want)
 	}
-}
-
-type healthChecker func(context.Context) error
-
-func (f healthChecker) Ping(ctx context.Context) error {
-	return f(ctx)
 }

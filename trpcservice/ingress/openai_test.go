@@ -206,7 +206,7 @@ func newTestOpenAIHandler(t *testing.T) (
 	}
 	admitter := &recordingAdmitter{}
 	source := &recordingEventSource{}
-	queued, err := gateway.NewQueuedRunner(gateway.New(gateway.WithAdmitter(admitter)), source)
+	queued, err := gateway.NewQueuedRunner(gateway.New(admitter), source)
 	if err != nil {
 		t.Fatalf("new queued runner: %v", err)
 	}

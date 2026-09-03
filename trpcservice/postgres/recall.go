@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 )
 
 // RecallRequest and RecallResult remain package aliases so callers can use
@@ -102,8 +101,7 @@ func (s *Store) HandleRecall(ctx context.Context, request RecallRequest) (Recall
 	case "PENDING":
 		if _, err := tx.Exec(ctx, `
 UPDATE platform.execution
-SET status = 'CANCELED', cancel_requested = true,
-    cancel_requested_at = clock_timestamp(), finished_at = clock_timestamp(),
+SET status = 'CANCELED', finished_at = clock_timestamp(),
     updated_at = clock_timestamp()
 WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'PENDING'`,
 			request.TenantID, request.AppID, inboxRequestID); err != nil {
@@ -113,37 +111,22 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'PENDING'`
 	case "RUNNING":
 		if _, err := tx.Exec(ctx, `
 UPDATE platform.execution
-SET cancel_requested = true,
-    cancel_requested_at = COALESCE(cancel_requested_at, clock_timestamp()),
+
+		SET status = 'CANCELED',
+		    lease_owner = NULL, run_token = NULL, lease_until = NULL,
+    finished_at = clock_timestamp(),
     updated_at = clock_timestamp()
 WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'RUNNING'`,
 			request.TenantID, request.AppID, inboxRequestID); err != nil {
-			return RecallResult{}, fmt.Errorf("request running execution cancellation: %w", err)
+			return RecallResult{}, fmt.Errorf("cancel running execution: %w", err)
 		}
-		result.CancelRequested = true
+		result.ExecutionStatus = "CANCELED"
 	default:
-		// Completed and previously canceled executions are retained. The audit
-		// row below records that the verified recall was observed.
+		// Completed and previously canceled executions are retained.
 	}
 
 	if err := insertRecall(ctx, tx, request, inboxRequestID, "APPLIED", ""); err != nil {
 		return RecallResult{}, err
-	}
-	if _, err := tx.Exec(ctx, `
-INSERT INTO platform.audit_event (
-    tenant_id, app_id, request_id, channel, user_id, session_principal_id,
-    session_id, trace_id, agent_name, event_type, decision
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'channel', 'CHANNEL_MESSAGE_RECALLED', 'ALLOW')`,
-		request.TenantID,
-		request.AppID,
-		inboxRequestID,
-		execution.Channel,
-		execution.UserID,
-		execution.SessionPrincipalID,
-		execution.SessionID,
-		execution.TraceID,
-	); err != nil {
-		return RecallResult{}, fmt.Errorf("record recall audit: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return RecallResult{}, fmt.Errorf("commit recall admission: %w", err)
@@ -302,83 +285,27 @@ INSERT INTO platform.channel_recall_inbox (
 	return nil
 }
 
-// CancellationRequested checks a running execution using its current lease.
-// It is called by Worker polling and does not change execution state.
-func (s *Store) CancellationRequested(
-	ctx context.Context,
-	tenantID, appID, requestID string,
-	lease queue.Lease,
-) (bool, error) {
+// IsExecutionCanceled reads the durable recall result before a worker starts.
+func (s *Store) IsExecutionCanceled(ctx context.Context, tenantID, appID, requestID string) (bool, error) {
 	if err := s.validate(); err != nil {
 		return false, err
 	}
 	if tenantID == "" || appID == "" || requestID == "" {
 		return false, errors.New("execution cancellation scope is required")
 	}
-	if err := lease.Validate(); err != nil {
-		return false, err
-	}
-	var requested bool
+	var canceled bool
 	err := s.pool.QueryRow(ctx, `
-SELECT cancel_requested
+SELECT status = 'CANCELED'
 FROM platform.execution
 WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3
-  AND status = 'RUNNING' AND lease_owner = $4 AND run_token = $5
-  AND lease_until > clock_timestamp()`,
-		tenantID, appID, requestID, lease.Owner, lease.Token).Scan(&requested)
+	`, tenantID, appID, requestID).Scan(&canceled)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, fmt.Errorf("check execution cancellation: %w", queue.ErrLeaseLost)
+		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("check execution cancellation: %w", err)
 	}
-	return requested, nil
-}
-
-// CancelExecution commits the terminal CANCELED state for the still-owned
-// run. A lost lease is harmless when another recall path already canceled it.
-func (s *Store) CancelExecution(
-	ctx context.Context,
-	tenantID, appID, requestID string,
-	lease queue.Lease,
-) error {
-	if err := s.validate(); err != nil {
-		return err
-	}
-	if tenantID == "" || appID == "" || requestID == "" {
-		return errors.New("execution cancellation scope is required")
-	}
-	if err := lease.Validate(); err != nil {
-		return err
-	}
-	tag, err := s.pool.Exec(ctx, `
-UPDATE platform.execution
-SET status = 'CANCELED', cancel_requested = true,
-    cancel_requested_at = COALESCE(cancel_requested_at, clock_timestamp()),
-    lease_owner = NULL, run_token = NULL, lease_until = NULL,
-    finished_at = clock_timestamp(), updated_at = clock_timestamp()
-WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3
-  AND status = 'RUNNING' AND lease_owner = $4 AND run_token = $5`,
-		tenantID, appID, requestID, lease.Owner, lease.Token)
-	if err != nil {
-		return fmt.Errorf("cancel execution: %w", err)
-	}
-	if tag.RowsAffected() == 1 {
-		return nil
-	}
-	var status string
-	var cancelRequested bool
-	if err := s.pool.QueryRow(ctx, `
-SELECT status, cancel_requested
-FROM platform.execution
-WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
-		tenantID, appID, requestID).Scan(&status, &cancelRequested); err != nil {
-		return fmt.Errorf("read canceled execution: %w", err)
-	}
-	if status == "CANCELED" && cancelRequested {
-		return nil
-	}
-	return fmt.Errorf("cancel execution: %w", queue.ErrLeaseLost)
+	return canceled, nil
 }
 
 var _ channels.RecallAdmitter = (*Store)(nil)

@@ -600,21 +600,16 @@ func validateAdmissionCredential(
 
 func lockTenant(ctx context.Context, tx pgx.Tx, tenantID string) (tenant.Tenant, error) {
 	var value tenant.Tenant
-	var auditPolicy []byte
 	err := tx.QueryRow(
 		ctx,
-		`SELECT tenant_id, name, status, audit_policy
+		`SELECT tenant_id, name, status
 FROM platform.tenant
 WHERE tenant_id = $1
 FOR UPDATE`,
 		tenantID,
-	).Scan(&value.ID, &value.Name, &value.Status, &auditPolicy)
+	).Scan(&value.ID, &value.Name, &value.Status)
 	if err != nil {
 		return tenant.Tenant{}, resolveError("tenant", err)
-	}
-	value.Audit, err = unmarshalAuditPolicy(auditPolicy)
-	if err != nil {
-		return tenant.Tenant{}, err
 	}
 	if err := value.Validate(); err != nil {
 		return tenant.Tenant{}, fmt.Errorf("stored tenant: %w", err)
@@ -691,7 +686,7 @@ func resolveAppConfigFrom(
 	var encoded appConfigColumns
 	err := db.QueryRow(
 		ctx,
-		`SELECT model_config, tool_policy, backend_config, audit_policy,
+		`SELECT model_config, tool_policy, backend_config,
        secret_refs, channel_binding_ids, knowledge_base_ids
 FROM platform.app_config_version
 WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
@@ -702,7 +697,6 @@ WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 		&encoded.modelConfig,
 		&encoded.toolPolicy,
 		&encoded.backendConfig,
-		&encoded.auditPolicy,
 		&encoded.secretRefs,
 		&encoded.channelBindingIDs,
 		&encoded.knowledgeBaseIDs,

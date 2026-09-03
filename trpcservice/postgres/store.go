@@ -87,18 +87,13 @@ func (s *Store) CreateTenant(ctx context.Context, value tenant.Tenant) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
-	auditPolicy, err := marshalAuditPolicy(value.Audit)
-	if err != nil {
-		return err
-	}
 	if _, err := s.pool.Exec(
 		ctx,
-		`INSERT INTO platform.tenant (tenant_id, name, status, audit_policy)
-VALUES ($1, $2, $3, $4)`,
+		`INSERT INTO platform.tenant (tenant_id, name, status)
+VALUES ($1, $2, $3)`,
 		value.ID,
 		value.Name,
 		value.Status,
-		auditPolicy,
 	); err != nil {
 		return fmt.Errorf("create tenant: %w", err)
 	}
@@ -114,20 +109,15 @@ func (s *Store) ResolveTenant(ctx context.Context, tenantID string) (tenant.Tena
 		return tenant.Tenant{}, errors.New("tenant_id is required")
 	}
 	var value tenant.Tenant
-	var auditPolicy []byte
 	err := s.pool.QueryRow(
 		ctx,
-		`SELECT tenant_id, name, status, audit_policy
+		`SELECT tenant_id, name, status
 FROM platform.tenant
 WHERE tenant_id = $1`,
 		tenantID,
-	).Scan(&value.ID, &value.Name, &value.Status, &auditPolicy)
+	).Scan(&value.ID, &value.Name, &value.Status)
 	if err != nil {
 		return tenant.Tenant{}, resolveError("tenant", err)
-	}
-	value.Audit, err = unmarshalAuditPolicy(auditPolicy)
-	if err != nil {
-		return tenant.Tenant{}, err
 	}
 	if err := value.Validate(); err != nil {
 		return tenant.Tenant{}, fmt.Errorf("stored tenant: %w", err)

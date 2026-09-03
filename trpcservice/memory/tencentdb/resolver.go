@@ -50,15 +50,6 @@ func NewResolver(secrets platformsecret.SecretProvider, gateways GatewayResolver
 	}, nil
 }
 
-// RequiresPerExecutionRunner reports whether exec creates an ingestor bound
-// to one authenticated user. Shared group Sessions are intentionally skipped.
-func (r *Resolver) RequiresPerExecutionRunner(exec worker.Execution) bool {
-	ref := exec.Config.BackendConfig.Memory
-	return !ref.IsZero() &&
-		ref.Provider == providerName &&
-		exec.Tenant.SessionPrincipalID == exec.Tenant.UserID
-}
-
 // ResolveSessionIngestor returns an ingestor only when the exact config
 // version selects the TencentDB Memory provider.
 func (r *Resolver) ResolveSessionIngestor(

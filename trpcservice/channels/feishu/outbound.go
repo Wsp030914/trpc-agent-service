@@ -20,14 +20,12 @@ import (
 
 const (
 	maxFeishuReplyTextBytes    = 150 << 10
-	maxFeishuReplyCardBytes    = 30 << 10
 	maxFeishuInboundMediaBytes = 32 << 20
 )
 
 var (
 	errFeishuReplyTooLarge          = errors.New("feishu reply is too large")
 	errFeishuReplyUnsupported       = errors.New("feishu reply is unsupported")
-	errFeishuStreamingUnsupported   = errors.New("feishu streaming reply is unsupported")
 	errFeishuOutboundNotInitialized = errors.New("feishu outbound client is not initialized")
 	errFeishuProviderMessageID      = errors.New("feishu provider message id is missing")
 )
@@ -168,20 +166,6 @@ func NewOutboundClient(
 	}, nil
 }
 
-// Capability reports the Feishu features exposed to IM-06. The client is
-// single-call only; queue claiming and retry are outside this package.
-func (c *OutboundClient) Capability() channels.ProviderCapability {
-	return channels.ProviderCapability{
-		SupportsUpdate:    true,
-		SupportsCard:      true,
-		SupportsArtifact:  false,
-		SupportsStreaming: false,
-		SupportsFinalize:  false,
-		MaxTextSize:       maxFeishuReplyTextBytes,
-		TargetTTL:         feishuMessageTargetTTL,
-	}
-}
-
 // DownloadMediaForMessage is the production media path. Feishu requires both
 // the message ID and resource key; the former comes from ChannelInput's
 // normalized external message ID and the latter from the opaque media ref.
@@ -246,7 +230,6 @@ func (c *OutboundClient) SendOnce(
 	ctx context.Context,
 	reply channels.Reply,
 	providerTarget string,
-	outboundContext channels.OutboundContext,
 ) (channels.ProviderReceipt, error) {
 	if c == nil || c.client == nil {
 		return channels.ProviderReceipt{}, errFeishuOutboundNotInitialized
@@ -257,71 +240,40 @@ func (c *OutboundClient) SendOnce(
 	if reply.Channel != channels.ChannelFeishu {
 		return channels.ProviderReceipt{}, errors.New("feishu outbound client received another channel")
 	}
-	if outboundContext.StreamContext != "" {
-		return channels.ProviderReceipt{}, errFeishuStreamingUnsupported
-	}
-	if reply.Operation == channels.ReplyOperationFinalize {
-		return channels.ProviderReceipt{}, errFeishuStreamingUnsupported
-	}
-	messageType, content, err := encodeReply(reply)
+	content, err := encodeReply(reply)
 	if err != nil {
 		return channels.ProviderReceipt{}, err
 	}
-	switch reply.Operation {
-	case channels.ReplyOperationSend:
-		kind, id, err := parseProviderTarget(providerTarget)
-		if err != nil {
-			return channels.ProviderReceipt{}, err
-		}
-		switch kind {
-		case feishuTargetMessage:
-			return c.replyMessage(ctx, id, messageType, content, reply.ReplyID)
-		case feishuTargetUser, feishuTargetConversation:
-			return c.createMessage(ctx, kind, id, messageType, content, reply.ReplyID)
-		default:
-			return channels.ProviderReceipt{}, errFeishuReplyUnsupported
-		}
-	case channels.ReplyOperationUpdate:
-		if outboundContext.ProviderMessageID == "" {
-			return channels.ProviderReceipt{}, errors.New("feishu provider message id is required")
-		}
-		if reply.Kind != channels.ReplyKindText && reply.Kind != channels.ReplyKindFallbackText {
-			return channels.ProviderReceipt{}, errFeishuReplyUnsupported
-		}
-		return c.updateMessage(ctx, outboundContext.ProviderMessageID, messageType, content, reply.ReplyID)
+	kind, id, err := parseProviderTarget(providerTarget)
+	if err != nil {
+		return channels.ProviderReceipt{}, err
+	}
+	switch kind {
+	case feishuTargetMessage:
+		return c.replyMessage(ctx, id, content, reply.ReplyID)
+	case feishuTargetUser, feishuTargetConversation:
+		return c.createMessage(ctx, kind, id, content, reply.ReplyID)
 	default:
 		return channels.ProviderReceipt{}, errFeishuReplyUnsupported
 	}
 }
 
-func encodeReply(reply channels.Reply) (string, []byte, error) {
-	switch reply.Kind {
-	case channels.ReplyKindText, channels.ReplyKindFallbackText:
-		if !utf8.ValidString(reply.Text) || len([]byte(reply.Text)) > maxFeishuReplyTextBytes {
-			return "", nil, errFeishuReplyTooLarge
-		}
-		content, err := json.Marshal(struct {
-			Text string `json:"text"`
-		}{Text: reply.Text})
-		if err != nil {
-			return "", nil, fmt.Errorf("encode feishu text: %w", err)
-		}
-		return larkim.MsgTypeText, content, nil
-	case channels.ReplyKindCard:
-		if len(reply.Card) > maxFeishuReplyCardBytes {
-			return "", nil, errFeishuReplyTooLarge
-		}
-		return larkim.MsgTypeInteractive, append([]byte(nil), reply.Card...), nil
-	case channels.ReplyKindArtifact:
-		return "", nil, errFeishuReplyUnsupported
-	default:
-		return "", nil, errFeishuReplyUnsupported
+func encodeReply(reply channels.Reply) ([]byte, error) {
+	if !utf8.ValidString(reply.Text) || len([]byte(reply.Text)) > maxFeishuReplyTextBytes {
+		return nil, errFeishuReplyTooLarge
 	}
+	content, err := json.Marshal(struct {
+		Text string `json:"text"`
+	}{Text: reply.Text})
+	if err != nil {
+		return nil, fmt.Errorf("encode feishu text: %w", err)
+	}
+	return content, nil
 }
 
 func (c *OutboundClient) createMessage(
 	ctx context.Context,
-	targetKind, targetID, messageType string,
+	targetKind, targetID string,
 	content []byte,
 	uuid string,
 ) (channels.ProviderReceipt, error) {
@@ -329,7 +281,7 @@ func (c *OutboundClient) createMessage(
 		ReceiveIdType(targetKind).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
 			ReceiveId(targetID).
-			MsgType(messageType).
+			MsgType(larkim.MsgTypeText).
 			Content(string(content)).
 			Uuid(uuid).
 			Build()).
@@ -352,48 +304,19 @@ func (c *OutboundClient) createMessage(
 
 func (c *OutboundClient) replyMessage(
 	ctx context.Context,
-	messageID, messageType string,
+	messageID string,
 	content []byte,
 	uuid string,
 ) (channels.ProviderReceipt, error) {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(messageID).
 		Body(larkim.NewReplyMessageReqBodyBuilder().
-			MsgType(messageType).
+			MsgType(larkim.MsgTypeText).
 			Content(string(content)).
 			Uuid(uuid).
 			Build()).
 		Build()
 	resp, err := c.client.Im.Message.Reply(ctx, req)
-	if err != nil {
-		return channels.ProviderReceipt{}, transportError(err)
-	}
-	if resp == nil {
-		return channels.ProviderReceipt{}, &ProviderSendError{Retryable: true, cause: errors.New("empty feishu response")}
-	}
-	if !resp.Success() {
-		return channels.ProviderReceipt{}, responseError(resp.ApiResp, resp.Code)
-	}
-	if resp.Data != nil {
-		return receiptFromID(resp.Data.MessageId)
-	}
-	return receiptFromID(nil)
-}
-
-func (c *OutboundClient) updateMessage(
-	ctx context.Context,
-	messageID, messageType string,
-	content []byte,
-	uuid string,
-) (channels.ProviderReceipt, error) {
-	req := larkim.NewUpdateMessageReqBuilder().
-		MessageId(messageID).
-		Body(larkim.NewUpdateMessageReqBodyBuilder().
-			MsgType(messageType).
-			Content(string(content)).
-			Build()).
-		Build()
-	resp, err := c.client.Im.Message.Update(ctx, req)
 	if err != nil {
 		return channels.ProviderReceipt{}, transportError(err)
 	}

@@ -91,7 +91,7 @@ func TestChannelBindingIdentityResolverCarriesTrustedScopeToGateway(t *testing.T
 		ConfigVersion: "v1",
 		TurnSeq:       1,
 	}}
-	_, err = gateway.New(gateway.WithAdmitter(admitter)).Handle(
+	_, err = gateway.New(admitter).Handle(
 		context.Background(),
 		gateway.Request{
 			RequestID:      "request-channel-1",

@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -31,38 +29,15 @@ var (
 	ErrReplyBindingChanged = errors.New("reply binding authorization changed")
 )
 
-// ReplyCapabilityResolver supplies the provider capability for one trusted
-// execution. It must resolve by tenant, application, and binding scope.
-type ReplyCapabilityResolver interface {
-	ResolveReplyCapability(context.Context, Execution) (channels.ProviderCapability, error)
-}
-
-// ReplyEventBuilder converts user-visible Runner output into platform Reply
-// values. It has no persistence or provider lifecycle responsibility.
-type ReplyEventBuilder struct {
-	capabilities ReplyCapabilityResolver
-}
-
-// NewReplyEventBuilder creates a Runner-event to Reply builder.
-func NewReplyEventBuilder(resolver ReplyCapabilityResolver) (*ReplyEventBuilder, error) {
-	if resolver == nil {
-		return nil, errors.New("reply capability resolver is required")
-	}
-	return &ReplyEventBuilder{capabilities: resolver}, nil
-}
-
-// Build returns platform replies for one persisted execution event. Events
-// without user-visible assistant text return no replies and are still expected
-// to advance the durable projection cursor in the persistence layer.
-func (b *ReplyEventBuilder) Build(
+// Build returns one durable text reply for a completed execution event.
+// Events without user-visible assistant text return no replies while the
+// execution event itself remains durable.
+func BuildReplyEvent(
 	ctx context.Context,
 	exec Execution,
 	sequence int64,
 	evt *event.Event,
 ) ([]channels.Reply, error) {
-	if b == nil || b.capabilities == nil {
-		return nil, errors.New("reply event builder is not initialized")
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -81,38 +56,15 @@ func (b *ReplyEventBuilder) Build(
 	if evt.RequestID != "" && evt.RequestID != exec.RequestID {
 		return nil, errors.New("runner event request_id does not match execution")
 	}
-	if exec.Tenant.Channel == "" || exec.Tenant.BindingID == "" {
+	if exec.Tenant.Channel == "" || exec.Tenant.BindingID == "" || !evt.IsRunnerCompletion() {
 		return nil, nil
-	}
-	capability, err := b.capabilities.ResolveReplyCapability(ctx, exec)
-	if err != nil {
-		return nil, fmt.Errorf("resolve reply capability: %w", err)
-	}
-	if err := capability.Validate(); err != nil {
-		return nil, fmt.Errorf("reply capability: %w", err)
 	}
 	if evt.Error != nil || evt.IsTerminalError() {
 		return nil, nil
 	}
-	text, contentDelta := visibleAssistantText(evt)
+	text := visibleAssistantText(evt)
 	if text == "" {
 		return nil, nil
-	}
-	completion := evt.IsRunnerCompletion()
-	if !capability.SupportsStreaming && !completion {
-		return nil, nil
-	}
-	var parts []string
-	if contentDelta {
-		if len([]byte(text)) > capability.MaxTextSize {
-			return nil, errors.New("reply delta exceeds provider text limit")
-		}
-		parts = []string{text}
-	} else {
-		parts, err = splitReplyText(text, capability.MaxTextSize)
-		if err != nil {
-			return nil, err
-		}
 	}
 	target := channels.ReplyTarget{
 		Kind:             channels.TargetKindUser,
@@ -124,45 +76,25 @@ func (b *ReplyEventBuilder) Build(
 			InternalEntityID: exec.Tenant.SessionPrincipalID,
 		}
 	}
-	sourceEventID := fmt.Sprintf("%s:%d", exec.RequestID, sequence)
-	logicalReplyID := exec.RequestID + ":assistant"
-	operation := channels.ReplyOperationSend
-	if completion && capability.SupportsStreaming {
-		if capability.SupportsFinalize {
-			operation = channels.ReplyOperationFinalize
-		} else if capability.SupportsUpdate {
-			operation = channels.ReplyOperationUpdate
-		}
+	reply := channels.Reply{
+		TenantID:        exec.Tenant.TenantID,
+		AppID:           exec.Tenant.AppID,
+		RequestID:       exec.RequestID,
+		SourceEventID:   fmt.Sprintf("%s:%d", exec.RequestID, sequence),
+		Channel:         channels.Channel(exec.Tenant.Channel),
+		BindingID:       exec.Tenant.BindingID,
+		BindingRevision: exec.Tenant.BindingRevision,
+		Revision:        sequence,
+		Target:          target,
+		Text:            text,
 	}
-	replies := make([]channels.Reply, 0, len(parts))
-	for index, part := range parts {
-		reply := channels.Reply{
-			TenantID:        exec.Tenant.TenantID,
-			AppID:           exec.Tenant.AppID,
-			RequestID:       exec.RequestID,
-			SourceEventID:   sourceEventID,
-			Channel:         channels.Channel(exec.Tenant.Channel),
-			BindingID:       exec.Tenant.BindingID,
-			BindingRevision: exec.Tenant.BindingRevision,
-			LogicalReplyID:  logicalReplyID,
-			PartNo:          int64(index + 1),
-			Revision:        sequence,
-			Operation:       operation,
-			Kind:            channels.ReplyKindText,
-			Target:          target,
-			Text:            part,
-			ContentDelta:    contentDelta,
-		}
-		reply.ReplyID = reply.StableID()
-		replies = append(replies, reply)
-	}
-	return replies, nil
+	reply.ReplyID = reply.StableID()
+	return []channels.Reply{reply}, nil
 }
 
 // ReplyOutbox persists and leases provider replies independently from the
 // execution Dispatch Outbox.
 type ReplyOutbox interface {
-	PutReply(context.Context, channels.Reply) error
 	ClaimReplies(context.Context, string, time.Duration, int) ([]ReplyDelivery, error)
 	CompleteReply(context.Context, ReplyDelivery, channels.ProviderReceipt) error
 	RetryReply(context.Context, ReplyDelivery, string, time.Duration, error) error
@@ -190,37 +122,17 @@ func (d ReplyDelivery) Validate() error {
 	return nil
 }
 
-// ReplyProvider is the one-call provider capability and client selected for a
-// Reply Outbox delivery.
+// ReplyProvider is the provider client and optional rate limiter selected for
+// one Reply Outbox delivery.
 type ReplyProvider struct {
-	Capability channels.ProviderCapability
-	Client     channels.ProviderOutboundClient
-	Classifier ReplyErrorClassifier
-	Limiter    ReplyRateLimiter
+	Client  channels.ProviderOutboundClient
+	Limiter ReplyRateLimiter
 }
 
-// ReplyProviderResolver selects a provider client only after the delivery's
-// tenant, application, binding, and channel scope is known.
-type ReplyProviderResolver interface {
-	ResolveReplyProvider(context.Context, ReplyDelivery) (ReplyProvider, error)
-}
-
-// ReplyTargetResolver decrypts a target envelope immediately before one
-// provider call. Implementations must never return or log the target earlier.
-type ReplyTargetResolver interface {
-	ResolveReplyTarget(context.Context, ReplyDelivery) (string, channels.OutboundContext, error)
-}
-
-// ReplyRateLimiter delays or rejects one provider operation within its bound
-// provider account. A limiter error is classified by ReplySender.
+// ReplyRateLimiter delays or rejects one provider send within its bound
+// provider account.
 type ReplyRateLimiter interface {
 	Allow(context.Context, ReplyDelivery) error
-}
-
-// ReplyErrorClassifier maps a provider error to the finite Reply Outbox
-// retry policy. errorType must not contain response bodies or credentials.
-type ReplyErrorClassifier interface {
-	Classify(error) (retryable bool, errorType string)
 }
 
 // ReplySenderOptions configures the finite Reply Outbox delivery loop.
@@ -237,8 +149,8 @@ type ReplySenderOptions struct {
 // bounded result. It never invokes Runner.
 type ReplySender struct {
 	outbox       ReplyOutbox
-	targets      ReplyTargetResolver
-	providers    ReplyProviderResolver
+	targets      func(context.Context, ReplyDelivery) (string, error)
+	providers    func(context.Context, ReplyDelivery) (ReplyProvider, error)
 	owner        string
 	lease        time.Duration
 	sendTimeout  time.Duration
@@ -250,8 +162,8 @@ type ReplySender struct {
 // NewReplySender creates a finite-retry Reply Outbox sender.
 func NewReplySender(
 	outbox ReplyOutbox,
-	targets ReplyTargetResolver,
-	providers ReplyProviderResolver,
+	targets func(context.Context, ReplyDelivery) (string, error),
+	providers func(context.Context, ReplyDelivery) (ReplyProvider, error),
 	options ReplySenderOptions,
 ) (*ReplySender, error) {
 	if outbox == nil || targets == nil || providers == nil {
@@ -314,8 +226,7 @@ func (s *ReplySender) SendBatch(ctx context.Context) (int, error) {
 	return len(deliveries), nil
 }
 
-// Run delivers replies until ctx is canceled. It is the only long-lived
-// lifecycle in the IM reply path; provider clients remain single-call values.
+// Run delivers replies until ctx is canceled.
 func (s *ReplySender) Run(ctx context.Context) error {
 	if s == nil {
 		return errors.New("reply sender is not initialized")
@@ -346,9 +257,9 @@ func (s *ReplySender) sendOne(ctx context.Context, delivery ReplyDelivery) error
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout)
 	defer cancel()
-	provider, err := s.providers.ResolveReplyProvider(sendCtx, delivery)
+	provider, err := s.providers(sendCtx, delivery)
 	if err != nil {
-		retryable, errorType := classifyReplyError(nil, err)
+		retryable, errorType := classifyReplyError(err)
 		if errors.Is(err, ErrReplyBindingInactive) {
 			retryable = true
 			errorType = "binding_inactive"
@@ -357,37 +268,21 @@ func (s *ReplySender) sendOne(ctx context.Context, delivery ReplyDelivery) error
 		}
 		return s.recordFailure(ctx, delivery, err, retryable, errorType)
 	}
-	if err := provider.Capability.Validate(); err != nil {
-		return s.recordFailure(ctx, delivery, err, false, "provider_capability")
-	}
 	if provider.Client == nil {
 		return s.recordFailure(ctx, delivery, errors.New("reply provider client is not initialized"), false, "provider_client")
 	}
-	reply, err := prepareReply(delivery.Reply, provider.Capability)
-	if err != nil {
-		return s.recordFailure(ctx, delivery, err, false, "unsupported_reply")
-	}
-	delivery.Reply = reply
 	if provider.Limiter != nil {
 		if err := provider.Limiter.Allow(sendCtx, delivery); err != nil {
 			return s.recordFailure(ctx, delivery, err, true, "rate_limit")
 		}
 	}
-	providerTarget, outboundContext, err := s.targets.ResolveReplyTarget(sendCtx, delivery)
+	providerTarget, err := s.targets(sendCtx, delivery)
 	if err != nil {
 		return s.recordFailure(ctx, delivery, err, false, "target_resolution")
 	}
-	if outboundContext.ProviderMessageID == "" {
-		outboundContext.ProviderMessageID = delivery.ProviderMessageID
-	}
-	if provider.Capability.SupportsStreaming &&
-		(provider.Capability.RequiresInitialStreamResponse || reply.Operation != channels.ReplyOperationSend) &&
-		outboundContext.StreamContext == "" {
-		outboundContext.StreamContext = reply.LogicalReplyID
-	}
-	receipt, err := provider.Client.SendOnce(sendCtx, reply, providerTarget, outboundContext)
+	receipt, err := provider.Client.SendOnce(sendCtx, delivery.Reply, providerTarget)
 	if err != nil {
-		retryable, errorType := classifyReplyError(provider.Classifier, err)
+		retryable, errorType := classifyReplyError(err)
 		return s.recordFailure(ctx, delivery, err, retryable, errorType)
 	}
 	if err := receipt.Validate(); err != nil {
@@ -422,14 +317,7 @@ func (s *ReplySender) recordFailure(
 	return nil
 }
 
-func classifyReplyError(classifier ReplyErrorClassifier, err error) (bool, string) {
-	if classifier != nil {
-		retryable, errorType := classifier.Classify(err)
-		if errorType != "" {
-			return retryable, errorType
-		}
-		return retryable, "provider_send"
-	}
+func classifyReplyError(err error) (bool, string) {
 	var netErr net.Error
 	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
 		return true, "transport_timeout"
@@ -444,41 +332,6 @@ func classifyReplyError(classifier ReplyErrorClassifier, err error) (bool, strin
 	return false, "provider_permanent"
 }
 
-func prepareReply(reply channels.Reply, capability channels.ProviderCapability) (channels.Reply, error) {
-	if reply.Operation == channels.ReplyOperationUpdate && !capability.SupportsUpdate {
-		return channels.Reply{}, errors.New("provider does not support reply update")
-	}
-	if reply.Operation == channels.ReplyOperationFinalize && !capability.SupportsFinalize {
-		if capability.SupportsUpdate {
-			reply.Operation = channels.ReplyOperationUpdate
-		} else {
-			return channels.Reply{}, errors.New("provider does not support reply finalize")
-		}
-	}
-	if reply.Kind == channels.ReplyKindCard && !capability.SupportsCard {
-		reply = fallbackReply(reply, "card replies are not supported by this channel")
-	}
-	if reply.Kind == channels.ReplyKindArtifact && !capability.SupportsArtifact {
-		reply = fallbackReply(reply, "attachment replies are not supported by this channel")
-	}
-	if reply.Kind == channels.ReplyKindText || reply.Kind == channels.ReplyKindFallbackText {
-		if len([]byte(reply.Text)) > capability.MaxTextSize {
-			return channels.Reply{}, errors.New("reply exceeds provider text limit")
-		}
-	}
-	return reply, reply.Validate()
-}
-
-func fallbackReply(reply channels.Reply, defaultText string) channels.Reply {
-	if strings.TrimSpace(reply.Text) == "" {
-		reply.Text = defaultText
-	}
-	reply.Kind = channels.ReplyKindFallbackText
-	reply.Card = nil
-	reply.ArtifactRef = ""
-	return reply
-}
-
 func retryDelay(attempt int) time.Duration {
 	if attempt <= 0 {
 		return time.Second
@@ -490,53 +343,17 @@ func retryDelay(attempt int) time.Duration {
 	return delay
 }
 
-func visibleAssistantText(evt *event.Event) (string, bool) {
+func visibleAssistantText(evt *event.Event) string {
 	if evt == nil || evt.Response == nil {
-		return "", false
+		return ""
 	}
-	isDelta := evt.Response.IsPartial
-	var builder strings.Builder
+	var text string
 	for _, choice := range evt.Response.Choices {
 		message := choice.Message
-		if isDelta {
-			message = choice.Delta
-		}
 		if message.Role != "" && message.Role != model.RoleAssistant {
 			continue
 		}
-		if message.Content != "" {
-			builder.WriteString(message.Content)
-		}
+		text += message.Content
 	}
-	return builder.String(), isDelta
-}
-
-func splitReplyText(value string, maxBytes int) ([]string, error) {
-	if maxBytes <= 0 {
-		return nil, errors.New("reply max text size must be positive")
-	}
-	if !utf8.ValidString(value) {
-		return nil, errors.New("reply text is not valid utf-8")
-	}
-	remaining := value
-	parts := make([]string, 0, 1)
-	for remaining != "" {
-		if len([]byte(remaining)) <= maxBytes {
-			parts = append(parts, remaining)
-			break
-		}
-		cut := maxBytes
-		for cut > 0 && !utf8.ValidString(remaining[:cut]) {
-			cut--
-		}
-		if cut == 0 {
-			return nil, errors.New("reply max text size splits utf-8 sequence")
-		}
-		parts = append(parts, remaining[:cut])
-		remaining = remaining[cut:]
-	}
-	if len(parts) == 0 {
-		return []string{""}, nil
-	}
-	return parts, nil
+	return text
 }

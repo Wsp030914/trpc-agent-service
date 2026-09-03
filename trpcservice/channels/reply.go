@@ -2,40 +2,12 @@ package channels
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
-)
-
-// ReplyOperation identifies one platform-level outbound operation.
-type ReplyOperation string
-
-const (
-	// ReplyOperationSend creates a new provider message.
-	ReplyOperationSend ReplyOperation = "SEND"
-	// ReplyOperationUpdate updates an existing provider message.
-	ReplyOperationUpdate ReplyOperation = "UPDATE"
-	// ReplyOperationFinalize finishes a streaming provider message.
-	ReplyOperationFinalize ReplyOperation = "FINALIZE"
-)
-
-// ReplyKind identifies the platform-neutral content shape of a reply.
-type ReplyKind string
-
-const (
-	// ReplyKindText is a plain text reply.
-	ReplyKindText ReplyKind = "text"
-	// ReplyKindCard is a platform-neutral or approved opaque card payload.
-	ReplyKindCard ReplyKind = "card"
-	// ReplyKindArtifact is a tenant-scoped artifact reply.
-	ReplyKindArtifact ReplyKind = "artifact"
-	// ReplyKindFallbackText is an explicit downgrade from an unsupported type.
-	ReplyKindFallbackText ReplyKind = "fallback_text"
 )
 
 // ReplyTarget identifies the internal platform record from which a provider
@@ -56,9 +28,8 @@ func (t ReplyTarget) Validate() error {
 	return nil
 }
 
-// Reply is the provider-neutral content passed from Reply Projection to one
-// provider outbound call. Claiming, persistence, and retry are owned by
-// IM-06, not by this value or a ProviderOutboundClient.
+// Reply is the durable text passed from Reply Projection to one provider
+// outbound call.
 type Reply struct {
 	TenantID        string
 	AppID           string
@@ -68,40 +39,27 @@ type Reply struct {
 	BindingID       string
 	BindingRevision int64
 	ReplyID         string
-	LogicalReplyID  string
-	PartNo          int64
 	Revision        int64
-	Operation       ReplyOperation
-	Kind            ReplyKind
 	Target          ReplyTarget
 	Text            string
-	// ContentDelta marks Text as an incremental Runner response. The durable
-	// projection combines it with the previous visible content before it is
-	// persisted for provider update/finalize operations.
-	ContentDelta bool
-	Card         json.RawMessage
-	ArtifactRef  string
 }
 
-// StableID returns the deterministic identity for one Reply operation. The
-// identity is shared by reply projection and event-to-reply conversion so a
-// replay cannot create a second operation ID.
+// StableID returns the deterministic identity shared by projection and the
+// Reply Outbox, so event replay cannot create a second send.
 func (r Reply) StableID() string {
 	identity := strings.Join([]string{
 		r.TenantID, r.AppID, r.BindingID, r.RequestID,
-		r.SourceEventID, r.LogicalReplyID,
-		strconv.FormatInt(r.PartNo, 10), strconv.FormatInt(r.Revision, 10), string(r.Operation),
+		r.SourceEventID, strconv.FormatInt(r.Revision, 10),
 	}, "\x1f")
 	return uuid.NewSHA1(uuid.Nil, []byte(identity)).String()
 }
 
-// Validate checks the stable platform-level fields required by an outbound
-// reply operation.
+// Validate checks the platform-level fields required by a text reply.
 func (r Reply) Validate() error {
 	if r.TenantID == "" || r.AppID == "" {
 		return errors.New("reply scope is required")
 	}
-	if r.RequestID == "" || r.SourceEventID == "" || r.ReplyID == "" || r.LogicalReplyID == "" {
+	if r.RequestID == "" || r.SourceEventID == "" || r.ReplyID == "" {
 		return errors.New("reply identity is required")
 	}
 	if err := r.Channel.Validate(); err != nil {
@@ -110,86 +68,25 @@ func (r Reply) Validate() error {
 	if r.BindingID == "" {
 		return errors.New("reply binding_id is required")
 	}
-	if r.PartNo <= 0 || r.Revision <= 0 || r.BindingRevision <= 0 {
-		return errors.New("reply part and revision must be positive")
+	if r.Revision <= 0 || r.BindingRevision <= 0 {
+		return errors.New("reply revision must be positive")
 	}
-	switch r.Operation {
-	case ReplyOperationSend, ReplyOperationUpdate, ReplyOperationFinalize:
-	default:
-		return errors.New("reply operation is invalid")
-	}
-	switch r.Kind {
-	case ReplyKindText, ReplyKindFallbackText:
-		if r.Text == "" {
-			return errors.New("reply text is required")
-		}
-	case ReplyKindCard:
-		if len(r.Card) == 0 || !json.Valid(r.Card) || r.Card[0] != '{' {
-			return errors.New("reply card must be a json object")
-		}
-	case ReplyKindArtifact:
-		if r.ArtifactRef == "" {
-			return errors.New("reply artifact_ref is required")
-		}
-	default:
-		return errors.New("reply kind is invalid")
+	if r.Text == "" {
+		return errors.New("reply text is required")
 	}
 	return r.Target.Validate()
 }
 
-// ProviderCapability declares the outbound features and limits of one bound
-// provider account.
-type ProviderCapability struct {
-	SupportsUpdate                bool
-	SupportsCard                  bool
-	SupportsArtifact              bool
-	SupportsStreaming             bool
-	RequiresInitialStreamResponse bool
-	SupportsFinalize              bool
-	MaxTextSize                   int
-	TargetTTL                     time.Duration
-}
-
-// Validate checks capability values before an adapter is registered.
-func (c ProviderCapability) Validate() error {
-	if c.MaxTextSize <= 0 {
-		return errors.New("provider max text size must be positive")
-	}
-	if c.TargetTTL < 0 {
-		return errors.New("provider target ttl must not be negative")
-	}
-	if c.RequiresInitialStreamResponse && !c.SupportsStreaming {
-		return errors.New("initial stream response requires streaming support")
-	}
-	if c.SupportsFinalize && !c.SupportsStreaming {
-		return errors.New("finalize support requires streaming support")
-	}
-	return nil
-}
-
-// OutboundContext contains controlled state needed by one provider operation.
-// It is not persisted as a platform payload and must not be logged.
-type OutboundContext struct {
-	ProviderMessageID string
-	StreamContext     string
+// ProviderOutboundClient performs exactly one ordinary text send. The caller
+// resolves the provider target immediately before this call.
+type ProviderOutboundClient interface {
+	SendOnce(context.Context, Reply, string) (ProviderReceipt, error)
 }
 
 // ProviderReceipt contains the scoped delivery receipt returned by one
 // provider operation.
 type ProviderReceipt struct {
 	ProviderMessageID string
-}
-
-// ProviderOutboundClient performs exactly one provider outbound operation.
-// The caller resolves providerTarget immediately before the call; this
-// interface does not claim, persist, classify, or retry Reply Outbox records.
-type ProviderOutboundClient interface {
-	SendOnce(
-		ctx context.Context,
-		reply Reply,
-		providerTarget string,
-		outboundContext OutboundContext,
-	) (ProviderReceipt, error)
 }
 
 // ValidateProviderReceipt checks a receipt returned by a provider operation.

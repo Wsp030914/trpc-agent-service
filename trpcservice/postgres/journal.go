@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -22,7 +23,7 @@ const executionEventPollInterval = 200 * time.Millisecond
 // tenant-scoped stream for protocol adapters.
 type ExecutionEventJournal struct {
 	store        *Store
-	replyBuilder *worker.ReplyEventBuilder
+	replyBuilder func(context.Context, worker.Execution, int64, *event.Event) ([]channels.Reply, error)
 }
 
 // ExecutionEventJournalOption configures optional durable event projections.
@@ -30,7 +31,7 @@ type ExecutionEventJournalOption func(*ExecutionEventJournal) error
 
 // WithReplyEventBuilder enables the IM Reply Projection inside the same
 // PostgreSQL transaction as execution_event insertion.
-func WithReplyEventBuilder(builder *worker.ReplyEventBuilder) ExecutionEventJournalOption {
+func WithReplyEventBuilder(builder func(context.Context, worker.Execution, int64, *event.Event) ([]channels.Reply, error)) ExecutionEventJournalOption {
 	return func(journal *ExecutionEventJournal) error {
 		if builder == nil {
 			return errors.New("reply event builder is required")
@@ -158,21 +159,20 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
 		return fmt.Errorf("insert execution event: %w", err)
 	}
 	if j.replyBuilder != nil {
-		replies, err := j.replyBuilder.Build(ctx, exec, sequence, evt)
+		replies, err := j.replyBuilder(ctx, exec, sequence, evt)
 		if err != nil {
 			return fmt.Errorf("build reply projection: %w", err)
 		}
-		if err := applyReplyProjectionTx(
+		if err := insertReplyOutboxTx(
 			ctx,
 			tx,
 			exec.Tenant.TenantID,
 			exec.Tenant.AppID,
 			exec.Tenant.BindingID,
 			exec.RequestID,
-			sequence,
 			replies,
 		); err != nil {
-			return fmt.Errorf("apply reply projection: %w", err)
+			return fmt.Errorf("insert reply outbox: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -371,120 +371,3 @@ func executionEventType(evt *event.Event) string {
 
 var _ gateway.ExecutionEventSource = (*ExecutionEventJournal)(nil)
 var _ worker.EventSink = (*ExecutionEventJournal)(nil)
-
-// AuditStore writes append-only, allowlisted audit events to platform SQL.
-type AuditStore struct {
-	store *Store
-}
-
-// NewAuditStore creates an audit writer backed by Store's PostgreSQL database.
-// The store remains owned by the caller.
-func NewAuditStore(store *Store) (*AuditStore, error) {
-	if store == nil {
-		return nil, errors.New("postgres store is required")
-	}
-	if err := store.validate(); err != nil {
-		return nil, err
-	}
-	return &AuditStore{store: store}, nil
-}
-
-// RecordAudit writes one audit event only while the caller owns the current
-// job lease. It stores no runner event payload, message body, or credentials.
-func (s *AuditStore) RecordAudit(
-	ctx context.Context,
-	exec worker.Execution,
-	auditEvent worker.AuditEvent,
-) error {
-	if s == nil || s.store == nil {
-		return errors.New("audit store is not initialized")
-	}
-	if err := s.store.validate(); err != nil {
-		return err
-	}
-	if err := auditEvent.Validate(); err != nil {
-		return err
-	}
-	lease, ok := worker.JobLeaseFromContext(ctx)
-	if !ok {
-		return errors.New("audit event requires a current execution lease")
-	}
-	if err := exec.Tenant.Validate(); err != nil {
-		return fmt.Errorf("execution tenant context: %w", err)
-	}
-	if exec.RequestID == "" {
-		return errors.New("execution request_id is required")
-	}
-
-	tx, err := s.store.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return fmt.Errorf("begin audit append: %w", err)
-	}
-	defer func() { rollback(tx) }()
-	if err := tx.QueryRow(ctx, `
-SELECT 1
-FROM platform.execution
-WHERE tenant_id = $1
-  AND app_id = $2
-  AND request_id = $3
-  AND status = 'RUNNING'
-  AND lease_owner = $4
-  AND run_token = $5
-  AND lease_until > clock_timestamp()
-  AND session_principal_id = $6
-  AND session_id = $7
-  AND user_id = $8
-  AND config_version = $9
-FOR UPDATE`,
-		exec.Tenant.TenantID,
-		exec.Tenant.AppID,
-		exec.RequestID,
-		lease.Owner,
-		lease.Token,
-		exec.Tenant.SessionPrincipalID,
-		exec.Tenant.SessionID,
-		exec.Tenant.UserID,
-		exec.Tenant.ConfigVersion,
-	).Scan(new(int)); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("lock execution for audit append: %w", queue.ErrLeaseLost)
-		}
-		return fmt.Errorf("lock execution for audit append: %w", err)
-	}
-	var expireAt *time.Time
-	if exec.Config.Audit.RetentionDays > 0 {
-		value := time.Now().UTC().AddDate(0, 0, exec.Config.Audit.RetentionDays)
-		expireAt = &value
-	}
-	if _, err := tx.Exec(ctx, `
-INSERT INTO platform.audit_event (
-    tenant_id, app_id, request_id, channel, user_id, session_principal_id, session_id, trace_id,
-    agent_name, event_type, tool_name, decision, latency_ms, error_type, expire_at
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
-)`,
-		exec.Tenant.TenantID,
-		exec.Tenant.AppID,
-		exec.RequestID,
-		exec.Tenant.Channel,
-		exec.Tenant.UserID,
-		exec.Tenant.SessionPrincipalID,
-		exec.Tenant.SessionID,
-		exec.Tenant.TraceID,
-		"assistant",
-		auditEvent.Type,
-		auditEvent.ToolName,
-		string(auditEvent.Decision),
-		auditEvent.Latency.Milliseconds(),
-		string(auditEvent.ErrorType),
-		expireAt,
-	); err != nil {
-		return fmt.Errorf("insert audit event: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit audit append: %w", err)
-	}
-	return nil
-}
-
-var _ worker.AuditSink = (*AuditStore)(nil)

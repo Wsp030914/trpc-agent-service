@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 )
 
 const (
@@ -262,21 +262,12 @@ FOR UPDATE`, tenantID, appID, bindingID, externalMessageID, artifactRef).Scan(
 }
 
 func inboundArtifactName(artifactRef string) (string, error) {
-	if !strings.HasPrefix(artifactRef, "artifact://") {
-		return "", errors.New("inbound artifact ref must use artifact://")
+	name, version, err := gateway.ParseArtifactRef(artifactRef)
+	if err != nil {
+		return "", fmt.Errorf("inbound artifact ref: %w", err)
 	}
-	rest := strings.TrimPrefix(artifactRef, "artifact://")
-	separator := strings.LastIndex(rest, "@")
-	if separator <= 0 || separator == len(rest)-1 {
-		return "", errors.New("inbound artifact ref must pin a version")
-	}
-	version, err := strconv.Atoi(rest[separator+1:])
-	if err != nil || version != 0 {
+	if version != 0 {
 		return "", errors.New("inbound artifact ref version must be zero")
-	}
-	name := rest[:separator]
-	if name == "" || strings.ContainsAny(name, "@\x00\r\n") || strings.Contains(name, "..") {
-		return "", errors.New("inbound artifact ref name is invalid")
 	}
 	return name, nil
 }

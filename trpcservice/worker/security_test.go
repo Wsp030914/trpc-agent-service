@@ -8,60 +8,34 @@ import (
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
-func TestToolPermissionPolicyDeniesDisallowedToolBeforeCustomAuthorizer(t *testing.T) {
-	authorizer := &recordingToolAuthorizer{}
-	w := Worker{ToolAuthorizer: authorizer}
-	exec := securityTestExecution()
-	exec.Config.Tools = tenant.ToolPolicy{ExecutableTools: []string{"safe"}}
+func TestToolPermissionPolicyIsTenantScoped(t *testing.T) {
+	cases := []struct {
+		name   string
+		tenant string
+		tools  []string
+		want   frameworktool.PermissionAction
+	}{
+		{name: "tenant A allows configured tool", tenant: "tenant-a", tools: []string{"todo_write"}, want: frameworktool.PermissionActionAllow},
+		{name: "tenant B denies absent tool", tenant: "tenant-b", want: frameworktool.PermissionActionDeny},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			w := Worker{}
+			exec := securityTestExecution()
+			exec.Tenant.TenantID = tt.tenant
+			exec.Config.TenantID = tt.tenant
+			exec.Config.Tools = tenant.ToolPolicy{ExecutableTools: tt.tools}
 
-	decision, err := w.toolPermissionPolicy(exec).CheckToolPermission(context.Background(), &frameworktool.PermissionRequest{
-		ToolName: "dangerous",
-	})
-	if err != nil {
-		t.Fatalf("check tool permission: %v", err)
-	}
-	if decision.Action != frameworktool.PermissionActionDeny {
-		t.Fatalf("decision = %q, want deny", decision.Action)
-	}
-	if authorizer.calls != 0 {
-		t.Fatalf("custom authorizer calls = %d, want 0", authorizer.calls)
-	}
-}
-
-func TestToolPermissionPolicyRevalidatesAllowedToolAtExecution(t *testing.T) {
-	authorizer := &recordingToolAuthorizer{decision: frameworktool.AskPermission("review")}
-	w := Worker{ToolAuthorizer: authorizer}
-	exec := securityTestExecution()
-	exec.Config.Tools = tenant.ToolPolicy{ExecutableTools: []string{"safe"}}
-
-	decision, err := w.toolPermissionPolicy(exec).CheckToolPermission(context.Background(), &frameworktool.PermissionRequest{
-		ToolName:  "safe",
-		Arguments: []byte(`{"secret":"not logged"}`),
-	})
-	if err != nil {
-		t.Fatalf("check tool permission: %v", err)
-	}
-	if decision.Action != frameworktool.PermissionActionAsk || authorizer.calls != 1 {
-		t.Fatalf("decision = %q, calls = %d", decision.Action, authorizer.calls)
-	}
-}
-
-func TestWorkerSpanAttributesExcludeUserAndSession(t *testing.T) {
-	exec := securityTestExecution()
-	for _, attr := range workerSpanAttributes(exec) {
-		if attr.Key == "user_id" || attr.Key == "session_id" {
-			t.Fatalf("unsafe span attribute %q", attr.Key)
-		}
-	}
-}
-
-func TestAuditEventRejectsArbitraryErrorText(t *testing.T) {
-	err := (AuditEvent{
-		Type:      AuditEventExecutionFailed,
-		ErrorType: AuditErrorType("model api key abc123"),
-	}).Validate()
-	if err == nil {
-		t.Fatal("audit event accepted arbitrary error text")
+			decision, err := w.toolPermissionPolicy(exec).CheckToolPermission(context.Background(), &frameworktool.PermissionRequest{
+				ToolName: "todo_write",
+			})
+			if err != nil {
+				t.Fatalf("check tool permission: %v", err)
+			}
+			if decision.Action != tt.want {
+				t.Fatalf("decision = %q, want %q", decision.Action, tt.want)
+			}
+		})
 	}
 }
 
@@ -77,18 +51,4 @@ func securityTestExecution() Execution {
 			Model: tenant.ModelConfig{Provider: "openai", Model: "gpt-test", APIKeyRef: tenant.SecretRef{Name: "model-key"}},
 		},
 	}
-}
-
-type recordingToolAuthorizer struct {
-	calls    int
-	decision frameworktool.PermissionDecision
-}
-
-func (a *recordingToolAuthorizer) CheckToolPermission(
-	_ context.Context,
-	_ Execution,
-	_ *frameworktool.PermissionRequest,
-) (frameworktool.PermissionDecision, error) {
-	a.calls++
-	return a.decision, nil
 }

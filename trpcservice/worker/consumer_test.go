@@ -18,7 +18,7 @@ func TestConsumerAcknowledgesAfterExecutionCompletion(t *testing.T) {
 	claim := testQueueClaim(t, "request-consumer-success")
 	stream := &testStream{delivery: queue.Delivery{ID: "1-0", Dispatch: queue.Dispatch{OutboxID: 1, TenantID: "tenant-a", AppID: "support", RequestID: claim.Job.RequestID()}}, cancel: cancel}
 	store := &testExecutionStore{claim: claim}
-	consumer, err := worker.NewConsumer(&consumerExecutor{result: worker.RunResult{RunnerCompleted: true}}, stream, store, "worker-1", worker.WithConsumerLeaseDuration(time.Second))
+	consumer, err := worker.NewConsumer(&consumerExecutor{result: worker.RunResult{RunnerCompleted: true}}, stream, store, "worker-1")
 	if err != nil {
 		t.Fatalf("new consumer: %v", err)
 	}

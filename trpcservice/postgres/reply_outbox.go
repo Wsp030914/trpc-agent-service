@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -16,9 +14,6 @@ import (
 )
 
 var (
-	// ErrReplyProjectionGap means a later execution event arrived before its
-	// predecessor and must be retried after the predecessor is projected.
-	ErrReplyProjectionGap = errors.New("reply projection event gap")
 	// ErrReplyLeaseLost means a sender no longer owns the Reply Outbox row.
 	ErrReplyLeaseLost = errors.New("reply outbox lease is lost")
 	// ErrReplyTargetExpired means a message-scoped provider target cannot be
@@ -26,15 +21,8 @@ var (
 	ErrReplyTargetExpired = errors.New("reply target is expired")
 )
 
-type replyProjectionState struct {
-	lastEventSeq int64
-	content      string
-}
-
 type storedReplyPayload struct {
-	Text        string          `json:"text,omitempty"`
-	Card        json.RawMessage `json:"card,omitempty"`
-	ArtifactRef string          `json:"artifact_ref,omitempty"`
+	Text string `json:"text"`
 }
 
 type storedReplyTarget struct {
@@ -42,207 +30,57 @@ type storedReplyTarget struct {
 	InternalEntityID string              `json:"internal_entity_id"`
 }
 
-// PutReply persists one Reply and advances its event projection cursor. It is
-// a convenience boundary for tests and small integrations; the execution
-// event journal uses the same operation inside its event append transaction.
-func (s *Store) PutReply(ctx context.Context, reply channels.Reply) error {
-	if err := s.validate(); err != nil {
-		return err
-	}
-	if err := reply.Validate(); err != nil {
-		return err
-	}
-	sequence, err := replyEventSequence(reply.SourceEventID, reply.RequestID)
-	if err != nil {
-		return err
-	}
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return fmt.Errorf("begin reply projection: %w", err)
-	}
-	defer func() { rollback(tx) }()
-	if err := applyReplyProjectionTx(ctx, tx, reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID, sequence, []channels.Reply{reply}); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit reply projection: %w", err)
-	}
-	return nil
-}
-
-// AdvanceReplyProjection moves a projection cursor for a non-user-visible
-// execution event without creating an outbound reply.
-func (s *Store) AdvanceReplyProjection(
-	ctx context.Context,
-	tenantID, appID, bindingID, requestID string,
-	sequence int64,
-) error {
-	if err := s.validate(); err != nil {
-		return err
-	}
-	if tenantID == "" || appID == "" || bindingID == "" || requestID == "" || sequence <= 0 {
-		return errors.New("reply projection scope and sequence are required")
-	}
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return fmt.Errorf("begin reply projection advance: %w", err)
-	}
-	defer func() { rollback(tx) }()
-	if err := applyReplyProjectionTx(ctx, tx, tenantID, appID, bindingID, requestID, sequence, nil); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit reply projection advance: %w", err)
-	}
-	return nil
-}
-
-func applyReplyProjectionTx(
+func insertReplyOutboxTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	tenantID, appID, bindingID, requestID string,
-	sequence int64,
 	replies []channels.Reply,
 ) error {
-	if sequence <= 0 {
-		return errors.New("reply projection sequence must be positive")
-	}
-	if _, err := tx.Exec(ctx, `
-INSERT INTO platform.reply_projection_state (
-    tenant_id, app_id, binding_id, request_id, last_event_seq
-) VALUES ($1, $2, $3, $4, 0)
-ON CONFLICT (tenant_id, app_id, binding_id, request_id) DO NOTHING`, tenantID, appID, bindingID, requestID); err != nil {
-		return fmt.Errorf("create reply projection state: %w", err)
-	}
-	var state replyProjectionState
-	if err := tx.QueryRow(ctx, `
-SELECT last_event_seq, content
-FROM platform.reply_projection_state
-WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND request_id = $4
-FOR UPDATE`, tenantID, appID, bindingID, requestID).Scan(&state.lastEventSeq, &state.content); err != nil {
-		return fmt.Errorf("lock reply projection state: %w", err)
-	}
-	if sequence <= state.lastEventSeq {
-		return nil
-	}
-	if sequence != state.lastEventSeq+1 {
-		return fmt.Errorf("%w: expected %d, got %d", ErrReplyProjectionGap, state.lastEventSeq+1, sequence)
-	}
 	for _, reply := range replies {
 		if reply.TenantID != tenantID || reply.AppID != appID || reply.BindingID != bindingID || reply.RequestID != requestID {
 			return errors.New("reply projection scope does not match state")
 		}
-		effective, err := normalizeProjectedReply(ctx, tx, reply, state.content)
-		if err != nil {
-			return err
+		reply.ReplyID = reply.StableID()
+		if err := reply.Validate(); err != nil {
+			return fmt.Errorf("projected reply: %w", err)
 		}
-		if effective == nil {
-			continue
-		}
-		payload, err := json.Marshal(storedReplyPayload{
-			Text:        effective.Text,
-			Card:        effective.Card,
-			ArtifactRef: effective.ArtifactRef,
-		})
+		payload, err := json.Marshal(storedReplyPayload{Text: reply.Text})
 		if err != nil {
 			return fmt.Errorf("marshal reply payload: %w", err)
 		}
 		target, err := json.Marshal(storedReplyTarget{
-			Kind:             effective.Target.Kind,
-			InternalEntityID: effective.Target.InternalEntityID,
+			Kind:             reply.Target.Kind,
+			InternalEntityID: reply.Target.InternalEntityID,
 		})
 		if err != nil {
 			return fmt.Errorf("marshal reply target: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
 INSERT INTO platform.reply_outbox (
-    reply_id, logical_reply_id, tenant_id, app_id, binding_id, binding_revision, channel, request_id,
-    source_event_id, part_no, revision, operation, reply_kind, target_ref,
-    payload, artifact_ref
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-ON CONFLICT (
-    tenant_id, app_id, binding_id, request_id, source_event_id,
-    logical_reply_id, part_no, revision, operation
-) DO NOTHING`,
-			effective.ReplyID,
-			effective.LogicalReplyID,
-			effective.TenantID,
-			effective.AppID,
-			effective.BindingID,
-			effective.BindingRevision,
-			effective.Channel,
-			effective.RequestID,
-			effective.SourceEventID,
-			effective.PartNo,
-			effective.Revision,
-			effective.Operation,
-			effective.Kind,
+    reply_id, tenant_id, app_id, binding_id, binding_revision, channel, request_id,
+    source_event_id, revision, target_ref, payload
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (tenant_id, app_id, binding_id, request_id, source_event_id, revision)
+DO NOTHING`,
+			reply.ReplyID,
+			reply.TenantID,
+			reply.AppID,
+			reply.BindingID,
+			reply.BindingRevision,
+			reply.Channel,
+			reply.RequestID,
+			reply.SourceEventID,
+			reply.Revision,
 			target,
 			payload,
-			effective.ArtifactRef,
 		); err != nil {
 			return fmt.Errorf("insert reply outbox: %w", err)
 		}
-		if effective.Text != "" {
-			state.content = effective.Text
-		}
-	}
-	if _, err := tx.Exec(ctx, `
-UPDATE platform.reply_projection_state
-SET last_event_seq = $5, content = $6, updated_at = clock_timestamp()
-WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND request_id = $4`,
-		tenantID, appID, bindingID, requestID, sequence, state.content); err != nil {
-		return fmt.Errorf("advance reply projection state: %w", err)
 	}
 	return nil
 }
 
-func normalizeProjectedReply(
-	ctx context.Context,
-	tx pgx.Tx,
-	reply channels.Reply,
-	previousContent string,
-) (*channels.Reply, error) {
-	if reply.ContentDelta {
-		reply.Text = previousContent + reply.Text
-		reply.ContentDelta = false
-	}
-	if reply.Operation == channels.ReplyOperationFinalize && reply.Text == "" {
-		reply.Text = previousContent
-	}
-	if reply.Kind == channels.ReplyKindText || reply.Kind == channels.ReplyKindFallbackText {
-		if reply.Text == "" {
-			return nil, nil
-		}
-	}
-	if reply.Operation == channels.ReplyOperationSend || reply.Operation == channels.ReplyOperationUpdate || reply.Operation == channels.ReplyOperationFinalize {
-		var previous bool
-		if err := tx.QueryRow(ctx, `
-SELECT EXISTS (
-    SELECT 1
-    FROM platform.reply_outbox
-    WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
-      AND request_id = $4 AND logical_reply_id = $5 AND part_no = $6
-      AND operation IN ('SEND', 'UPDATE')
-)`, reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID, reply.LogicalReplyID, reply.PartNo).Scan(&previous); err != nil {
-			return nil, fmt.Errorf("check previous reply operation: %w", err)
-		}
-		if reply.Operation == channels.ReplyOperationSend && previous {
-			reply.Operation = channels.ReplyOperationUpdate
-		}
-		if reply.Operation == channels.ReplyOperationUpdate && !previous {
-			reply.Operation = channels.ReplyOperationSend
-		}
-	}
-	reply.ReplyID = reply.StableID()
-	if err := reply.Validate(); err != nil {
-		return nil, fmt.Errorf("projected reply: %w", err)
-	}
-	return &reply, nil
-}
-
-// ClaimReplies leases ready replies while preserving multipart and streaming
-// operation order within one logical reply.
+// ClaimReplies leases ready replies in event order within one request.
 func (s *Store) ClaimReplies(
 	ctx context.Context,
 	owner string,
@@ -302,22 +140,7 @@ WITH candidates AS (
           AND p.app_id = o.app_id
           AND p.binding_id = o.binding_id
           AND p.request_id = o.request_id
-          AND p.logical_reply_id = o.logical_reply_id
-          AND p.reply_id <> o.reply_id
-          AND (
-              p.part_no < o.part_no
-              OR (
-                  p.part_no = o.part_no
-                  AND (
-                      p.revision < o.revision
-                      OR (
-                          p.revision = o.revision
-                          AND CASE p.operation WHEN 'SEND' THEN 1 WHEN 'UPDATE' THEN 2 ELSE 3 END
-                              < CASE o.operation WHEN 'SEND' THEN 1 WHEN 'UPDATE' THEN 2 ELSE 3 END
-                      )
-                  )
-              )
-          )
+          AND p.revision < o.revision
           AND p.status <> 'SENT'
     )
     ORDER BY o.created_at, o.reply_id
@@ -328,40 +151,12 @@ UPDATE platform.reply_outbox o
 SET status = 'SENDING', lease_owner = $1,
     lease_until = clock_timestamp() + $2::interval,
     attempt = attempt + 1,
-    provider_message_id = CASE
-        WHEN o.operation IN ('UPDATE', 'FINALIZE') AND o.provider_message_id = '' THEN
-            COALESCE((
-                SELECT p.provider_message_id
-                FROM platform.reply_outbox p
-                WHERE p.tenant_id = o.tenant_id
-                  AND p.app_id = o.app_id
-                  AND p.binding_id = o.binding_id
-                  AND p.request_id = o.request_id
-                  AND p.logical_reply_id = o.logical_reply_id
-                  AND p.part_no = o.part_no
-                  AND p.status = 'SENT'
-                  AND p.provider_message_id <> ''
-                  AND (
-                      p.revision < o.revision
-                      OR (
-                          p.revision = o.revision
-                          AND CASE p.operation WHEN 'SEND' THEN 1 WHEN 'UPDATE' THEN 2 ELSE 3 END
-                              < CASE o.operation WHEN 'SEND' THEN 1 WHEN 'UPDATE' THEN 2 ELSE 3 END
-                      )
-                  )
-                ORDER BY p.revision DESC,
-                         CASE p.operation WHEN 'SEND' THEN 1 WHEN 'UPDATE' THEN 2 ELSE 3 END DESC
-                LIMIT 1
-            ), '')
-        ELSE o.provider_message_id
-    END,
     updated_at = clock_timestamp()
 FROM candidates c
 WHERE o.reply_id = c.reply_id
-RETURNING o.reply_id, o.logical_reply_id, o.tenant_id, o.app_id, o.binding_id,
+RETURNING o.reply_id, o.tenant_id, o.app_id, o.binding_id,
           o.binding_revision, o.channel, o.request_id, o.source_event_id,
-          o.part_no, o.revision, o.operation,
-          o.reply_kind, o.target_ref, o.payload, o.artifact_ref, o.attempt,
+          o.revision, o.target_ref, o.payload, o.attempt,
           o.lease_owner, o.lease_until, o.provider_message_id`,
 		owner, intervalLiteral(leaseDuration), limit)
 	if err != nil {
@@ -388,16 +183,16 @@ type replyRowScanner interface {
 
 func scanReplyDelivery(row replyRowScanner) (worker.ReplyDelivery, error) {
 	var (
-		replyID, logicalReplyID, tenantID, appID, bindingID, channel, requestID    string
-		sourceEventID, operation, kind, artifactRef, leaseOwner, providerMessageID string
-		bindingRevision, partNo, revision, attempt                                 int64
-		targetJSON, payloadJSON                                                    []byte
-		leaseUntil                                                                 time.Time
+		replyID, tenantID, appID, bindingID, channel, requestID string
+		sourceEventID, leaseOwner, providerMessageID            string
+		bindingRevision, revision, attempt                      int64
+		targetJSON, payloadJSON                                 []byte
+		leaseUntil                                              time.Time
 	)
 	if err := row.Scan(
-		&replyID, &logicalReplyID, &tenantID, &appID, &bindingID, &bindingRevision, &channel, &requestID,
-		&sourceEventID, &partNo, &revision, &operation, &kind, &targetJSON,
-		&payloadJSON, &artifactRef, &attempt, &leaseOwner, &leaseUntil, &providerMessageID,
+		&replyID, &tenantID, &appID, &bindingID, &bindingRevision, &channel, &requestID,
+		&sourceEventID, &revision, &targetJSON, &payloadJSON, &attempt, &leaseOwner, &leaseUntil,
+		&providerMessageID,
 	); err != nil {
 		return worker.ReplyDelivery{}, fmt.Errorf("scan reply outbox: %w", err)
 	}
@@ -418,18 +213,12 @@ func scanReplyDelivery(row replyRowScanner) (worker.ReplyDelivery, error) {
 		BindingID:       bindingID,
 		BindingRevision: bindingRevision,
 		ReplyID:         replyID,
-		LogicalReplyID:  logicalReplyID,
-		PartNo:          partNo,
 		Revision:        revision,
-		Operation:       channels.ReplyOperation(operation),
-		Kind:            channels.ReplyKind(kind),
 		Target: channels.ReplyTarget{
 			Kind:             target.Kind,
 			InternalEntityID: target.InternalEntityID,
 		},
-		Text:        payload.Text,
-		Card:        payload.Card,
-		ArtifactRef: artifactRef,
+		Text: payload.Text,
 	}
 	return worker.ReplyDelivery{
 		Reply:             reply,
@@ -493,8 +282,7 @@ func (s *Store) RetryReply(
 	return s.transitionReplyFailure(ctx, delivery, "PENDING", errorType, delay)
 }
 
-// FailReply retains an unrecoverable reply failure for audit and operator
-// inspection; it never removes the row.
+// FailReply retains an unrecoverable reply failure for operator inspection.
 func (s *Store) FailReply(
 	ctx context.Context,
 	delivery worker.ReplyDelivery,
@@ -573,15 +361,15 @@ WHERE status = 'SENDING' AND lease_until <= clock_timestamp()`); err != nil {
 func (s *Store) ResolveReplyTarget(
 	ctx context.Context,
 	delivery worker.ReplyDelivery,
-) (string, channels.OutboundContext, error) {
+) (string, error) {
 	if err := s.validate(); err != nil {
-		return "", channels.OutboundContext{}, err
+		return "", err
 	}
 	if err := delivery.Validate(); err != nil {
-		return "", channels.OutboundContext{}, err
+		return "", err
 	}
 	if s.identityMapper == nil || s.identityMapper.protector == nil {
-		return "", channels.OutboundContext{}, errors.New("target protector is required")
+		return "", errors.New("target protector is required")
 	}
 	reply := delivery.Reply
 	var bindingStatus string
@@ -593,13 +381,13 @@ FROM platform.channel_binding
 WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`,
 		reply.TenantID, reply.AppID, reply.BindingID,
 	).Scan(&bindingStatus, &bindingChannel, &bindingRevision); err != nil {
-		return "", channels.OutboundContext{}, resolveError("reply binding", err)
+		return "", resolveError("reply binding", err)
 	}
 	if bindingStatus != string(channels.BindingActive) {
-		return "", channels.OutboundContext{}, channels.ErrBindingInactive
+		return "", channels.ErrBindingInactive
 	}
 	if channels.Channel(bindingChannel) != reply.Channel || bindingRevision != reply.BindingRevision {
-		return "", channels.OutboundContext{}, errors.New("reply binding authorization changed")
+		return "", errors.New("reply binding authorization changed")
 	}
 	var targetJSON []byte
 	var expiresAt *time.Time
@@ -612,7 +400,7 @@ ORDER BY created_at
 LIMIT 1`, reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID).Scan(&targetJSON, &expiresAt)
 	if err == nil {
 		if expiresAt == nil || !time.Now().UTC().Before(expiresAt.UTC()) {
-			return "", channels.OutboundContext{}, ErrReplyTargetExpired
+			return "", ErrReplyTargetExpired
 		}
 		plaintext, err := s.openReplyTarget(ctx, reply, channels.TargetContext{
 			Scope:            tenant.Scope{TenantID: reply.TenantID, AppID: reply.AppID},
@@ -622,12 +410,12 @@ LIMIT 1`, reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID).Scan(&t
 			InternalEntityID: reply.RequestID,
 		}, channels.TargetPurposeReplyMessage, targetJSON)
 		if err != nil {
-			return "", channels.OutboundContext{}, err
+			return "", err
 		}
-		return plaintext.ProviderTarget, channels.OutboundContext{}, nil
+		return plaintext.ProviderTarget, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", channels.OutboundContext{}, fmt.Errorf("find message reply target: %w", err)
+		return "", fmt.Errorf("find message reply target: %w", err)
 	}
 	scope := tenant.Scope{TenantID: reply.TenantID, AppID: reply.AppID}
 	switch reply.Target.Kind {
@@ -638,16 +426,16 @@ FROM platform.channel_identity
 WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND user_id = $4`,
 			reply.TenantID, reply.AppID, reply.BindingID, reply.Target.InternalEntityID).Scan(&targetJSON)
 		if err != nil {
-			return "", channels.OutboundContext{}, resolveError("reply identity target", err)
+			return "", resolveError("reply identity target", err)
 		}
 		plaintext, err := s.openReplyTarget(ctx, reply, channels.TargetContext{
 			Scope: scope, BindingID: reply.BindingID, Channel: reply.Channel,
 			EntityType: channels.TargetEntityIdentity, InternalEntityID: reply.Target.InternalEntityID,
 		}, channels.TargetPurposeIdentityUser, targetJSON)
 		if err != nil {
-			return "", channels.OutboundContext{}, err
+			return "", err
 		}
-		return plaintext.ProviderTarget, channels.OutboundContext{}, nil
+		return plaintext.ProviderTarget, nil
 	case channels.TargetKindConversation, channels.TargetKindTopic:
 		err = s.pool.QueryRow(ctx, `
 SELECT provider_target_envelope, scope
@@ -655,7 +443,7 @@ FROM platform.channel_conversation
 WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND conversation_id = $4`,
 			reply.TenantID, reply.AppID, reply.BindingID, reply.Target.InternalEntityID).Scan(&targetJSON, new(string))
 		if err != nil {
-			return "", channels.OutboundContext{}, resolveError("reply conversation target", err)
+			return "", resolveError("reply conversation target", err)
 		}
 		purpose := channels.TargetPurposeConversationChat
 		if reply.Target.Kind == channels.TargetKindTopic {
@@ -666,11 +454,11 @@ WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND conversation_id = $
 			EntityType: channels.TargetEntityConversation, InternalEntityID: reply.Target.InternalEntityID,
 		}, purpose, targetJSON)
 		if err != nil {
-			return "", channels.OutboundContext{}, err
+			return "", err
 		}
-		return plaintext.ProviderTarget, channels.OutboundContext{}, nil
+		return plaintext.ProviderTarget, nil
 	default:
-		return "", channels.OutboundContext{}, errors.New("reply target kind is unsupported")
+		return "", errors.New("reply target kind is unsupported")
 	}
 }
 
@@ -701,19 +489,6 @@ func (s *Store) openReplyTarget(
 	return plaintext, nil
 }
 
-func replyEventSequence(sourceEventID, requestID string) (int64, error) {
-	prefix := requestID + ":"
-	if !strings.HasPrefix(sourceEventID, prefix) {
-		return 0, errors.New("reply source event id is invalid")
-	}
-	value, err := strconv.ParseInt(strings.TrimPrefix(sourceEventID, prefix), 10, 64)
-	if err != nil || value <= 0 {
-		return 0, errors.New("reply source event sequence is invalid")
-	}
-	return value, nil
-}
-
 var (
-	_ worker.ReplyOutbox         = (*Store)(nil)
-	_ worker.ReplyTargetResolver = (*Store)(nil)
+	_ worker.ReplyOutbox = (*Store)(nil)
 )

@@ -9,8 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
@@ -19,8 +17,6 @@ import (
 var (
 	// ErrNotFound reports that no accessible artifact metadata exists.
 	ErrNotFound = errors.New("artifact metadata not found")
-	// ErrCleanupLeaseLost reports that another worker owns an artifact cleanup.
-	ErrCleanupLeaseLost = errors.New("artifact cleanup lease lost")
 )
 
 // Record is the SQL-authoritative metadata for one session-scoped artifact
@@ -51,43 +47,9 @@ const (
 	StatusPending Status = "PENDING"
 	// StatusAvailable permits a trusted session-scoped read.
 	StatusAvailable Status = "AVAILABLE"
-	// StatusDeleted prevents subsequent reads while retaining the audit record.
+	// StatusDeleted prevents subsequent reads while retaining metadata history.
 	StatusDeleted Status = "DELETED"
 )
-
-// CleanupStatus identifies the durable retry lifecycle for an unreachable
-// object. Cleanup records never grant artifact read access.
-type CleanupStatus string
-
-const (
-	// CleanupPending is ready for a worker to delete the object.
-	CleanupPending CleanupStatus = "PENDING"
-	// CleanupRunning is leased by one worker.
-	CleanupRunning CleanupStatus = "RUNNING"
-)
-
-// CleanupRecord identifies one artifact object cleanup operation. The
-// immutable config version retains the backend route after later config
-// versions become active.
-type CleanupRecord struct {
-	ID                 string
-	TenantID           string
-	AppID              string
-	ConfigVersion      string
-	SessionPrincipalID string
-	SessionID          string
-	Filename           string
-	ObjectKey          string
-	// Version is the exact immutable object version selected for cleanup.
-	Version       int
-	Status        CleanupStatus
-	Attempt       int
-	NextAttemptAt time.Time
-	LeaseOwner    string
-	LeaseUntil    time.Time
-	RunToken      string
-	LastError     string
-}
 
 // Access binds an artifact service to one trusted execution session.
 type Access struct {
@@ -109,37 +71,12 @@ func (a Access) Validate() error {
 	return nil
 }
 
-// Validate checks the identity and retry fields of CleanupRecord.
-func (r CleanupRecord) Validate() error {
-	if r.ID == "" || r.TenantID == "" || r.AppID == "" || r.ConfigVersion == "" ||
-		r.SessionPrincipalID == "" || r.SessionID == "" || strings.TrimSpace(r.Filename) == "" {
-		return errors.New("artifact cleanup identity is required")
-	}
-	if r.ObjectKey == "" || r.Version < 0 {
-		return errors.New("artifact cleanup requires an exact object version")
-	}
-	if r.Attempt < 0 {
-		return errors.New("artifact cleanup attempt must not be negative")
-	}
-	if r.Status != CleanupPending && r.Status != CleanupRunning {
-		return errors.New("artifact cleanup status is invalid")
-	}
-	if r.LeaseOwner == "" && (!r.LeaseUntil.IsZero() || r.RunToken != "") {
-		return errors.New("artifact cleanup lease owner is required")
-	}
-	if r.LeaseOwner != "" && (r.LeaseUntil.IsZero() || r.RunToken == "") {
-		return errors.New("artifact cleanup lease is incomplete")
-	}
-	return nil
-}
-
 // MetadataStore persists and authorizes session-scoped artifact metadata.
 type MetadataStore interface {
 	ReserveArtifact(context.Context, Access, string, string, int64) (Record, error)
 	BindArtifactObject(context.Context, Record, string) error
 	PublishArtifact(context.Context, Record) error
 	AbandonArtifact(context.Context, Record) error
-	EnqueueArtifactCleanup(context.Context, CleanupRecord) error
 	FindArtifact(context.Context, Access, string, *int) (Record, error)
 	ListArtifactKeys(context.Context, Access) ([]string, error)
 	ListArtifactVersions(context.Context, Access, string) ([]int, error)
@@ -163,23 +100,20 @@ type ExactObjectStorage interface {
 	DeleteArtifactObject(context.Context, string) error
 }
 
-// StorageResolver resolves the configured backing artifact service for one
-// execution. It owns the backing service lifecycle.
-type StorageResolver interface {
-	ResolveArtifact(context.Context, worker.Execution) (frameworkartifact.Service, error)
-}
-
 // ExecutionResolver combines a configured backing service with authoritative
 // SQL metadata and the trusted execution session scope.
 type ExecutionResolver struct {
-	storage  StorageResolver
+	storage  func(context.Context, worker.Execution) (frameworkartifact.Service, error)
 	metadata MetadataStore
 }
 
 // NewExecutionResolver creates a resolver for SQL-guarded artifact services.
-func NewExecutionResolver(storage StorageResolver, metadata MetadataStore) (*ExecutionResolver, error) {
+func NewExecutionResolver(
+	storage func(context.Context, worker.Execution) (frameworkartifact.Service, error),
+	metadata MetadataStore,
+) (*ExecutionResolver, error) {
 	if storage == nil {
-		return nil, errors.New("artifact storage resolver is required")
+		return nil, errors.New("artifact storage provider is required")
 	}
 	if metadata == nil {
 		return nil, errors.New("artifact metadata store is required")
@@ -205,7 +139,7 @@ func (r *ExecutionResolver) ResolveArtifact(ctx context.Context, exec worker.Exe
 	if exec.Config.BackendConfig.Artifact.IsZero() {
 		return nil, nil
 	}
-	storage, err := r.storage.ResolveArtifact(ctx, exec)
+	storage, err := r.storage(ctx, exec)
 	if err != nil {
 		return nil, err
 	}
@@ -218,76 +152,6 @@ func (r *ExecutionResolver) ResolveArtifact(ctx context.Context, exec worker.Exe
 		SessionPrincipalID: exec.Tenant.SessionPrincipalID,
 		SessionID:          exec.Tenant.SessionID,
 	})
-}
-
-// DeleteCleanup removes the backing object selected by record without
-// consulting artifact metadata. It is reserved for the durable cleanup path
-// after reads have already been denied or metadata creation failed.
-func (r *ExecutionResolver) DeleteCleanup(
-	ctx context.Context,
-	exec worker.Execution,
-	record CleanupRecord,
-) error {
-	if r == nil || r.storage == nil || r.metadata == nil {
-		return errors.New("artifact execution resolver is not initialized")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := exec.Tenant.Validate(); err != nil {
-		return err
-	}
-	if err := record.Validate(); err != nil {
-		return err
-	}
-	if record.TenantID != exec.Tenant.TenantID || record.AppID != exec.Tenant.AppID ||
-		record.ConfigVersion != exec.Tenant.ConfigVersion ||
-		record.SessionPrincipalID != exec.Tenant.SessionPrincipalID || record.SessionID != exec.Tenant.SessionID {
-		return errors.New("artifact cleanup record does not match execution")
-	}
-	if exec.Config.BackendConfig.Artifact.IsZero() {
-		return errors.New("artifact backend is not configured")
-	}
-	storage, err := r.storage.ResolveArtifact(ctx, exec)
-	if err != nil {
-		return err
-	}
-	if storage == nil {
-		return errors.New("configured artifact storage service is required")
-	}
-	service, err := NewService(storage, r.metadata, Access{
-		Scope:              exec.Tenant.Scope(),
-		ConfigVersion:      exec.Tenant.ConfigVersion,
-		SessionPrincipalID: exec.Tenant.SessionPrincipalID,
-		SessionID:          exec.Tenant.SessionID,
-	})
-	if err != nil {
-		return err
-	}
-	if exact, ok := storage.(ExactObjectStorage); ok {
-		if err := exact.DeleteArtifactObject(ctx, record.ObjectKey); err != nil {
-			return fmt.Errorf("delete artifact object: %w", err)
-		}
-		return nil
-	}
-	info, storageFilename, err := service.storageRequest(record.Filename)
-	if err != nil {
-		return err
-	}
-	expectedKey, err := objectKey(storage, info, storageFilename, record.Version)
-	if err != nil {
-		return err
-	}
-	if record.ObjectKey != expectedKey {
-		return errors.New("artifact cleanup object key does not match record")
-	}
-	if err := service.deleteArtifactVersion(ctx, info, storageFilename, record.Version); err != nil {
-		return fmt.Errorf("delete artifact version: %w", err)
-	}
-	return nil
 }
 
 // Service guards a framework Artifact service with SQL-authoritative metadata
@@ -422,7 +286,7 @@ func (s *Service) DeleteArtifact(ctx context.Context, info frameworkartifact.Ses
 			err = s.deleteArtifactVersion(ctx, storageInfo, storageFilename, record.Version)
 		}
 		if err != nil {
-			failures = append(failures, s.enqueueVersionCleanup(ctx, record, fmt.Errorf("delete artifact storage: %w", err)))
+			failures = append(failures, fmt.Errorf("delete artifact storage: %w", err))
 		}
 	}
 	return errors.Join(failures...)
@@ -439,34 +303,11 @@ func (s *Service) compensateSave(
 	if err := s.metadata.AbandonArtifact(context.WithoutCancel(ctx), record); err != nil {
 		metadataFailure = errors.Join(metadataFailure, fmt.Errorf("abandon artifact metadata: %w", err))
 	}
-	if err := s.deleteArtifactVersion(ctx, info, filename, record.Version); err == nil {
+	if err := s.deleteArtifactVersion(context.WithoutCancel(ctx), info, filename, record.Version); err == nil {
 		return metadataFailure
 	} else {
-		return s.enqueueVersionCleanup(ctx, record, errors.Join(
-			metadataFailure,
-			fmt.Errorf("compensate artifact storage: %w", err),
-		))
+		return errors.Join(metadataFailure, fmt.Errorf("compensate artifact storage: %w", err))
 	}
-}
-
-func (s *Service) enqueueVersionCleanup(ctx context.Context, record Record, cause error) error {
-	task := CleanupRecord{
-		ID:                 uuid.NewString(),
-		TenantID:           s.access.Scope.TenantID,
-		AppID:              s.access.Scope.AppID,
-		ConfigVersion:      s.access.ConfigVersion,
-		SessionPrincipalID: s.access.SessionPrincipalID,
-		SessionID:          s.access.SessionID,
-		Filename:           record.Filename,
-		ObjectKey:          record.ObjectKey,
-		Version:            record.Version,
-		Status:             CleanupPending,
-		LastError:          platformlog.SafeError(cause),
-	}
-	if err := s.metadata.EnqueueArtifactCleanup(context.WithoutCancel(ctx), task); err != nil {
-		return errors.Join(cause, fmt.Errorf("record artifact cleanup: %w", err))
-	}
-	return cause
 }
 
 func (s *Service) abandonReservedArtifact(ctx context.Context, record Record, cause error) error {

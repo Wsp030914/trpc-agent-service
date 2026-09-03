@@ -18,8 +18,7 @@ const (
 )
 
 var (
-	errWeComReplyTooLarge    = errors.New("wecom reply is too large")
-	errWeComReplyUnsupported = errors.New("wecom reply is unsupported")
+	errWeComReplyTooLarge = errors.New("wecom reply is too large")
 )
 
 // ProviderSendError is the stable, body-redacted error returned by one
@@ -87,29 +86,13 @@ func NewOutboundClient(httpClient *http.Client) *OutboundClient {
 	}
 }
 
-// Capability reports the WeCom AI Bot features exposed to IM-06.
-func (*OutboundClient) Capability() channels.ProviderCapability {
-	return channels.ProviderCapability{
-		SupportsUpdate:                true,
-		SupportsCard:                  true,
-		SupportsArtifact:              false,
-		SupportsStreaming:             true,
-		RequiresInitialStreamResponse: true,
-		SupportsFinalize:              true,
-		MaxTextSize:                   maxWeComReplyBytes,
-		TargetTTL:                     wecomMessageTargetTTL,
-	}
-}
-
 // SendOnce encodes and sends one platform Reply to a resolved WeCom target.
 // WeCom response_url calls do not return a provider message ID, so the local
-// reply ID is used as the shared receipt fallback; stream updates use the
-// explicit StreamContext instead of that fallback.
+// reply ID is used as the shared receipt fallback.
 func (c *OutboundClient) SendOnce(
 	ctx context.Context,
 	reply channels.Reply,
 	providerTarget string,
-	outboundContext channels.OutboundContext,
 ) (channels.ProviderReceipt, error) {
 	if c == nil || c.httpClient == nil {
 		return channels.ProviderReceipt{}, &ProviderSendError{cause: errors.New("wecom outbound client is not initialized")}
@@ -127,7 +110,7 @@ func (c *OutboundClient) SendOnce(
 	if err := validator(providerTarget); err != nil {
 		return channels.ProviderReceipt{}, &ProviderSendError{cause: err}
 	}
-	payload, err := encodeReply(reply, outboundContext)
+	payload, err := encodeReply(reply)
 	if err != nil {
 		return channels.ProviderReceipt{}, err
 	}
@@ -135,7 +118,7 @@ func (c *OutboundClient) SendOnce(
 	if err != nil {
 		return channels.ProviderReceipt{}, err
 	}
-	return providerReceipt(reply, outboundContext, result), nil
+	return providerReceipt(reply, result), nil
 }
 
 func sendProviderPayload(
@@ -196,13 +179,9 @@ func sendProviderPayload(
 
 func providerReceipt(
 	reply channels.Reply,
-	outboundContext channels.OutboundContext,
 	result providerResponse,
 ) channels.ProviderReceipt {
 	providerMessageID := result.MessageID
-	if providerMessageID == "" {
-		providerMessageID = outboundContext.ProviderMessageID
-	}
 	if providerMessageID == "" {
 		providerMessageID = reply.ReplyID
 	}
@@ -214,71 +193,20 @@ type providerResponse struct {
 	MessageID string `json:"msgid"`
 }
 
-func encodeReply(reply channels.Reply, outboundContext channels.OutboundContext) ([]byte, error) {
-	if reply.Operation == channels.ReplyOperationUpdate || reply.Operation == channels.ReplyOperationFinalize ||
-		outboundContext.StreamContext != "" {
-		return encodeStreamReply(reply, outboundContext)
-	}
-	switch reply.Kind {
-	case channels.ReplyKindText, channels.ReplyKindFallbackText:
-		if len([]byte(reply.Text)) > maxWeComReplyBytes {
-			return nil, errWeComReplyTooLarge
-		}
-		return json.Marshal(struct {
-			MessageType string `json:"msgtype"`
-			Markdown    struct {
-				Content string `json:"content"`
-			} `json:"markdown"`
-		}{
-			MessageType: "markdown",
-			Markdown: struct {
-				Content string `json:"content"`
-			}{Content: reply.Text},
-		})
-	case channels.ReplyKindCard:
-		return json.Marshal(struct {
-			MessageType  string          `json:"msgtype"`
-			TemplateCard json.RawMessage `json:"template_card"`
-		}{MessageType: "template_card", TemplateCard: reply.Card})
-	case channels.ReplyKindArtifact:
-		return nil, errWeComReplyUnsupported
-	default:
-		return nil, errWeComReplyUnsupported
-	}
-}
-
-func encodeStreamReply(reply channels.Reply, outboundContext channels.OutboundContext) ([]byte, error) {
-	if reply.Kind != channels.ReplyKindText && reply.Kind != channels.ReplyKindFallbackText {
-		return nil, errWeComReplyUnsupported
-	}
+func encodeReply(reply channels.Reply) ([]byte, error) {
 	if len([]byte(reply.Text)) > maxWeComReplyBytes {
 		return nil, errWeComReplyTooLarge
 	}
-	streamID := outboundContext.StreamContext
-	if streamID == "" && reply.Operation == channels.ReplyOperationSend {
-		streamID = reply.LogicalReplyID
-	}
-	if streamID == "" {
-		return nil, errors.New("wecom stream context is required")
-	}
 	return json.Marshal(struct {
 		MessageType string `json:"msgtype"`
-		Stream      struct {
-			ID      string `json:"id"`
-			Finish  bool   `json:"finish"`
+		Markdown    struct {
 			Content string `json:"content"`
-		} `json:"stream"`
+		} `json:"markdown"`
 	}{
-		MessageType: "stream",
-		Stream: struct {
-			ID      string `json:"id"`
-			Finish  bool   `json:"finish"`
+		MessageType: "markdown",
+		Markdown: struct {
 			Content string `json:"content"`
-		}{
-			ID:      streamID,
-			Finish:  reply.Operation == channels.ReplyOperationFinalize,
-			Content: reply.Text,
-		},
+		}{Content: reply.Text},
 	})
 }
 

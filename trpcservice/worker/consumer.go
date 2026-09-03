@@ -32,26 +32,6 @@ type ExecutionStore interface {
 	Retry(context.Context, queue.Claim, error) error
 }
 
-// ConsumerOption configures a Consumer.
-type ConsumerOption func(*Consumer)
-
-// WithConsumerLeaseDuration sets the PostgreSQL execution lease duration.
-func WithConsumerLeaseDuration(duration time.Duration) ConsumerOption {
-	return func(c *Consumer) { c.leaseDuration = duration }
-}
-
-// WithConsumerPollInterval sets the maximum Redis Stream receive wait.
-func WithConsumerPollInterval(interval time.Duration) ConsumerOption {
-	return func(c *Consumer) { c.pollInterval = interval }
-}
-
-// WithConsumerConcurrency caps how many claimed jobs one consumer executes at
-// once. Session-lane ordering is preserved because the execution store defers
-// a turn until earlier turns of the same session reach a terminal state.
-func WithConsumerConcurrency(concurrency int) ConsumerOption {
-	return func(c *Consumer) { c.concurrency = concurrency }
-}
-
 // Consumer reads Redis Stream entries, claims their PostgreSQL execution, and
 // acknowledges Redis only after the persistent transition is complete.
 type Consumer struct {
@@ -68,7 +48,7 @@ type Consumer struct {
 }
 
 // NewConsumer creates a consumer for one stable worker identity.
-func NewConsumer(executor JobExecutor, stream queue.Stream, jobs ExecutionStore, owner string, opts ...ConsumerOption) (*Consumer, error) {
+func NewConsumer(executor JobExecutor, stream queue.Stream, jobs ExecutionStore, owner string) (*Consumer, error) {
 	if executor == nil {
 		return nil, errors.New("job executor is required")
 	}
@@ -81,22 +61,16 @@ func NewConsumer(executor JobExecutor, stream queue.Stream, jobs ExecutionStore,
 	if owner == "" {
 		return nil, errors.New("worker owner is required")
 	}
-	c := &Consumer{executor: executor, stream: stream, jobs: jobs, owner: owner, leaseDuration: defaultConsumerLeaseDuration, pollInterval: defaultConsumerPollInterval, concurrency: defaultConsumerConcurrency, stopClaims: make(chan struct{})}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(c)
-		}
-	}
-	if c.leaseDuration <= 0 {
-		return nil, errors.New("consumer lease duration must be positive")
-	}
-	if c.pollInterval <= 0 {
-		return nil, errors.New("consumer poll interval must be positive")
-	}
-	if c.concurrency <= 0 {
-		return nil, errors.New("consumer concurrency must be positive")
-	}
-	return c, nil
+	return &Consumer{
+		executor:      executor,
+		stream:        stream,
+		jobs:          jobs,
+		owner:         owner,
+		leaseDuration: defaultConsumerLeaseDuration,
+		pollInterval:  defaultConsumerPollInterval,
+		concurrency:   defaultConsumerConcurrency,
+		stopClaims:    make(chan struct{}),
+	}, nil
 }
 
 // StopClaiming stops reads while allowing a previously claimed run to drain.

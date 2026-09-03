@@ -357,8 +357,8 @@ func TestOutboundClientUsesOfficialFeishuOpenAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new outbound client: %v", err)
 	}
-	reply := testReply(channels.ReplyOperationSend, channels.ReplyKindText)
-	receipt, err := client.SendOnce(context.Background(), reply, "message_id:om-inbound", channels.OutboundContext{})
+	reply := testReply()
+	receipt, err := client.SendOnce(context.Background(), reply, "message_id:om-inbound")
 	if err != nil || receipt.ProviderMessageID != "om-reply" {
 		t.Fatalf("receipt=%#v err=%v", receipt, err)
 	}
@@ -471,7 +471,7 @@ func newTestAdapter(t *testing.T, opts ...AdapterOption) (*Adapter, *testAdmitte
 	t.Helper()
 	resolver := &testRouteResolver{snapshot: testBindingSnapshot()}
 	admitter := &testAdmitter{}
-	admissionGateway := gateway.New(gateway.WithAdmitter(admitter))
+	admissionGateway := gateway.New(admitter)
 	options := append(opts, WithClock(func() time.Time { return testCallbackNow }))
 	adapter, err := NewAdapter(resolver, admissionGateway, platformsecret.SecretProvider(testSecrets()), options...)
 	if err != nil {
@@ -581,8 +581,8 @@ func signedRequestAt(body []byte, timestamp string) *http.Request {
 	return request
 }
 
-func testReply(operation channels.ReplyOperation, kind channels.ReplyKind) channels.Reply {
-	reply := channels.Reply{
+func testReply() channels.Reply {
+	return channels.Reply{
 		TenantID:        testTenantID,
 		AppID:           testAppID,
 		RequestID:       "request-1",
@@ -591,22 +591,13 @@ func testReply(operation channels.ReplyOperation, kind channels.ReplyKind) chann
 		BindingID:       testBindingID,
 		BindingRevision: 3,
 		ReplyID:         "reply-1",
-		LogicalReplyID:  "logical-1",
-		PartNo:          1,
 		Revision:        1,
-		Operation:       operation,
-		Kind:            kind,
 		Target: channels.ReplyTarget{
 			Kind:             channels.TargetKindMessage,
 			InternalEntityID: "request-1",
 		},
 		Text: "hello",
 	}
-	if kind == channels.ReplyKindArtifact {
-		reply.Text = ""
-		reply.ArtifactRef = "artifact://feishu/test"
-	}
-	return reply
 }
 
 var _ channels.AttachmentIngestor = (*testAttachmentIngestor)(nil)

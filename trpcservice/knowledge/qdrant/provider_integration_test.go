@@ -3,7 +3,6 @@
 package qdrant_test
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -64,33 +63,33 @@ func TestScopedKnowledgeUsesQdrantFilterAndSQLAuthority(t *testing.T) {
 	}, v1); err != nil {
 		t.Fatalf("create app: %v", err)
 	}
-	base := platformknowledge.Base{Scope: scope, ID: "handbook", Status: platformknowledge.BaseStatusActive}
-	if err := metadata.CreateKnowledgeBase(ctx, base); err != nil {
+	baseID := "handbook"
+	if _, err := pool.Exec(ctx, `
+INSERT INTO platform.knowledge_base (tenant_id, app_id, knowledge_base_id, status)
+VALUES ($1, $2, $3, 'ACTIVE')`, scope.TenantID, scope.AppID, baseID); err != nil {
 		t.Fatalf("create base: %v", err)
 	}
 	v2 := v1
 	v2.Version = "v2"
-	v2.KnowledgeBaseIDs = []string{base.ID}
+	v2.KnowledgeBaseIDs = []string{baseID}
 	if err := metadata.InsertAppConfigVersion(ctx, v2); err != nil {
 		t.Fatalf("insert bound config: %v", err)
 	}
 
-	source := platformknowledge.Document{
-		Scope:           scope,
-		KnowledgeBaseID: base.ID,
-		ID:              "employee-handbook",
-		Version:         1,
-		ObjectKey:       "knowledge/source.txt",
-		ContentSHA256:   bytes.Repeat([]byte{1}, 32),
-		MIMEType:        "text/plain",
-		Status:          platformknowledge.DocumentStatusAvailable,
-		IndexGeneration: "g1",
-	}
-	if err := metadata.CreateKnowledgeDocument(ctx, source); err != nil {
+	if _, err := pool.Exec(ctx, `
+INSERT INTO platform.knowledge_document (
+    tenant_id, app_id, knowledge_base_id, document_id, version,
+    status, index_generation
+) VALUES ($1, $2, $3, $4, 1, 'AVAILABLE', $5)`,
+		scope.TenantID, scope.AppID, baseID, "employee-handbook", "g1"); err != nil {
 		t.Fatalf("create document: %v", err)
 	}
-	chunk := platformknowledge.Chunk{Document: source, ChunkID: "1", Status: platformknowledge.ChunkStatusAvailable}
-	if err := metadata.CreateKnowledgeChunk(ctx, chunk); err != nil {
+	if _, err := pool.Exec(ctx, `
+INSERT INTO platform.knowledge_chunk (
+    tenant_id, app_id, knowledge_base_id, document_id, document_version,
+    index_generation, chunk_id, status
+) VALUES ($1, $2, $3, $4, 1, $5, $6, 'AVAILABLE')`,
+		scope.TenantID, scope.AppID, baseID, "employee-handbook", "g1", "1"); err != nil {
 		t.Fatalf("create chunk: %v", err)
 	}
 
@@ -104,8 +103,8 @@ func TestScopedKnowledgeUsesQdrantFilterAndSQLAuthority(t *testing.T) {
 		t.Fatalf("new qdrant store: %v", err)
 	}
 	defer vectorStore.Close()
-	allowed := knowledgeVectorDocument(scope, base.ID, source.ID, "1", "1", "g1", "allowed")
-	foreign := knowledgeVectorDocument(tenant.Scope{TenantID: "other", AppID: scope.AppID}, base.ID, source.ID, "1", "foreign", "g1", "foreign")
+	allowed := knowledgeVectorDocument(scope, baseID, "employee-handbook", "1", "1", "g1", "allowed")
+	foreign := knowledgeVectorDocument(tenant.Scope{TenantID: "other", AppID: scope.AppID}, baseID, "employee-handbook", "1", "foreign", "g1", "foreign")
 	if err := vectorStore.Add(ctx, allowed, []float64{1, 0, 0}); err != nil {
 		t.Fatalf("add allowed vector: %v", err)
 	}
@@ -116,7 +115,7 @@ func TestScopedKnowledgeUsesQdrantFilterAndSQLAuthority(t *testing.T) {
 		frameworkknowledge.WithVectorStore(vectorStore),
 		frameworkknowledge.WithEmbedder(fixedEmbedder{}),
 	)
-	service, err := platformknowledge.NewScopedKnowledge(inner, metadata, scope, v2.Version, []string{base.ID})
+	service, err := platformknowledge.NewScopedKnowledge(inner, metadata, scope, v2.Version, []string{baseID})
 	if err != nil {
 		t.Fatalf("new scoped knowledge: %v", err)
 	}
@@ -131,7 +130,7 @@ func TestScopedKnowledgeUsesQdrantFilterAndSQLAuthority(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 UPDATE platform.knowledge_base
 SET status = 'DELETED', updated_at = now()
-WHERE tenant_id = $1 AND app_id = $2 AND knowledge_base_id = $3`, scope.TenantID, scope.AppID, base.ID); err != nil {
+WHERE tenant_id = $1 AND app_id = $2 AND knowledge_base_id = $3`, scope.TenantID, scope.AppID, baseID); err != nil {
 		t.Fatalf("delete base: %v", err)
 	}
 	result, err = service.Search(ctx, &frameworkknowledge.SearchRequest{Query: "policy", MaxResults: 10})
@@ -182,11 +181,6 @@ func createKnowledgeTenant(t *testing.T, ctx context.Context, store *platformpos
 		ID:     scope.TenantID,
 		Name:   name,
 		Status: tenant.StatusActive,
-		Audit: tenant.AuditPolicy{
-			Enabled:       true,
-			RetentionDays: 30,
-			RedactPII:     true,
-		},
 	}); err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}
@@ -212,7 +206,6 @@ func knowledgeConfig(scope tenant.Scope, version string) tenant.AppConfig {
 				Options:  map[string]string{"schema": "agent"},
 			},
 		},
-		Audit:      tenant.AuditPolicy{Enabled: true, RetentionDays: 30, RedactPII: true},
 		SecretRefs: []tenant.SecretRef{{Name: "model-key", Version: "1"}},
 	}
 }

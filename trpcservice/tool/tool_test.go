@@ -8,25 +8,6 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 )
 
-func TestVisibleDeclarationsFiltersBeforeModelExposure(t *testing.T) {
-	policy := tenant.ToolPolicy{
-		VisibleTools:    []string{"search"},
-		ExecutableTools: []string{"search"},
-	}
-	decls := []tool.Declaration{
-		{Name: "search"},
-		{Name: "delete"},
-	}
-
-	visible, err := tool.VisibleDeclarations(policy, decls)
-	if err != nil {
-		t.Fatalf("visible declarations: %v", err)
-	}
-	if len(visible) != 1 || visible[0].Name != "search" {
-		t.Fatalf("visible declarations = %#v, want search only", visible)
-	}
-}
-
 func TestAuthorizeExecutionChecksExecutablePolicy(t *testing.T) {
 	policy := tenant.ToolPolicy{
 		VisibleTools:    []string{"search", "delete"},

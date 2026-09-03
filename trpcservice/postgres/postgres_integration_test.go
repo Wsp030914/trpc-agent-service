@@ -75,19 +75,15 @@ func TestPostgresMigrationFromEmptySchema(t *testing.T) {
 		"execution",
 		"dispatch_outbox",
 		"execution_event",
-		"audit_event",
 		"data_migration",
 		"artifact",
-		"artifact_cleanup",
 		"knowledge_base",
 		"knowledge_document",
 		"knowledge_chunk",
-		"knowledge_index_job",
 		"channel_identity",
 		"channel_conversation",
 		"channel_inbox",
 		"channel_recall_inbox",
-		"reply_projection_state",
 		"reply_outbox",
 	} {
 		var exists bool
@@ -223,11 +219,6 @@ func integrationAppConfig(version, modelName string) tenant.AppConfig {
 				Name:     "session-postgres",
 				Options:  map[string]string{"schema": "agent"},
 			},
-		},
-		Audit: tenant.AuditPolicy{
-			Enabled:       true,
-			RetentionDays: 30,
-			RedactPII:     true,
 		},
 		SecretRefs: []tenant.SecretRef{{Name: "model-key", Version: "1"}},
 	}

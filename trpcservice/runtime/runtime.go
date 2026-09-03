@@ -7,23 +7,26 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
-	"reflect"
 	"strconv"
 	"strings"
-	"sync"
 
+	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
+	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
+	memorytencentdb "github.com/liuzengh/trpc-agent-service/trpcservice/memory/tencentdb"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
+	platformsession "github.com/liuzengh/trpc-agent-service/trpcservice/session"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
-	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
 	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	modelopenai "trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
-	"trpc.group/trpc-go/trpc-agent-go/session"
+	frameworksession "trpc.group/trpc-go/trpc-agent-go/session"
 	sessionexternalization "trpc.group/trpc-go/trpc-agent-go/session/externalization"
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -44,54 +47,6 @@ type ModelRuntime struct {
 	GenerationConfig model.GenerationConfig
 }
 
-// ModelResolver resolves a tenant-scoped model without persisting or logging
-// its credentials.
-type ModelResolver interface {
-	ResolveModel(ctx context.Context, exec worker.Execution) (ModelRuntime, error)
-}
-
-// SessionResolver resolves the session service selected for one execution.
-// The resolver owns the returned service's lifecycle.
-type SessionResolver interface {
-	ResolveSession(ctx context.Context, exec worker.Execution) (session.Service, error)
-}
-
-// SessionIngestorResolver resolves an optional long-term-memory ingestor for
-// one execution. The resolver owns the returned ingestor's lifecycle.
-type SessionIngestorResolver interface {
-	ResolveSessionIngestor(ctx context.Context, exec worker.Execution) (session.Ingestor, error)
-	RequiresPerExecutionRunner(exec worker.Execution) bool
-}
-
-// ArtifactResolver resolves an SQL-guarded Artifact service for one
-// execution. A configured artifact backend binds the Runner to that trusted
-// session and therefore prevents Runner cache reuse.
-type ArtifactResolver interface {
-	ResolveArtifact(ctx context.Context, exec worker.Execution) (frameworkartifact.Service, error)
-}
-
-// KnowledgeResolver resolves an SQL-guarded Knowledge implementation for one
-// immutable application configuration version.
-type KnowledgeResolver interface {
-	ResolveKnowledge(ctx context.Context, exec worker.Execution) (frameworkknowledge.Knowledge, error)
-}
-
-// ToolResolver resolves the complete static tool set for one immutable app
-// configuration. It receives the full execution scope so it can resolve tools
-// and their scoped secret references for that exact config version. Returned
-// tools must be safe to share between matching executions.
-type ToolResolver interface {
-	ResolveTools(ctx context.Context, exec worker.Execution) ([]frameworktool.Tool, error)
-}
-
-type runnerFactory func(string, frameworkagent.Agent, ...runner.Option) runner.Runner
-
-// ModelAPIKeyResolver resolves a model API key for one execution. Implementations
-// must obtain the key from an external secret store and must not log it.
-type ModelAPIKeyResolver interface {
-	ResolveModelAPIKey(ctx context.Context, exec worker.Execution) (string, error)
-}
-
 // ModelEndpointPolicy resolves a configured OpenAI-compatible endpoint to one
 // approved for the scoped model credential. Implementations must enforce the
 // operator's hostname and network egress policy.
@@ -99,11 +54,52 @@ type ModelEndpointPolicy interface {
 	ResolveModelBaseURL(ctx context.Context, exec worker.Execution, configuredURL string) (string, error)
 }
 
+// DefaultEndpointPolicy allows operator-configured HTTPS endpoints while
+// blocking addresses that enable server-side request forgery.
+type DefaultEndpointPolicy struct{}
+
+func (DefaultEndpointPolicy) ResolveModelBaseURL(
+	_ context.Context,
+	_ worker.Execution,
+	configuredURL string,
+) (string, error) {
+	parsed, err := url.Parse(configuredURL)
+	if err != nil {
+		return "", fmt.Errorf("parse model base url: %w", err)
+	}
+	host := parsed.Hostname()
+	if parsed.Scheme != "https" || host == "" {
+		return "", errors.New("model base url must use https")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if blockedEndpointIP(ip) {
+			return "", errors.New("model base url resolves to a blocked address")
+		}
+		return configuredURL, nil
+	}
+	addresses, err := net.LookupIP(host)
+	if err != nil {
+		return "", fmt.Errorf("resolve model base url host: %w", err)
+	}
+	for _, address := range addresses {
+		if blockedEndpointIP(address) {
+			return "", errors.New("model base url resolves to a blocked address")
+		}
+	}
+	return configuredURL, nil
+}
+
+func blockedEndpointIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+}
+
+var _ ModelEndpointPolicy = DefaultEndpointPolicy{}
+
 // OpenAIModelResolver resolves OpenAI-compatible models from immutable app
 // configuration. It supports the openai provider and obtains the API key only
-// through ModelAPIKeyResolver.
+// through the scoped SecretProvider.
 type OpenAIModelResolver struct {
-	apiKeys        ModelAPIKeyResolver
+	secrets        platformsecret.SecretProvider
 	endpointPolicy ModelEndpointPolicy
 }
 
@@ -111,18 +107,18 @@ type OpenAIModelResolver struct {
 // a ModelEndpointPolicy, immutable model config cannot override the default
 // OpenAI endpoint.
 func NewOpenAIModelResolver(
-	apiKeys ModelAPIKeyResolver,
+	secrets platformsecret.SecretProvider,
 	endpointPolicy ModelEndpointPolicy,
 ) (*OpenAIModelResolver, error) {
-	if apiKeys == nil {
-		return nil, errors.New("model api key resolver is required")
+	if secrets == nil {
+		return nil, errors.New("secret provider is required")
 	}
-	return &OpenAIModelResolver{apiKeys: apiKeys, endpointPolicy: endpointPolicy}, nil
+	return &OpenAIModelResolver{secrets: secrets, endpointPolicy: endpointPolicy}, nil
 }
 
 // ResolveModel resolves the OpenAI model selected by exec.Config.
 func (r *OpenAIModelResolver) ResolveModel(ctx context.Context, exec worker.Execution) (ModelRuntime, error) {
-	if r == nil || r.apiKeys == nil {
+	if r == nil || r.secrets == nil {
 		return ModelRuntime{}, errors.New("openai model resolver is not initialized")
 	}
 	if ctx == nil {
@@ -153,7 +149,14 @@ func (r *OpenAIModelResolver) ResolveModel(ctx context.Context, exec worker.Exec
 			return ModelRuntime{}, err
 		}
 	}
-	apiKey, err := r.apiKeys.ResolveModelAPIKey(ctx, exec)
+	if err := exec.Tenant.Scope().Validate(); err != nil {
+		return ModelRuntime{}, fmt.Errorf("execution scope: %w", err)
+	}
+	ref := exec.Config.Model.APIKeyRef
+	if err := ref.Validate(); err != nil {
+		return ModelRuntime{}, fmt.Errorf("model api key ref: %w", err)
+	}
+	apiKey, err := r.secrets.ResolveSecret(ctx, exec.Tenant.Scope(), ref)
 	if err != nil {
 		return ModelRuntime{}, fmt.Errorf("resolve model api key: %w", err)
 	}
@@ -170,95 +173,53 @@ func (r *OpenAIModelResolver) ResolveModel(ctx context.Context, exec worker.Exec
 	}, nil
 }
 
-// RuntimeRunnerResolver constructs and caches one real framework runner for
-// each immutable tenant application configuration version. Close releases the
-// cached runners; the SessionResolver remains responsible for session services.
-type RuntimeRunnerResolver struct {
-	models    ModelResolver
-	sessions  SessionResolver
-	ingestors SessionIngestorResolver
-	artifacts ArtifactResolver
-	knowledge KnowledgeResolver
-	tools     ToolResolver
-
-	mu        sync.Mutex
-	closed    bool
-	runners   map[string]runner.Runner
-	ephemeral map[uintptr]runner.Runner
-	newRunner runnerFactory
+// Runtime constructs one framework runner per execution. Long-
+// lived session, memory, artifact, and knowledge services are owned by their
+// respective resolvers; the worker owns and closes each returned Runner.
+type Runtime struct {
+	models    *OpenAIModelResolver
+	sessions  *platformsession.Router
+	ingestors *memorytencentdb.Resolver
+	artifacts *platformartifact.ExecutionResolver
+	knowledge *knowledgeqdrant.Resolver
+	tools     *ToolCatalog
 }
 
-// RuntimeRunnerOption configures a RuntimeRunnerResolver.
-type RuntimeRunnerOption func(*RuntimeRunnerResolver)
-
-// WithRuntimeToolResolver sets the resolver used to obtain candidate tools
-// before the tenant's visible-tool policy is applied.
-func WithRuntimeToolResolver(resolver ToolResolver) RuntimeRunnerOption {
-	return func(runtime *RuntimeRunnerResolver) {
-		runtime.tools = resolver
-	}
-}
-
-// WithSessionIngestorResolver sets the resolver used to attach optional
-// long-term-memory ingestion to a configured runner.
-func WithSessionIngestorResolver(resolver SessionIngestorResolver) RuntimeRunnerOption {
-	return func(runtime *RuntimeRunnerResolver) {
-		runtime.ingestors = resolver
-	}
-}
-
-// WithArtifactResolver sets the resolver used to attach a session-scoped
-// Artifact service when the immutable app configuration selects one.
-func WithArtifactResolver(resolver ArtifactResolver) RuntimeRunnerOption {
-	return func(runtime *RuntimeRunnerResolver) {
-		runtime.artifacts = resolver
-	}
-}
-
-// WithKnowledgeResolver sets the resolver used to attach configured Knowledge
-// to the framework agent.
-func WithKnowledgeResolver(resolver KnowledgeResolver) RuntimeRunnerOption {
-	return func(runtime *RuntimeRunnerResolver) {
-		runtime.knowledge = resolver
-	}
-}
-
-// NewRuntimeRunnerResolver creates a resolver that assembles LLMAgent, Runner,
-// and Session service instances for prepared executions.
-func NewRuntimeRunnerResolver(
-	models ModelResolver,
-	sessions SessionResolver,
-	opts ...RuntimeRunnerOption,
-) (*RuntimeRunnerResolver, error) {
+// NewRuntime creates a runner builder that assembles LLMAgent,
+// Runner, and Session service instances for prepared executions.
+func NewRuntime(
+	models *OpenAIModelResolver,
+	sessions *platformsession.Router,
+	ingestors *memorytencentdb.Resolver,
+	artifacts *platformartifact.ExecutionResolver,
+	knowledge *knowledgeqdrant.Resolver,
+	tools *ToolCatalog,
+) (*Runtime, error) {
 	if models == nil {
 		return nil, errors.New("model resolver is required")
 	}
 	if sessions == nil {
 		return nil, errors.New("session resolver is required")
 	}
-	resolver := &RuntimeRunnerResolver{
+	runtime := &Runtime{
 		models:    models,
 		sessions:  sessions,
-		runners:   make(map[string]runner.Runner),
-		ephemeral: make(map[uintptr]runner.Runner),
-		newRunner: runner.NewRunner,
+		ingestors: ingestors,
+		artifacts: artifacts,
+		knowledge: knowledge,
+		tools:     tools,
 	}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(resolver)
-		}
-	}
-	return resolver, nil
+	return runtime, nil
 }
 
-// ResolveRunner returns the cached runner for exec's immutable app config, or
-// creates one with its selected model and session service.
-func (r *RuntimeRunnerResolver) ResolveRunner(
+// BuildRunner creates a runner with dependencies selected by exec's
+// immutable configuration. The caller owns the returned runner.
+func (r *Runtime) BuildRunner(
 	ctx context.Context,
 	exec worker.Execution,
 ) (runner.Runner, error) {
 	if r == nil || r.models == nil || r.sessions == nil {
-		return nil, errors.New("runtime runner resolver is not initialized")
+		return nil, errors.New("runtime is not initialized")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -266,30 +227,11 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	cacheable := !requiresPerExecutionRunner(r.ingestors, exec)
-	cacheKey, err := exec.Tenant.Scope().Key("runner", exec.Tenant.ConfigVersion)
-	if err != nil {
-		return nil, err
-	}
 	appName, err := exec.Tenant.Scope().Key("runner")
 	if err != nil {
 		return nil, err
 	}
 
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil, errors.New("runtime runner resolver is closed")
-	}
-	if cacheable && r.runners[cacheKey] != nil {
-		cached := r.runners[cacheKey]
-		r.mu.Unlock()
-		return cached, nil
-	}
-	r.mu.Unlock()
-
-	// Resolve dependencies without holding the mutex so a slow first build
-	// for one tenant does not block runner lookups for all tenants.
 	modelRuntime, err := r.models.ResolveModel(ctx, exec)
 	if err != nil {
 		return nil, err
@@ -304,7 +246,7 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 	if sessionService == nil {
 		return nil, errors.New("resolved session service is required")
 	}
-	var ingestor session.Ingestor
+	var ingestor frameworksession.Ingestor
 	if r.ingestors != nil {
 		ingestor, err = r.ingestors.ResolveSessionIngestor(ctx, exec)
 		if err != nil {
@@ -384,78 +326,11 @@ func (r *RuntimeRunnerResolver) ResolveRunner(
 	if artifactService != nil {
 		runnerOptions = append(runnerOptions, runner.WithArtifactService(artifactService))
 	}
-	if r.newRunner == nil {
-		return nil, errors.New("runtime runner factory is not initialized")
-	}
-	resolved := r.newRunner(appName, agent, runnerOptions...)
+	resolved := runner.NewRunner(appName, agent, runnerOptions...)
 	if resolved == nil {
-		return nil, errors.New("runtime runner factory returned nil")
+		return nil, errors.New("runtime runner construction returned nil")
 	}
-	if !cacheable {
-		r.mu.Lock()
-		if r.closed {
-			r.mu.Unlock()
-			return closeUnpublishedRunner(resolved, errors.New("runtime runner resolver is closed"))
-		}
-		r.ephemeral[runnerIdentity(resolved)] = resolved
-		r.mu.Unlock()
-		return resolved, nil
-	}
-
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return closeUnpublishedRunner(resolved, errors.New("runtime runner resolver is closed"))
-	}
-	// Another caller may have published a runner for the same scope while
-	// this one was building; prefer the cached instance.
-	if cached := r.runners[cacheKey]; cached != nil {
-		r.mu.Unlock()
-		if closeErr := resolved.Close(); closeErr != nil {
-			return nil, fmt.Errorf("close duplicate runner: %w", closeErr)
-		}
-		return cached, nil
-	}
-	r.runners[cacheKey] = resolved
-	r.mu.Unlock()
 	return resolved, nil
-}
-
-func closeUnpublishedRunner(resolved runner.Runner, cause error) (runner.Runner, error) {
-	if closeErr := resolved.Close(); closeErr != nil {
-		return nil, errors.Join(cause, fmt.Errorf("close unpublished runner: %w", closeErr))
-	}
-	return nil, cause
-}
-
-func requiresPerExecutionRunner(resolver SessionIngestorResolver, exec worker.Execution) bool {
-	if !exec.Config.BackendConfig.Artifact.IsZero() {
-		return true
-	}
-	return resolver != nil && resolver.RequiresPerExecutionRunner(exec)
-}
-
-// ReleaseRunner closes a Runner created for an uncached execution. Cached
-// runners remain owned by RuntimeRunnerResolver.Close.
-func (r *RuntimeRunnerResolver) ReleaseRunner(resolved runner.Runner) error {
-	if r == nil || resolved == nil {
-		return nil
-	}
-	r.mu.Lock()
-	key := runnerIdentity(resolved)
-	if key == 0 {
-		r.mu.Unlock()
-		return nil
-	}
-	_, ok := r.ephemeral[key]
-	if ok {
-		delete(r.ephemeral, key)
-	}
-	r.mu.Unlock()
-	if !ok {
-		return nil
-	}
-	return resolved.Close()
 }
 
 func visibleTools(policy tenant.ToolPolicy, tools []frameworktool.Tool) ([]frameworktool.Tool, error) {
@@ -486,49 +361,6 @@ func visibleTools(policy tenant.ToolPolicy, tools []frameworktool.Tool) ([]frame
 		}
 	}
 	return visible, nil
-}
-
-// Close closes all cached runners. It does not close session services because
-// their owning SessionResolver can share them across runner cache entries.
-func (r *RuntimeRunnerResolver) Close() error {
-	if r == nil {
-		return nil
-	}
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil
-	}
-	r.closed = true
-	runners := r.runners
-	ephemeral := r.ephemeral
-	r.runners = nil
-	r.ephemeral = nil
-	r.mu.Unlock()
-
-	var errs []error
-	for _, resolved := range runners {
-		if err := resolved.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	for _, resolved := range ephemeral {
-		if err := resolved.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func runnerIdentity(resolved runner.Runner) uintptr {
-	if resolved == nil {
-		return 0
-	}
-	value := reflect.ValueOf(resolved)
-	if value.Kind() != reflect.Pointer || value.IsNil() {
-		return 0
-	}
-	return value.Pointer()
 }
 
 func openAIModelOptions(parameters map[string]string) (string, model.GenerationConfig, error) {
@@ -625,6 +457,3 @@ func validateModelBaseURL(value string) error {
 	}
 	return nil
 }
-
-var _ ModelResolver = (*OpenAIModelResolver)(nil)
-var _ worker.RunnerResolver = (*RuntimeRunnerResolver)(nil)

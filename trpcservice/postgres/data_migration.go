@@ -455,7 +455,6 @@ func sameMigrationBehavior(source, target tenant.AppConfig) bool {
 		reflect.DeepEqual(source.Model, target.Model) &&
 		reflect.DeepEqual(source.Tools, target.Tools) &&
 		reflect.DeepEqual(source.KnowledgeBaseIDs, target.KnowledgeBaseIDs) &&
-		reflect.DeepEqual(source.Audit, target.Audit) &&
 		reflect.DeepEqual(source.SecretRefs, target.SecretRefs) &&
 		reflect.DeepEqual(source.ChannelBinding, target.ChannelBinding)
 }

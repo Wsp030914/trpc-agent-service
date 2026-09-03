@@ -12,9 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
+	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	platformredis "github.com/liuzengh/trpc-agent-service/trpcservice/redis"
@@ -135,17 +134,27 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 	if err != nil {
 		t.Fatalf("create redis stream: %v", err)
 	}
+	getenv := migrationSecretEnvironment(
+		tenantID,
+		appID,
+		*dataMigrationTestURL,
+		*dataMigrationTestDSN,
+	)
+	artifacts, err := artifactcos.NewResolver(
+		environmentSecretProvider{getenv: getenv},
+		environmentCOSEndpointResolver{getenv: getenv},
+	)
+	if err != nil {
+		t.Fatalf("new artifact resolver: %v", err)
+	}
+	t.Cleanup(func() { _ = artifacts.Close() })
 	runtime, err := newWorkerRuntime(workerRuntimeDependencies{
 		store:       store,
 		redisClient: redisClient,
 		stream:      stream,
 		owner:       "worker-migration",
-		getenv: migrationSecretEnvironment(
-			tenantID,
-			appID,
-			*dataMigrationTestURL,
-			*dataMigrationTestDSN,
-		),
+		getenv:      getenv,
+		artifacts:   artifacts,
 	})
 	if err != nil {
 		t.Fatalf("new worker runtime: %v", err)
@@ -319,187 +328,6 @@ func TestDataMigrationLeaseTakeoverRejectsPreviousWorker(t *testing.T) {
 	}
 }
 
-func TestArtifactCleanupLeaseTakeoverRejectsPreviousWorker(t *testing.T) {
-	if *dataMigrationTestDSN == "" {
-		t.Skip("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN is required")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	pool := openDataMigrationIntegrationPool(t)
-	store, err := postgres.New(pool)
-	if err != nil {
-		t.Fatalf("new postgres store: %v", err)
-	}
-	if err := store.Migrate(ctx); err != nil {
-		t.Fatalf("migrate postgres store: %v", err)
-	}
-
-	seed := time.Now().UnixNano()
-	tenantID := fmt.Sprintf("artifact-cleanup-takeover-%x", seed)
-	appID := "support"
-	schema := fmt.Sprintf("cleanup%x", seed&0xffffff)
-	t.Cleanup(func() { cleanupDataMigrationIntegration(t, pool, tenantID, appID, schema) })
-	v1, _ := dataMigrationAppConfigs(tenantID, appID, schema)
-	if err := store.CreateTenant(ctx, tenant.Tenant{ID: tenantID, Name: "Artifact Cleanup Takeover", Status: tenant.StatusActive}); err != nil {
-		t.Fatalf("create tenant: %v", err)
-	}
-	if err := store.CreateAgentApp(ctx, tenant.AgentApp{
-		TenantID: tenantID, AppID: appID, Name: "Artifact Cleanup Takeover", ActiveConfigVersion: v1.Version, Status: tenant.StatusActive,
-	}, v1); err != nil {
-		t.Fatalf("create agent app: %v", err)
-	}
-	key := dataMigrationSessionKey(t, tenantID, appID)
-	if _, err := pool.Exec(ctx, `
-INSERT INTO platform.session_lane (tenant_id, app_id, session_principal_id, session_id)
-VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != nil {
-		t.Fatalf("insert session lane: %v", err)
-	}
-	record := platformartifact.CleanupRecord{
-		ID:                 fmt.Sprintf("artifact-cleanup-%x", seed),
-		TenantID:           tenantID,
-		AppID:              appID,
-		ConfigVersion:      v1.Version,
-		SessionPrincipalID: key.UserID,
-		SessionID:          key.SessionID,
-		Filename:           "report.txt",
-		ObjectKey:          "artifact-key",
-		Version:            0,
-		Status:             platformartifact.CleanupPending,
-		LastError:          "delete failed",
-	}
-	if err := store.EnqueueArtifactCleanup(ctx, record); err != nil {
-		t.Fatalf("enqueue artifact cleanup: %v", err)
-	}
-	previous, found, err := store.ClaimNextArtifactCleanup(ctx, "worker-previous", artifactCleanupLease)
-	if err != nil || !found {
-		t.Fatalf("claim artifact cleanup found=%v err=%v", found, err)
-	}
-	if err := store.RenewArtifactCleanup(ctx, previous, artifactCleanupLease); err != nil {
-		t.Fatalf("renew artifact cleanup: %v", err)
-	}
-	var leaseUntil time.Time
-	if err := pool.QueryRow(ctx, `SELECT lease_until FROM platform.artifact_cleanup WHERE cleanup_id = $1`, record.ID).Scan(&leaseUntil); err != nil {
-		t.Fatalf("query renewed cleanup lease: %v", err)
-	}
-	if !leaseUntil.After(time.Now()) {
-		t.Fatalf("renewed cleanup lease = %v, want future lease", leaseUntil)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE platform.artifact_cleanup SET lease_until = clock_timestamp() - interval '1 second' WHERE cleanup_id = $1`, record.ID); err != nil {
-		t.Fatalf("expire cleanup lease: %v", err)
-	}
-	successor, found, err := store.ClaimNextArtifactCleanup(ctx, "worker-successor", artifactCleanupLease)
-	if err != nil || !found || successor.RunToken == previous.RunToken {
-		t.Fatalf("claim successor cleanup found=%v record=%+v err=%v", found, successor, err)
-	}
-	if err := store.RenewArtifactCleanup(ctx, previous, artifactCleanupLease); !errors.Is(err, platformartifact.ErrCleanupLeaseLost) {
-		t.Fatalf("previous worker renew error = %v, want lease lost", err)
-	}
-	if err := store.CompleteArtifactCleanup(ctx, previous); !errors.Is(err, platformartifact.ErrCleanupLeaseLost) {
-		t.Fatalf("previous worker complete error = %v, want lease lost", err)
-	}
-	if err := store.CompleteArtifactCleanup(ctx, successor); err != nil {
-		t.Fatalf("complete successor cleanup: %v", err)
-	}
-	var status platformartifact.CleanupStatus
-	if err := pool.QueryRow(ctx, `SELECT status FROM platform.artifact_cleanup WHERE cleanup_id = $1`, record.ID).Scan(&status); !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("completed cleanup row error = %v, want %v", err, pgx.ErrNoRows)
-	}
-}
-
-func TestWorkerRuntimeCompletesAndRetriesArtifactCleanup(t *testing.T) {
-	if *dataMigrationTestDSN == "" {
-		t.Skip("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN is required")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	pool := openDataMigrationIntegrationPool(t)
-	store, err := postgres.New(pool)
-	if err != nil {
-		t.Fatalf("new postgres store: %v", err)
-	}
-	if err := store.Migrate(ctx); err != nil {
-		t.Fatalf("migrate postgres store: %v", err)
-	}
-
-	seed := time.Now().UnixNano()
-	tenantID := fmt.Sprintf("artifact-cleanup-worker-%x", seed)
-	appID := "support"
-	schema := fmt.Sprintf("cleanupworker%x", seed&0xffffff)
-	t.Cleanup(func() { cleanupDataMigrationIntegration(t, pool, tenantID, appID, schema) })
-	v1, _ := dataMigrationAppConfigs(tenantID, appID, schema)
-	if err := store.CreateTenant(ctx, tenant.Tenant{ID: tenantID, Name: "Artifact Cleanup Worker", Status: tenant.StatusActive}); err != nil {
-		t.Fatalf("create tenant: %v", err)
-	}
-	if err := store.CreateAgentApp(ctx, tenant.AgentApp{
-		TenantID: tenantID, AppID: appID, Name: "Artifact Cleanup Worker", ActiveConfigVersion: v1.Version, Status: tenant.StatusActive,
-	}, v1); err != nil {
-		t.Fatalf("create agent app: %v", err)
-	}
-	key := dataMigrationSessionKey(t, tenantID, appID)
-	if _, err := pool.Exec(ctx, `
-INSERT INTO platform.session_lane (tenant_id, app_id, session_principal_id, session_id)
-VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != nil {
-		t.Fatalf("insert session lane: %v", err)
-	}
-	record := platformartifact.CleanupRecord{
-		ID:                 fmt.Sprintf("artifact-cleanup-worker-%x", seed),
-		TenantID:           tenantID,
-		AppID:              appID,
-		ConfigVersion:      v1.Version,
-		SessionPrincipalID: key.UserID,
-		SessionID:          key.SessionID,
-		Filename:           "report.txt",
-		ObjectKey:          "artifact-key",
-		Version:            0,
-		Status:             platformartifact.CleanupPending,
-		LastError:          "delete failed",
-	}
-	if err := store.EnqueueArtifactCleanup(ctx, record); err != nil {
-		t.Fatalf("enqueue artifact cleanup: %v", err)
-	}
-	cleanup := &testArtifactCleanupExecutor{}
-	runtime := &workerRuntime{store: store, artifactServices: cleanup, owner: "worker-cleanup"}
-	if err := runtime.runArtifactCleanupPass(ctx); err != nil {
-		t.Fatalf("run artifact cleanup pass: %v", err)
-	}
-	if cleanup.calls != 1 || cleanup.filename != record.Filename || cleanup.configVersion != v1.Version {
-		t.Fatalf("cleanup invocation = %#v", cleanup)
-	}
-	var status platformartifact.CleanupStatus
-	if err := pool.QueryRow(ctx, `SELECT status FROM platform.artifact_cleanup WHERE cleanup_id = $1`, record.ID).Scan(&status); !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("completed cleanup row error = %v, want %v", err, pgx.ErrNoRows)
-	}
-
-	retryRecord := record
-	retryRecord.ID += "-retry"
-	retryRecord.Filename = "retry.txt"
-	if err := store.EnqueueArtifactCleanup(ctx, retryRecord); err != nil {
-		t.Fatalf("enqueue retry artifact cleanup: %v", err)
-	}
-	retryErr := errors.New("cos delete unavailable")
-	cleanup.err = retryErr
-	if err := runtime.runArtifactCleanupPass(ctx); err != nil {
-		t.Fatalf("run retry artifact cleanup pass: %v", err)
-	}
-	var lastError string
-	if err := pool.QueryRow(ctx, `SELECT status, last_error FROM platform.artifact_cleanup WHERE cleanup_id = $1`, retryRecord.ID).Scan(&status, &lastError); err != nil {
-		t.Fatalf("query retry cleanup status: %v", err)
-	}
-	if status != platformartifact.CleanupPending || !strings.Contains(lastError, retryErr.Error()) {
-		t.Fatalf("retry cleanup status=%q last_error=%q", status, lastError)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE platform.artifact_cleanup SET next_attempt_at = clock_timestamp() WHERE cleanup_id = $1`, retryRecord.ID); err != nil {
-		t.Fatalf("make retry cleanup due: %v", err)
-	}
-	cleanup.err = nil
-	if err := runtime.runArtifactCleanupPass(ctx); err != nil {
-		t.Fatalf("run successful retry cleanup pass: %v", err)
-	}
-	if err := pool.QueryRow(ctx, `SELECT status FROM platform.artifact_cleanup WHERE cleanup_id = $1`, retryRecord.ID).Scan(&status); !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("completed retry cleanup row error = %v, want %v", err, pgx.ErrNoRows)
-	}
-}
-
 func appendMigrationTestEvents(ctx context.Context, service session.Service, value *session.Session) error {
 	if err := service.AppendEvent(ctx, value, event.NewResponseEvent("event-1", "user", &model.Response{
 		Object: model.ObjectTypeChatCompletion,
@@ -576,20 +404,6 @@ func dataMigrationExecution(t *testing.T, key session.Key, config tenant.AppConf
 	return worker.Execution{Tenant: runtime, Config: config}
 }
 
-type testArtifactCleanupExecutor struct {
-	calls         int
-	filename      string
-	configVersion string
-	err           error
-}
-
-func (e *testArtifactCleanupExecutor) DeleteCleanup(_ context.Context, exec worker.Execution, record platformartifact.CleanupRecord) error {
-	e.calls++
-	e.filename = record.Filename
-	e.configVersion = exec.Tenant.ConfigVersion
-	return e.err
-}
-
 func dataMigrationSessionKey(t *testing.T, tenantID, appID string) session.Key {
 	t.Helper()
 	appName, err := (tenant.Scope{TenantID: tenantID, AppID: appID}).Key("runner")
@@ -619,17 +433,28 @@ func newDataMigrationTestRuntime(
 		_ = redisClient.Close()
 		t.Fatalf("create redis stream: %v", err)
 	}
+	getenv := migrationSecretEnvironment(
+		tenantID,
+		appID,
+		sessionRedisURL,
+		*dataMigrationTestDSN,
+	)
+	artifacts, err := artifactcos.NewResolver(
+		environmentSecretProvider{getenv: getenv},
+		environmentCOSEndpointResolver{getenv: getenv},
+	)
+	if err != nil {
+		_ = redisClient.Close()
+		t.Fatalf("new artifact resolver: %v", err)
+	}
+	t.Cleanup(func() { _ = artifacts.Close() })
 	runtime, err := newWorkerRuntime(workerRuntimeDependencies{
 		store:       store,
 		redisClient: redisClient,
 		stream:      stream,
 		owner:       owner,
-		getenv: migrationSecretEnvironment(
-			tenantID,
-			appID,
-			sessionRedisURL,
-			*dataMigrationTestDSN,
-		),
+		getenv:      getenv,
+		artifacts:   artifacts,
 	})
 	if err != nil {
 		_ = redisClient.Close()
@@ -696,9 +521,6 @@ func cleanupDataMigrationIntegration(t *testing.T, pool *pgxpool.Pool, tenantID,
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := pool.Exec(ctx, `DELETE FROM platform.artifact_cleanup WHERE tenant_id = $1 AND app_id = $2`, tenantID, appID); err != nil {
-		t.Errorf("delete artifact cleanup: %v", err)
-	}
 	if _, err := pool.Exec(ctx, `DELETE FROM platform.execution WHERE tenant_id = $1 AND app_id = $2`, tenantID, appID); err != nil {
 		t.Errorf("delete execution: %v", err)
 	}
@@ -710,7 +532,7 @@ func cleanupDataMigrationIntegration(t *testing.T, pool *pgxpool.Pool, tenantID,
 	}
 	// Published AppConfig rows are intentionally immutable. The test uses a
 	// unique tenant ID and the dedicated _test database, so control-plane rows
-	// remain as audit history while mutable migration data is removed above.
+	// remain after mutable migration data is removed above.
 	if _, err := pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
 		t.Errorf("drop target session schema: %v", err)
 	}

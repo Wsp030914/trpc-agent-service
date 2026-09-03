@@ -61,7 +61,7 @@ func TestRelayDeliversAdmittedExecutionToWorker(t *testing.T) {
 		t.Fatalf("initialize redis stream: %v", err)
 	}
 
-	gatewayService := gateway.New(gateway.WithAdmitter(store))
+	gatewayService := gateway.New(store)
 	result, err := gatewayService.Handle(ctx, gateway.Request{
 		RequestID:      "request-relay-1",
 		IdempotencyKey: "client-relay-1",
@@ -78,7 +78,7 @@ func TestRelayDeliversAdmittedExecutionToWorker(t *testing.T) {
 
 	executor := &relayExecutor{executed: make(chan execution.Job, 1)}
 	trackedStream := &ackTrackingStream{Stream: stream}
-	consumer, err := worker.NewConsumer(executor, trackedStream, store, "worker-relay-test", worker.WithConsumerPollInterval(10*time.Millisecond))
+	consumer, err := worker.NewConsumer(executor, trackedStream, store, "worker-relay-test")
 	if err != nil {
 		t.Fatalf("new worker consumer: %v", err)
 	}

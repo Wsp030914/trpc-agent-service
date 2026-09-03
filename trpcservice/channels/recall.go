@@ -54,7 +54,6 @@ type RecallResult struct {
 	RequestID       string
 	ExecutionStatus string
 	Replayed        bool
-	CancelRequested bool
 }
 
 // RecallAdmitter durably applies a verified provider recall event.

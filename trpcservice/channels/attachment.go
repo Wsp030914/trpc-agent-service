@@ -69,28 +69,6 @@ type ArtifactWriter interface {
 	WriteInboundArtifact(context.Context, InboundArtifact) (string, error)
 }
 
-// MediaDownloaderFunc adapts a function to MediaDownloader.
-type MediaDownloaderFunc func(context.Context, ChannelInput, ProviderMediaRef) (DownloadedMedia, error)
-
-// Download implements MediaDownloader.
-func (f MediaDownloaderFunc) Download(ctx context.Context, input ChannelInput, media ProviderMediaRef) (DownloadedMedia, error) {
-	if f == nil {
-		return DownloadedMedia{}, errors.New("media downloader is not initialized")
-	}
-	return f(ctx, input, media)
-}
-
-// ArtifactWriterFunc adapts a function to ArtifactWriter.
-type ArtifactWriterFunc func(context.Context, InboundArtifact) (string, error)
-
-// WriteInboundArtifact implements ArtifactWriter.
-func (f ArtifactWriterFunc) WriteInboundArtifact(ctx context.Context, artifact InboundArtifact) (string, error) {
-	if f == nil {
-		return "", errors.New("artifact writer is not initialized")
-	}
-	return f(ctx, artifact)
-}
-
 // ArtifactIngestor materializes provider media before PostgreSQL admission.
 // It is independent of a concrete object store; the supplied ArtifactWriter
 // is the only persistence boundary.

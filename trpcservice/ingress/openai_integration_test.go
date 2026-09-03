@@ -49,7 +49,7 @@ func TestOpenAIHandlerPersistsAuthenticatedAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new event journal: %v", err)
 	}
-	queued, err := gateway.NewQueuedRunner(gateway.New(gateway.WithAdmitter(store)), events)
+	queued, err := gateway.NewQueuedRunner(gateway.New(store), events)
 	if err != nil {
 		t.Fatalf("new queued runner: %v", err)
 	}

@@ -41,7 +41,7 @@ func TestQueuedRunnerAdmitsAuthenticatedContextAndForwardsPersistedEvents(t *tes
 			Done:   true,
 		}),
 	}}}
-	queued, err := gateway.NewQueuedRunner(gateway.New(gateway.WithAdmitter(admitter)), source)
+	queued, err := gateway.NewQueuedRunner(gateway.New(admitter), source)
 	if err != nil {
 		t.Fatalf("new queued runner: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestQueuedRunnerRejectsRuntimeOptions(t *testing.T) {
 		TurnSeq:       1,
 	}}
 	queued, err := gateway.NewQueuedRunner(
-		gateway.New(gateway.WithAdmitter(admitter)),
+		gateway.New(admitter),
 		&staticExecutionEventSource{},
 	)
 	if err != nil {

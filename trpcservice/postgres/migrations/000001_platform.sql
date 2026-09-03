@@ -6,7 +6,6 @@ CREATE TABLE platform.tenant (
     tenant_id TEXT PRIMARY KEY,
     name TEXT NOT NULL CHECK (name <> ''),
     status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'SUSPENDED')),
-    audit_policy JSONB NOT NULL DEFAULT '{}'::JSONB CHECK (jsonb_typeof(audit_policy) = 'object'),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -29,7 +28,6 @@ CREATE TABLE platform.app_config_version (
     model_config JSONB NOT NULL CHECK (jsonb_typeof(model_config) = 'object'),
     tool_policy JSONB NOT NULL CHECK (jsonb_typeof(tool_policy) = 'object'),
     backend_config JSONB NOT NULL CHECK (jsonb_typeof(backend_config) = 'object'),
-    audit_policy JSONB NOT NULL CHECK (jsonb_typeof(audit_policy) = 'object'),
     secret_refs JSONB NOT NULL DEFAULT '[]'::JSONB CHECK (jsonb_typeof(secret_refs) IN ('array', 'null')),
     channel_binding_ids JSONB NOT NULL DEFAULT '[]'::JSONB CHECK (jsonb_typeof(channel_binding_ids) IN ('array', 'null')),
     knowledge_base_ids JSONB NOT NULL DEFAULT '[]'::JSONB CHECK (jsonb_typeof(knowledge_base_ids) = 'array'),
@@ -174,8 +172,6 @@ CREATE TABLE platform.execution (
     lease_until TIMESTAMPTZ,
     last_error TEXT NOT NULL DEFAULT '',
     trace_id TEXT NOT NULL,
-    cancel_requested BOOLEAN NOT NULL DEFAULT false,
-    cancel_requested_at TIMESTAMPTZ,
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -195,10 +191,6 @@ CREATE INDEX execution_active_lane_idx
 
 CREATE INDEX execution_trace_idx
     ON platform.execution (tenant_id, app_id, trace_id);
-
-CREATE INDEX execution_cancel_requested_idx
-    ON platform.execution (tenant_id, app_id, status, cancel_requested)
-    WHERE cancel_requested = true;
 
 CREATE TABLE platform.dispatch_outbox (
     outbox_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -232,31 +224,6 @@ CREATE TABLE platform.execution_event (
     FOREIGN KEY (tenant_id, app_id, request_id)
         REFERENCES platform.execution (tenant_id, app_id, request_id)
 );
-
-CREATE TABLE platform.audit_event (
-    event_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    app_id TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    channel TEXT NOT NULL DEFAULT '',
-    user_id TEXT NOT NULL,
-    session_principal_id TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    trace_id TEXT NOT NULL,
-    agent_name TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    tool_name TEXT NOT NULL DEFAULT '',
-    decision TEXT NOT NULL DEFAULT '',
-    latency_ms BIGINT NOT NULL DEFAULT 0,
-    error_type TEXT NOT NULL DEFAULT '',
-    expire_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    FOREIGN KEY (tenant_id, app_id, request_id)
-        REFERENCES platform.execution (tenant_id, app_id, request_id)
-);
-
-CREATE INDEX audit_event_scope_idx
-    ON platform.audit_event (tenant_id, app_id, created_at);
 
 CREATE TABLE platform.data_migration (
     migration_id TEXT PRIMARY KEY,
@@ -309,40 +276,6 @@ CREATE INDEX artifact_session_available_idx
     ON platform.artifact (tenant_id, app_id, session_principal_id, session_id, filename, version DESC)
     WHERE status = 'AVAILABLE';
 
-CREATE TABLE platform.artifact_cleanup (
-    cleanup_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    app_id TEXT NOT NULL,
-    config_version TEXT NOT NULL,
-    session_principal_id TEXT NOT NULL CHECK (session_principal_id <> ''),
-    session_id TEXT NOT NULL CHECK (session_id <> ''),
-    filename TEXT NOT NULL CHECK (filename <> ''),
-    object_key TEXT NOT NULL CHECK (object_key <> ''),
-    version INTEGER NOT NULL CHECK (version >= 0),
-    status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING')),
-    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
-    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    lease_owner TEXT,
-    lease_until TIMESTAMPTZ,
-    run_token TEXT,
-    last_error TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    FOREIGN KEY (tenant_id, app_id, config_version)
-        REFERENCES platform.app_config_version (tenant_id, app_id, version),
-    FOREIGN KEY (tenant_id, app_id, session_principal_id, session_id)
-        REFERENCES platform.session_lane (tenant_id, app_id, session_principal_id, session_id)
-);
-
-CREATE UNIQUE INDEX artifact_cleanup_active_object_idx
-    ON platform.artifact_cleanup (
-        tenant_id, app_id, config_version, session_principal_id, session_id, object_key, version
-    ) WHERE status IN ('PENDING', 'RUNNING');
-
-CREATE INDEX artifact_cleanup_claim_idx
-    ON platform.artifact_cleanup (status, next_attempt_at, cleanup_id)
-    WHERE status IN ('PENDING', 'RUNNING');
-
 CREATE TABLE platform.knowledge_base (
     tenant_id TEXT NOT NULL,
     app_id TEXT NOT NULL,
@@ -360,9 +293,6 @@ CREATE TABLE platform.knowledge_document (
     knowledge_base_id TEXT NOT NULL CHECK (knowledge_base_id <> ''),
     document_id TEXT NOT NULL CHECK (document_id <> ''),
     version INTEGER NOT NULL CHECK (version >= 0),
-    object_key TEXT NOT NULL CHECK (object_key <> ''),
-    content_sha256 BYTEA NOT NULL DEFAULT '\\x'::bytea,
-    mime_type TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL CHECK (status IN ('PENDING', 'AVAILABLE', 'DELETED')),
     index_generation TEXT NOT NULL CHECK (index_generation <> ''),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -400,40 +330,6 @@ CREATE INDEX knowledge_chunk_available_idx
         tenant_id, app_id, knowledge_base_id, document_id, document_version,
         index_generation, chunk_id
     ) WHERE status = 'AVAILABLE';
-
-CREATE TABLE platform.knowledge_index_job (
-    job_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    app_id TEXT NOT NULL,
-    knowledge_base_id TEXT NOT NULL,
-    document_id TEXT NOT NULL,
-    document_version INTEGER NOT NULL CHECK (document_version >= 0),
-    index_generation TEXT NOT NULL CHECK (index_generation <> ''),
-    config_version TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED')),
-    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
-    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    lease_owner TEXT,
-    lease_until TIMESTAMPTZ,
-    run_token TEXT,
-    last_error TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    FOREIGN KEY (tenant_id, app_id, knowledge_base_id, document_id, document_version)
-        REFERENCES platform.knowledge_document (tenant_id, app_id, knowledge_base_id, document_id, version),
-    FOREIGN KEY (tenant_id, app_id, config_version)
-        REFERENCES platform.app_config_version (tenant_id, app_id, version)
-);
-
-CREATE UNIQUE INDEX knowledge_index_job_document_idx
-    ON platform.knowledge_index_job (
-        tenant_id, app_id, knowledge_base_id, document_id, document_version,
-        index_generation, config_version
-    );
-
-CREATE INDEX knowledge_index_job_pending_idx
-    ON platform.knowledge_index_job (status, next_attempt_at, job_id)
-    WHERE status IN ('PENDING', 'RUNNING');
 
 CREATE TABLE platform.channel_identity (
     tenant_id TEXT NOT NULL,
@@ -514,37 +410,17 @@ CREATE TABLE platform.channel_inbox (
 CREATE INDEX channel_inbox_request_idx
     ON platform.channel_inbox (tenant_id, app_id, request_id);
 
-CREATE TABLE platform.reply_projection_state (
-    tenant_id TEXT NOT NULL,
-    app_id TEXT NOT NULL,
-    binding_id TEXT NOT NULL,
-    request_id TEXT NOT NULL CHECK (request_id <> ''),
-    last_event_seq BIGINT NOT NULL DEFAULT 0 CHECK (last_event_seq >= 0),
-    content TEXT NOT NULL DEFAULT '',
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (tenant_id, app_id, binding_id, request_id),
-    FOREIGN KEY (tenant_id, app_id, request_id)
-        REFERENCES platform.execution (tenant_id, app_id, request_id),
-    FOREIGN KEY (tenant_id, app_id, binding_id)
-        REFERENCES platform.channel_binding (tenant_id, app_id, binding_id)
-);
-
 CREATE TABLE platform.reply_outbox (
     reply_id TEXT PRIMARY KEY CHECK (reply_id <> ''),
-    logical_reply_id TEXT NOT NULL CHECK (logical_reply_id <> ''),
     tenant_id TEXT NOT NULL,
     app_id TEXT NOT NULL,
     binding_id TEXT NOT NULL,
     channel TEXT NOT NULL CHECK (channel <> ''),
     request_id TEXT NOT NULL CHECK (request_id <> ''),
     source_event_id TEXT NOT NULL CHECK (source_event_id <> ''),
-    part_no BIGINT NOT NULL CHECK (part_no > 0),
     revision BIGINT NOT NULL CHECK (revision > 0),
-    operation TEXT NOT NULL CHECK (operation IN ('SEND', 'UPDATE', 'FINALIZE')),
-    reply_kind TEXT NOT NULL CHECK (reply_kind IN ('text', 'card', 'artifact', 'fallback_text')),
     target_ref JSONB NOT NULL CHECK (jsonb_typeof(target_ref) = 'object'),
     payload JSONB NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
-    artifact_ref TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'PENDING'
         CHECK (status IN ('PENDING', 'SENDING', 'SENT', 'PERMANENTLY_FAILED')),
     attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
@@ -567,7 +443,7 @@ CREATE TABLE platform.reply_outbox (
     ),
     UNIQUE (
         tenant_id, app_id, binding_id, request_id, source_event_id,
-        logical_reply_id, part_no, revision, operation
+        revision
     )
 );
 
@@ -576,7 +452,7 @@ CREATE INDEX reply_outbox_claim_idx
 
 CREATE INDEX reply_outbox_order_idx
     ON platform.reply_outbox (
-        tenant_id, app_id, binding_id, request_id, logical_reply_id, part_no, operation
+        tenant_id, app_id, binding_id, request_id, revision
     );
 
 CREATE TABLE platform.inbound_artifact (

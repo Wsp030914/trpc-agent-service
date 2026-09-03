@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -53,6 +54,30 @@ var (
 type Message struct {
 	Text         string
 	ArtifactRefs []string
+}
+
+// ParseArtifactRef validates and splits one pinned artifact reference.
+func ParseArtifactRef(ref string) (string, int, error) {
+	if !utf8.ValidString(ref) {
+		return "", 0, errors.New("artifact ref is not valid utf-8")
+	}
+	if !strings.HasPrefix(ref, "artifact://") {
+		return "", 0, errors.New("artifact ref must use artifact://")
+	}
+	rest := strings.TrimPrefix(ref, "artifact://")
+	separator := strings.LastIndex(rest, "@")
+	if separator <= 0 || separator == len(rest)-1 {
+		return "", 0, errors.New("artifact ref must pin a version")
+	}
+	name := rest[:separator]
+	if strings.ContainsAny(name, "@\x00\r\n\t") || strings.Contains(name, "..") {
+		return "", 0, errors.New("artifact ref name is invalid")
+	}
+	version, err := strconv.Atoi(rest[separator+1:])
+	if err != nil || version < 0 {
+		return "", 0, errors.New("artifact ref version is invalid")
+	}
+	return name, version, nil
 }
 
 // Validate checks whether Message contains a platform-approved user payload.
@@ -270,7 +295,7 @@ func (r AdmissionRequest) Validate() error {
 		return errors.New("channel input message does not match gateway message")
 	}
 	// Unsupported provider payloads are durably classified by PostgreSQL so
-	// they can be audited without creating an execution. Validate executable
+	// they can be rejected without creating an execution. Validate executable
 	// content here, while allowing an empty normalized payload to reach that
 	// classification path.
 	if r.Message.Text != "" || len(r.Message.ArtifactRefs) > 0 {
@@ -337,35 +362,20 @@ type Admitter interface {
 	Admit(ctx context.Context, request AdmissionRequest) (AdmissionResult, error)
 }
 
-// Option configures a Gateway.
-type Option func(*Gateway)
-
-// WithAdmitter sets the authoritative backend used for atomic request
-// admission.
-func WithAdmitter(admitter Admitter) Option {
-	return func(g *Gateway) {
-		g.Admitter = admitter
-	}
-}
-
 // Gateway converts trusted requests into atomic admission commands.
 type Gateway struct {
-	Admitter Admitter
+	admitter Admitter
 }
 
-// New creates a Gateway with the provided options.
-func New(opts ...Option) *Gateway {
-	g := &Gateway{}
-	for _, opt := range opts {
-		opt(g)
-	}
-	return g
+// New creates a Gateway backed by the authoritative admission store.
+func New(admitter Admitter) *Gateway {
+	return &Gateway{admitter: admitter}
 }
 
 // Handle validates a request and submits it to the authoritative admission
 // backend. It never performs a separate in-memory enqueue.
 func (g Gateway) Handle(ctx context.Context, req Request) (AdmissionResult, error) {
-	if g.Admitter == nil {
+	if g.admitter == nil {
 		return AdmissionResult{}, ErrAdmitterRequired
 	}
 	if req.Tenant == nil {
@@ -402,7 +412,7 @@ func (g Gateway) Handle(ctx context.Context, req Request) (AdmissionResult, erro
 	if err := admissionRequest.Validate(); err != nil {
 		return AdmissionResult{}, err
 	}
-	result, err := g.Admitter.Admit(ctx, admissionRequest)
+	result, err := g.admitter.Admit(ctx, admissionRequest)
 	if err != nil {
 		return AdmissionResult{}, err
 	}

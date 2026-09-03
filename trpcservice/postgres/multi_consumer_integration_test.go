@@ -135,7 +135,7 @@ func TestTwoConsumersPreserveSessionLanes(t *testing.T) {
 	}
 	identity := seedRelayIntegrationScope(t, ctx, store)
 
-	gatewayService := gateway.New(gateway.WithAdmitter(store))
+	gatewayService := gateway.New(store)
 	admit := func(requestID, sessionID string, wantTurnSeq int64) {
 		t.Helper()
 		admission := identity
@@ -177,11 +177,11 @@ func TestTwoConsumersPreserveSessionLanes(t *testing.T) {
 	tracker := newLaneTracker()
 	executorA := newLaneTrackingExecutor(tracker, "worker-lane-a")
 	executorB := newLaneTrackingExecutor(tracker, "worker-lane-b")
-	consumerA, err := worker.NewConsumer(executorA, stream, store, "worker-lane-a", worker.WithConsumerPollInterval(10*time.Millisecond))
+	consumerA, err := worker.NewConsumer(executorA, stream, store, "worker-lane-a")
 	if err != nil {
 		t.Fatalf("new consumer a: %v", err)
 	}
-	consumerB, err := worker.NewConsumer(executorB, stream, store, "worker-lane-b", worker.WithConsumerPollInterval(10*time.Millisecond))
+	consumerB, err := worker.NewConsumer(executorB, stream, store, "worker-lane-b")
 	if err != nil {
 		t.Fatalf("new consumer b: %v", err)
 	}

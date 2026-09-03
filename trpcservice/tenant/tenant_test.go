@@ -160,11 +160,6 @@ func validAppConfig() tenant.AppConfig {
 			ExecutableTools: []string{"search"},
 		},
 		BackendConfig: validBackendConfig(),
-		Audit: tenant.AuditPolicy{
-			Enabled:       true,
-			RetentionDays: 30,
-			RedactPII:     true,
-		},
 		SecretRefs: []tenant.SecretRef{
 			{Name: "model-api-key", Version: "v1"},
 		},

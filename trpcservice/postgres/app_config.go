@@ -170,7 +170,6 @@ func (s *Store) ResolveAppConfig(
     model_config,
     tool_policy,
     backend_config,
-    audit_policy,
     secret_refs,
     channel_binding_ids,
     knowledge_base_ids
@@ -183,7 +182,6 @@ WHERE tenant_id = $1 AND app_id = $2 AND version = $3 AND status = 'PUBLISHED'`,
 		&encoded.modelConfig,
 		&encoded.toolPolicy,
 		&encoded.backendConfig,
-		&encoded.auditPolicy,
 		&encoded.secretRefs,
 		&encoded.channelBindingIDs,
 		&encoded.knowledgeBaseIDs,
@@ -209,14 +207,13 @@ type appConfigColumns struct {
 	modelConfig       []byte
 	toolPolicy        []byte
 	backendConfig     []byte
-	auditPolicy       []byte
 	secretRefs        []byte
 	channelBindingIDs []byte
 	knowledgeBaseIDs  []byte
 }
 
 func insertAppConfig(ctx context.Context, db databaseExecutor, cfg tenant.AppConfig) error {
-	modelConfig, toolPolicy, backendConfig, auditPolicy, secretRefs, bindings, knowledgeBaseIDs, err :=
+	modelConfig, toolPolicy, backendConfig, secretRefs, bindings, knowledgeBaseIDs, err :=
 		marshalAppConfig(cfg)
 	if err != nil {
 		return err
@@ -230,18 +227,16 @@ func insertAppConfig(ctx context.Context, db databaseExecutor, cfg tenant.AppCon
     model_config,
     tool_policy,
     backend_config,
-    audit_policy,
     secret_refs,
     channel_binding_ids,
     knowledge_base_ids
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		cfg.TenantID,
 		cfg.AppID,
 		cfg.Version,
 		modelConfig,
 		toolPolicy,
 		backendConfig,
-		auditPolicy,
 		secretRefs,
 		bindings,
 		knowledgeBaseIDs,
@@ -303,19 +298,12 @@ type backendRefDocument struct {
 	Options   map[string]string  `json:"options,omitempty"`
 }
 
-type auditPolicyDocument struct {
-	Enabled       bool `json:"enabled"`
-	RetentionDays int  `json:"retention_days"`
-	RedactPII     bool `json:"redact_pii"`
-}
-
 type secretRefDocument struct {
 	Name    string `json:"name"`
 	Version string `json:"version,omitempty"`
 }
 
 func marshalAppConfig(cfg tenant.AppConfig) (
-	[]byte,
 	[]byte,
 	[]byte,
 	[]byte,
@@ -331,22 +319,18 @@ func marshalAppConfig(cfg tenant.AppConfig) (
 		Parameters: cfg.Model.Parameters,
 	})
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal model config: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal model config: %w", err)
 	}
 	toolPolicy, err := json.Marshal(toolPolicyDocument{
 		VisibleTools:    cfg.Tools.VisibleTools,
 		ExecutableTools: cfg.Tools.ExecutableTools,
 	})
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal tool policy: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal tool policy: %w", err)
 	}
 	backendConfig, err := json.Marshal(newBackendConfigDocument(cfg.BackendConfig))
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal backend config: %w", err)
-	}
-	auditPolicy, err := marshalAuditPolicy(cfg.Audit)
-	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal backend config: %w", err)
 	}
 	var secretRefDocuments []secretRefDocument
 	if cfg.SecretRefs != nil {
@@ -357,11 +341,11 @@ func marshalAppConfig(cfg tenant.AppConfig) (
 	}
 	encodedSecretRefs, err := json.Marshal(secretRefDocuments)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal secret refs: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal secret refs: %w", err)
 	}
 	bindings, err := json.Marshal(cfg.ChannelBinding)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal channel bindings: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal channel bindings: %w", err)
 	}
 	knowledgeBaseIDsValue := cfg.KnowledgeBaseIDs
 	if knowledgeBaseIDsValue == nil {
@@ -369,9 +353,9 @@ func marshalAppConfig(cfg tenant.AppConfig) (
 	}
 	knowledgeBaseIDs, err := json.Marshal(knowledgeBaseIDsValue)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal knowledge base ids: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal knowledge base ids: %w", err)
 	}
-	return modelConfig, toolPolicy, backendConfig, auditPolicy, encodedSecretRefs, bindings, knowledgeBaseIDs, nil
+	return modelConfig, toolPolicy, backendConfig, encodedSecretRefs, bindings, knowledgeBaseIDs, nil
 }
 
 func unmarshalAppConfig(
@@ -391,10 +375,6 @@ func unmarshalAppConfig(
 	var backendDocument backendConfigDocument
 	if err := json.Unmarshal(encoded.backendConfig, &backendDocument); err != nil {
 		return tenant.AppConfig{}, fmt.Errorf("unmarshal backend config: %w", err)
-	}
-	audit, err := unmarshalAuditPolicy(encoded.auditPolicy)
-	if err != nil {
-		return tenant.AppConfig{}, err
 	}
 	var secretDocuments []secretRefDocument
 	if err := json.Unmarshal(encoded.secretRefs, &secretDocuments); err != nil {
@@ -433,7 +413,6 @@ func unmarshalAppConfig(
 			ExecutableTools: toolDocument.ExecutableTools,
 		},
 		BackendConfig:    backendDocument.value(),
-		Audit:            audit,
 		SecretRefs:       refs,
 		ChannelBinding:   channelBinding,
 		KnowledgeBaseIDs: knowledgeBaseIDList,
@@ -450,34 +429,6 @@ func newSecretRefDocument(ref tenant.SecretRef) secretRefDocument {
 
 func (d secretRefDocument) value() tenant.SecretRef {
 	return tenant.SecretRef{Name: d.Name, Version: d.Version}
-}
-
-func marshalAuditPolicy(policy tenant.AuditPolicy) ([]byte, error) {
-	encoded, err := json.Marshal(auditPolicyDocument{
-		Enabled:       policy.Enabled,
-		RetentionDays: policy.RetentionDays,
-		RedactPII:     policy.RedactPII,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal audit policy: %w", err)
-	}
-	return encoded, nil
-}
-
-func unmarshalAuditPolicy(encoded []byte) (tenant.AuditPolicy, error) {
-	var document auditPolicyDocument
-	if err := json.Unmarshal(encoded, &document); err != nil {
-		return tenant.AuditPolicy{}, fmt.Errorf("unmarshal audit policy: %w", err)
-	}
-	policy := tenant.AuditPolicy{
-		Enabled:       document.Enabled,
-		RetentionDays: document.RetentionDays,
-		RedactPII:     document.RedactPII,
-	}
-	if err := policy.Validate(); err != nil {
-		return tenant.AuditPolicy{}, fmt.Errorf("stored audit policy: %w", err)
-	}
-	return policy, nil
 }
 
 func newBackendConfigDocument(config tenant.BackendConfig) backendConfigDocument {

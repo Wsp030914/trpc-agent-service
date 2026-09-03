@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
@@ -20,7 +19,8 @@ type Resolver interface {
 
 // Router selects a Session resolver by backend provider.
 type Router struct {
-	resolvers map[string]Resolver
+	postgres Resolver
+	redis    Resolver
 }
 
 const (
@@ -28,26 +28,16 @@ const (
 	redisProvider    = "redis"
 )
 
-// NewRouter creates a Session resolver router from explicitly registered providers.
-func NewRouter(resolvers map[string]Resolver) (*Router, error) {
-	if len(resolvers) == 0 {
-		return nil, errors.New("session resolvers are required")
+// NewRouter creates the built-in PostgreSQL and Redis Session routes.
+func NewRouter(postgres Resolver, redis Resolver) (*Router, error) {
+	if postgres == nil || redis == nil {
+		return nil, errors.New("postgres and redis session providers are required")
 	}
-	cloned := make(map[string]Resolver, len(resolvers))
-	for provider, resolver := range resolvers {
-		if provider == "" || resolver == nil {
-			return nil, errors.New("session provider and resolver are required")
-		}
-		if reflect.TypeOf(resolver).Kind() != reflect.Pointer {
-			return nil, errors.New("session resolver must be a pointer")
-		}
-		cloned[provider] = resolver
-	}
-	return &Router{resolvers: cloned}, nil
+	return &Router{postgres: postgres, redis: redis}, nil
 }
 
 // ValidateBackend checks whether the platform's built-in Session provider
-// registry can resolve ref.
+// providers can resolve ref.
 func ValidateBackend(ref tenant.BackendRef) error {
 	if err := ref.Validate(); err != nil {
 		return err
@@ -73,29 +63,32 @@ func (r *Router) ResolveSession(ctx context.Context, exec worker.Execution) (fra
 		return nil, errors.New("session router is not initialized")
 	}
 	provider := exec.Config.BackendConfig.Session.Provider
-	resolver := r.resolvers[provider]
-	if resolver == nil {
+	var resolver Resolver
+	switch provider {
+	case postgresProvider:
+		resolver = r.postgres
+	case redisProvider:
+		resolver = r.redis
+	default:
 		return nil, fmt.Errorf("session provider %q is not supported", provider)
+	}
+	if resolver == nil {
+		return nil, fmt.Errorf("session provider %q is not configured", provider)
 	}
 	return resolver.ResolveSession(ctx, exec)
 }
 
-// Close closes every resolver owned by Router.
+// Close closes both built-in providers owned by Router.
 func (r *Router) Close() error {
 	if r == nil {
 		return nil
 	}
-	closed := make(map[uintptr]struct{}, len(r.resolvers))
 	var errs []error
-	for _, resolver := range r.resolvers {
-		value := reflect.ValueOf(resolver).Pointer()
-		if _, ok := closed[value]; ok {
-			continue
-		}
-		closed[value] = struct{}{}
-		if err := resolver.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	if r.postgres != nil {
+		errs = append(errs, r.postgres.Close())
+	}
+	if r.redis != nil {
+		errs = append(errs, r.redis.Close())
 	}
 	return errors.Join(errs...)
 }

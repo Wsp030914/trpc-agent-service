@@ -171,30 +171,6 @@ func TestServiceSaveArtifactEncodesStoragePathComponents(t *testing.T) {
 	}
 }
 
-func TestServiceSaveArtifactQueuesCleanupWhenCompensationFails(t *testing.T) {
-	metadataErr := errors.New("metadata unavailable")
-	deleteErr := errors.New("cos delete unavailable")
-	storage := &fakeStorage{deleteErr: deleteErr}
-	metadata := &fakeMetadata{createErr: metadataErr}
-	service := newTestService(t, storage, metadata)
-
-	_, err := service.SaveArtifact(
-		context.Background(), testSessionInfo(t, testScope()), "report.txt", &frameworkartifact.Artifact{},
-	)
-	if !errors.Is(err, metadataErr) || !errors.Is(err, deleteErr) {
-		t.Fatalf("SaveArtifact error = %v", err)
-	}
-	if metadata.cleanupCalls != 1 {
-		t.Fatalf("cleanup enqueue calls = %d, want 1", metadata.cleanupCalls)
-	}
-	if storage.deleteVersionCalls != 1 || storage.deleteCalls != 0 {
-		t.Fatalf("storage deletion calls = version %d all %d, want 1 and 0", storage.deleteVersionCalls, storage.deleteCalls)
-	}
-	if metadata.cleanup.Version != 0 || metadata.cleanup.ObjectKey == "" {
-		t.Fatalf("cleanup record = %#v, want exact failed version", metadata.cleanup)
-	}
-}
-
 func TestServiceSaveArtifactReportsAbandonFailure(t *testing.T) {
 	metadataErr := errors.New("metadata unavailable")
 	abandonErr := errors.New("abandon unavailable")
@@ -211,15 +187,17 @@ func TestServiceSaveArtifactReportsAbandonFailure(t *testing.T) {
 	if metadata.abandonCalls != 1 {
 		t.Fatalf("abandon calls = %d, want 1", metadata.abandonCalls)
 	}
-	if metadata.cleanupCalls != 0 || storage.deleteVersionCalls != 1 {
-		t.Fatalf("compensation calls = cleanup %d, delete version %d, want 0 and 1", metadata.cleanupCalls, storage.deleteVersionCalls)
+	if storage.deleteVersionCalls != 1 {
+		t.Fatalf("compensation delete version calls = %d, want 1", storage.deleteVersionCalls)
 	}
 }
 
 func TestExecutionResolverBindsArtifactServiceToTrustedSession(t *testing.T) {
 	storage := &fakeStorage{}
 	metadata := &fakeMetadata{}
-	resolver, err := NewExecutionResolver(&fakeStorageResolver{service: storage}, metadata)
+	resolver, err := NewExecutionResolver(func(context.Context, worker.Execution) (frameworkartifact.Service, error) {
+		return storage, nil
+	}, metadata)
 	if err != nil {
 		t.Fatalf("NewExecutionResolver: %v", err)
 	}
@@ -249,38 +227,6 @@ func TestExecutionResolverBindsArtifactServiceToTrustedSession(t *testing.T) {
 	}
 }
 
-func TestExecutionResolverDeleteCleanupUsesExactVersionWhenRecorded(t *testing.T) {
-	storage := &fakeStorage{}
-	resolver, err := NewExecutionResolver(&fakeStorageResolver{service: storage}, &fakeMetadata{})
-	if err != nil {
-		t.Fatalf("NewExecutionResolver: %v", err)
-	}
-	exec := testArtifactExecution()
-	record := cleanupRecord(exec, "object-key", 0)
-	if err := resolver.DeleteCleanup(context.Background(), exec, record); err != nil {
-		t.Fatalf("DeleteCleanup: %v", err)
-	}
-	if storage.deleteVersionCalls != 1 || storage.deleteCalls != 0 {
-		t.Fatalf("storage deletion calls = version %d all %d, want 1 and 0", storage.deleteVersionCalls, storage.deleteCalls)
-	}
-}
-
-func TestExecutionResolverDeleteCleanupRejectsAllVersions(t *testing.T) {
-	storage := &fakeStorage{}
-	resolver, err := NewExecutionResolver(&fakeStorageResolver{service: storage}, &fakeMetadata{})
-	if err != nil {
-		t.Fatalf("NewExecutionResolver: %v", err)
-	}
-	exec := testArtifactExecution()
-	record := cleanupRecord(exec, "", -1)
-	if err := resolver.DeleteCleanup(context.Background(), exec, record); err == nil {
-		t.Fatal("DeleteCleanup accepted an all-version record")
-	}
-	if storage.deleteVersionCalls != 0 || storage.deleteCalls != 0 {
-		t.Fatalf("storage deletion calls = version %d all %d, want 0 and 0", storage.deleteVersionCalls, storage.deleteCalls)
-	}
-}
-
 func newTestService(t *testing.T, storage frameworkartifact.Service, metadata MetadataStore) *Service {
 	t.Helper()
 	service, err := NewService(storage, metadata, Access{
@@ -293,21 +239,6 @@ func newTestService(t *testing.T, storage frameworkartifact.Service, metadata Me
 		t.Fatalf("NewService: %v", err)
 	}
 	return service
-}
-
-func cleanupRecord(exec worker.Execution, objectKey string, version int) CleanupRecord {
-	return CleanupRecord{
-		ID:                 "cleanup-1",
-		TenantID:           exec.Tenant.TenantID,
-		AppID:              exec.Tenant.AppID,
-		ConfigVersion:      exec.Tenant.ConfigVersion,
-		SessionPrincipalID: exec.Tenant.SessionPrincipalID,
-		SessionID:          exec.Tenant.SessionID,
-		Filename:           "report.txt",
-		ObjectKey:          objectKey,
-		Version:            version,
-		Status:             CleanupPending,
-	}
 }
 
 func testScope() tenant.Scope {
@@ -409,20 +340,11 @@ func (*fakeStorage) ObjectKey(frameworkartifact.SessionInfo, string, int) (strin
 type fakeMetadata struct {
 	reserveCalls int
 	abandonCalls int
-	cleanupCalls int
 	findCalls    int
 	keys         []string
 	findErr      error
 	createErr    error
 	abandonErr   error
-	cleanupErr   error
-	cleanup      CleanupRecord
-}
-
-func (m *fakeMetadata) EnqueueArtifactCleanup(_ context.Context, record CleanupRecord) error {
-	m.cleanupCalls++
-	m.cleanup = record
-	return m.cleanupErr
 }
 
 func (m *fakeMetadata) ReserveArtifact(_ context.Context, access Access, filename, mimeType string, size int64) (Record, error) {
@@ -441,14 +363,6 @@ func (m *fakeMetadata) PublishArtifact(context.Context, Record) error { return m
 func (m *fakeMetadata) AbandonArtifact(context.Context, Record) error {
 	m.abandonCalls++
 	return m.abandonErr
-}
-
-type fakeStorageResolver struct {
-	service frameworkartifact.Service
-}
-
-func (r *fakeStorageResolver) ResolveArtifact(context.Context, worker.Execution) (frameworkartifact.Service, error) {
-	return r.service, nil
 }
 
 func testArtifactExecution() worker.Execution {
@@ -504,4 +418,3 @@ func (*fakeMetadata) MarkArtifactsDeleted(_ context.Context, access Access, file
 
 var _ frameworkartifact.Service = (*fakeStorage)(nil)
 var _ MetadataStore = (*fakeMetadata)(nil)
-var _ StorageResolver = (*fakeStorageResolver)(nil)

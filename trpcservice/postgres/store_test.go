@@ -94,11 +94,6 @@ func TestAppConfigPersistenceDocumentRoundTrip(t *testing.T) {
 						Name:     "memory-redis",
 					},
 				},
-				Audit: tenant.AuditPolicy{
-					Enabled:       true,
-					RetentionDays: 90,
-					RedactPII:     true,
-				},
 				SecretRefs: []tenant.SecretRef{{Name: "model-key", Version: "3"}},
 				ChannelBinding: []string{
 					"wecom-support",
@@ -109,7 +104,7 @@ func TestAppConfigPersistenceDocumentRoundTrip(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			modelConfig, toolPolicy, backendConfig, auditPolicy, secretRefs, bindings, knowledgeBaseIDs, err :=
+			modelConfig, toolPolicy, backendConfig, secretRefs, bindings, knowledgeBaseIDs, err :=
 				marshalAppConfig(tt.cfg)
 			if err != nil {
 				t.Fatalf("marshal app config: %v", err)
@@ -122,7 +117,6 @@ func TestAppConfigPersistenceDocumentRoundTrip(t *testing.T) {
 					modelConfig:       modelConfig,
 					toolPolicy:        toolPolicy,
 					backendConfig:     backendConfig,
-					auditPolicy:       auditPolicy,
 					secretRefs:        secretRefs,
 					channelBindingIDs: bindings,
 					knowledgeBaseIDs:  knowledgeBaseIDs,

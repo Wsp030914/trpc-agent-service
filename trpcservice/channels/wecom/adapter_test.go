@@ -298,10 +298,10 @@ func TestOutboundClientUsesOneActiveResponseCall(t *testing.T) {
 		_, _ = w.Write([]byte(`{"errcode":0}`))
 	}))
 	defer server.Close()
-	reply := testReply(channels.ReplyOperationSend, channels.ReplyKindText)
+	reply := testReply()
 	client := NewOutboundClient(server.Client())
 	client.targetValidator = func(string) error { return nil }
-	receipt, err := client.SendOnce(context.Background(), reply, server.URL, channels.OutboundContext{})
+	receipt, err := client.SendOnce(context.Background(), reply, server.URL)
 	if err != nil {
 		t.Fatalf("send reply: %v", err)
 	}
@@ -443,7 +443,6 @@ func (c *fakeOutboundClient) SendOnce(
 	_ context.Context,
 	_ channels.Reply,
 	_ string,
-	_ channels.OutboundContext,
 ) (channels.ProviderReceipt, error) {
 	c.calls++
 	if c.err != nil {
@@ -456,7 +455,7 @@ func TestFakeOutboundClientPropagatesProviderError(t *testing.T) {
 	want := &ProviderSendError{StatusCode: http.StatusTooManyRequests, Code: 45009, Retryable: true}
 	fake := &fakeOutboundClient{err: want}
 	var client channels.ProviderOutboundClient = fake
-	_, err := client.SendOnce(context.Background(), testReply(channels.ReplyOperationSend, channels.ReplyKindText), "https://example.test/reply", channels.OutboundContext{})
+	_, err := client.SendOnce(context.Background(), testReply(), "https://example.test/reply")
 	var got *ProviderSendError
 	if !errors.As(err, &got) || got != want || !got.Retryable || got.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("provider error=%v, want %#v", err, want)
@@ -494,7 +493,7 @@ func newTestAdapter(t *testing.T, opts ...AdapterOption) (*Adapter, callbackCode
 		"encoding-aes-key": base64Raw(key),
 	}}
 	admitter := &testAdmitter{}
-	admissionGateway := gateway.New(gateway.WithAdmitter(admitter))
+	admissionGateway := gateway.New(admitter)
 	adapter, err := NewAdapter(resolver, admissionGateway, platformsecret.SecretProvider(secrets), append(opts, WithClock(func() time.Time { return testNow }))...)
 	if err != nil {
 		t.Fatalf("new adapter: %v", err)
@@ -603,7 +602,7 @@ func testBindingSnapshot() channels.BindingSnapshot {
 	}}
 }
 
-func testReply(operation channels.ReplyOperation, kind channels.ReplyKind) channels.Reply {
+func testReply() channels.Reply {
 	return channels.Reply{
 		TenantID:        "tenant-a",
 		AppID:           "app-a",
@@ -613,11 +612,7 @@ func testReply(operation channels.ReplyOperation, kind channels.ReplyKind) chann
 		BindingID:       testBindingID,
 		BindingRevision: 3,
 		ReplyID:         "reply-1",
-		LogicalReplyID:  "logical-1",
-		PartNo:          1,
 		Revision:        1,
-		Operation:       operation,
-		Kind:            kind,
 		Target: channels.ReplyTarget{
 			Kind:             channels.TargetKindMessage,
 			InternalEntityID: "request-1",

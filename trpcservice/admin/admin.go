@@ -45,19 +45,6 @@ type dataMigrationRepository interface {
 	BeginDataMigration(context.Context, string, string, string, string, time.Time, time.Duration) (migration.Record, error)
 }
 
-// ToolPolicyValidator checks whether an application tool policy can be backed
-// by the tools registered in the deployed runtime.
-type ToolPolicyValidator interface {
-	// ValidateToolPolicy rejects policies that the deployed runtime cannot serve.
-	ValidateToolPolicy(context.Context, tenant.ToolPolicy) error
-}
-
-// AppConfigToolPolicyValidator is used when tool availability also depends on
-// immutable application backends, such as the knowledge-search tool.
-type AppConfigToolPolicyValidator interface {
-	ValidateAppConfigTools(context.Context, tenant.AppConfig) error
-}
-
 type inputError struct {
 	cause error
 }
@@ -126,8 +113,6 @@ func prepareChannelBinding(binding channels.Binding) (channels.Binding, error) {
 type API struct {
 	Bindings   config.BindingResolver
 	Repository Repository
-	// ToolPolicyValidator rejects policies unsupported by the deployed runtime.
-	ToolPolicyValidator ToolPolicyValidator
 }
 
 // ValidateAppConfig checks app config fields and cross-resource references.
@@ -137,17 +122,6 @@ func (a API) ValidateAppConfig(ctx context.Context, cfg tenant.AppConfig) error 
 	}
 	if err := platformsession.ValidateBackend(cfg.BackendConfig.Session); err != nil {
 		return fmt.Errorf("session backend provider: %w", err)
-	}
-	if a.ToolPolicyValidator != nil {
-		var err error
-		if validator, ok := a.ToolPolicyValidator.(AppConfigToolPolicyValidator); ok {
-			err = validator.ValidateAppConfigTools(ctx, cfg)
-		} else {
-			err = a.ToolPolicyValidator.ValidateToolPolicy(ctx, cfg.Tools)
-		}
-		if err != nil {
-			return fmt.Errorf("tool policy runtime: %w", err)
-		}
 	}
 	if !cfg.BackendConfig.Memory.IsZero() {
 		if err := memorytencentdb.ValidateBackend(cfg.BackendConfig.Memory); err != nil {
@@ -162,9 +136,6 @@ func (a API) ValidateAppConfig(ctx context.Context, cfg tenant.AppConfig) error 
 	if !cfg.BackendConfig.Knowledge.IsZero() {
 		if err := knowledgeqdrant.ValidateBackend(cfg.BackendConfig.Knowledge); err != nil {
 			return fmt.Errorf("knowledge backend: %w", err)
-		}
-		if cfg.BackendConfig.Artifact.IsZero() {
-			return errors.New("knowledge backend requires the artifact cos backend for source objects")
 		}
 	}
 	if err := config.ValidateAppConfigBindings(ctx, cfg, a.Bindings); err != nil {

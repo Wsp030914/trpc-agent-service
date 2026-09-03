@@ -14,7 +14,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
+	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
+	channelsattachments "github.com/liuzengh/trpc-agent-service/trpcservice/channels/attachments"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/feishu"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
@@ -33,7 +35,7 @@ const (
 	envRedisStream       = "TRPC_AGENT_SERVICE_REDIS_STREAM"
 	envRedisGroup        = "TRPC_AGENT_SERVICE_REDIS_GROUP"
 	envDispatcherID      = "TRPC_AGENT_SERVICE_DISPATCHER_ID"
-	envHealthAddr        = "TRPC_AGENT_SERVICE_HEALTH_ADDR"
+	envHTTPAddr          = "TRPC_AGENT_SERVICE_HTTP_ADDR"
 	envWorkerID          = "TRPC_AGENT_SERVICE_WORKER_ID"
 	envAdminToken        = "TRPC_AGENT_SERVICE_ADMIN_TOKEN"
 	envTencentDBGateways = "TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS"
@@ -41,24 +43,14 @@ const (
 	envCOSEndpoints      = "TRPC_AGENT_SERVICE_COS_ENDPOINTS"
 	envQdrantEndpoints   = "TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS"
 
-	defaultHealthAddr       = ":8080"
-	defaultRedisStream      = "trpc-agent-service:dispatch"
-	defaultRedisGroup       = "workers"
-	healthCheckTimeout      = 2 * time.Second
-	dispatchLeaseDuration   = 30 * time.Second
-	sessionLeaseDuration    = 30 * time.Second
-	defaultShutdownTimeout  = 30 * time.Second
-	dataMigrationLease      = 30 * time.Second
-	dataMigrationPoll       = time.Second
-	artifactCleanupLease    = 30 * time.Second
-	artifactCleanupTimeout  = 15 * time.Second
-	artifactCleanupRetry    = time.Minute
-	knowledgeIndexLease     = 30 * time.Second
-	knowledgeIndexRetry     = time.Minute
-	knowledgeIndexAttempts  = 5
-	knowledgeChunkSize      = 1000
-	knowledgeChunkOverlap   = 100
-	healthReadHeaderTimeout = 5 * time.Second
+	defaultHTTPAddr        = ":8080"
+	defaultRedisStream     = "trpc-agent-service:dispatch"
+	defaultRedisGroup      = "workers"
+	dispatchLeaseDuration  = 30 * time.Second
+	sessionLeaseDuration   = 30 * time.Second
+	defaultShutdownTimeout = 30 * time.Second
+	dataMigrationLease     = 30 * time.Second
+	dataMigrationPoll      = time.Second
 )
 
 var errWorkerShutdownTimeout = errors.New("worker did not stop before shutdown deadline")
@@ -78,7 +70,7 @@ type serviceConfig struct {
 	RedisStream     string
 	RedisGroup      string
 	DispatcherID    string
-	HealthAddr      string
+	HTTPAddr        string
 	WorkerID        string
 	AdminToken      string
 	ShutdownTimeout time.Duration
@@ -116,7 +108,7 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 		RedisStream:     getenv(envRedisStream),
 		RedisGroup:      getenv(envRedisGroup),
 		DispatcherID:    getenv(envDispatcherID),
-		HealthAddr:      getenv(envHealthAddr),
+		HTTPAddr:        getenv(envHTTPAddr),
 		WorkerID:        getenv(envWorkerID),
 		AdminToken:      getenv(envAdminToken),
 		ShutdownTimeout: defaultShutdownTimeout,
@@ -136,8 +128,8 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 	if config.RedisGroup == "" {
 		config.RedisGroup = defaultRedisGroup
 	}
-	if config.HealthAddr == "" {
-		config.HealthAddr = defaultHealthAddr
+	if config.HTTPAddr == "" {
+		config.HTTPAddr = defaultHTTPAddr
 	}
 	if config.Role.runsWorker() && config.WorkerID == "" {
 		return serviceConfig{}, fmt.Errorf("%s is required for worker role", envWorkerID)
@@ -170,12 +162,6 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	telemetry, err := startTelemetry(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { serviceErr = errors.Join(serviceErr, telemetry.close()) }()
-
 	pool, err := pgxpool.New(ctx, config.PostgresDSN)
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
@@ -207,6 +193,12 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	if err := store.Migrate(ctx); err != nil {
 		return fmt.Errorf("migrate postgres: %w", err)
 	}
+	cosEndpoints := environmentCOSEndpointResolver{getenv: os.Getenv}
+	artifacts, err := artifactcos.NewResolver(secrets, cosEndpoints)
+	if err != nil {
+		return err
+	}
+	defer func() { serviceErr = errors.Join(serviceErr, artifacts.Close()) }()
 	redisClient, err := platformredis.NewClient(ctx, config.RedisURL)
 	if err != nil {
 		return fmt.Errorf("connect redis: %w", err)
@@ -221,7 +213,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	}
 	var ingressHandler, adminHandler http.Handler
 	if config.Role.runsGateway() {
-		ingressHandler, err = newGatewayHandler(store)
+		ingressHandler, err = newGatewayHandler(store, artifacts)
 		if err != nil {
 			return err
 		}
@@ -231,15 +223,14 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		}
 	}
 
-	state := &healthState{check: readinessCheck(pool, redisClient)}
-	health, err := startHealthServer(config.HealthAddr, state, ingressHandler, adminHandler)
+	server, err := startServiceServer(config.HTTPAddr, ingressHandler, adminHandler)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
 		defer cancel()
-		serviceErr = errors.Join(serviceErr, health.shutdown(shutdownCtx))
+		serviceErr = errors.Join(serviceErr, server.shutdown(shutdownCtx))
 	}()
 
 	var runtime *workerRuntime
@@ -257,6 +248,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 			stream:            stream,
 			owner:             config.WorkerID,
 			getenv:            os.Getenv,
+			artifacts:         artifacts,
 			defaultSessionDSN: config.PostgresDSN,
 			defaultRedisURL:   config.RedisURL,
 		})
@@ -278,24 +270,24 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		go func() { done <- dispatchRelay.Run(componentCtx) }()
 		relayDone = done
 	}
-	state.ready.Store(true)
-	log.Printf("trpc-agent-service %s role=%s health=%s", trpcservice.Version, config.Role, config.HealthAddr)
+	log.Printf("trpc-agent-service %s role=%s http=%s", trpcservice.Version, config.Role, config.HTTPAddr)
 	if runtime == nil {
-		return waitForGatewayShutdown(componentCtx, health, state, config.ShutdownTimeout, relayDone)
+		return waitForGatewayShutdown(componentCtx, server, config.ShutdownTimeout, relayDone)
 	}
-	return runWorkerUntilShutdown(componentCtx, runtime, health, state, config.ShutdownTimeout, relayDone)
+	return runWorkerUntilShutdown(componentCtx, runtime, server, config.ShutdownTimeout, relayDone)
 }
 
-func newGatewayHandler(store *postgres.Store) (http.Handler, error) {
-	if store == nil {
-		return nil, errors.New("postgres store is required")
+func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (http.Handler, error) {
+	if store == nil || artifacts == nil {
+		return nil, errors.New("gateway dependencies are required")
 	}
 	events, err := postgres.NewExecutionEventJournal(store)
 	if err != nil {
 		return nil, err
 	}
+	admitter := gateway.New(store)
 	queued, err := gateway.NewQueuedRunner(
-		gateway.New(gateway.WithAdmitter(store)),
+		admitter,
 		events,
 	)
 	if err != nil {
@@ -309,13 +301,17 @@ func newGatewayHandler(store *postgres.Store) (http.Handler, error) {
 		return nil, err
 	}
 	secrets := environmentSecretProvider{getenv: os.Getenv}
-	attachmentIngestor, err := newProductionAttachmentIngestor(store, secrets)
+	attachmentIngestor, err := channelsattachments.NewIngestor(
+		store,
+		secrets,
+		artifacts,
+	)
 	if err != nil {
 		return nil, err
 	}
 	wecomAdapter, err := wecom.NewAdapter(
 		store,
-		gateway.New(gateway.WithAdmitter(store)),
+		admitter,
 		secrets,
 		wecom.WithAttachmentIngestor(attachmentIngestor),
 	)
@@ -324,7 +320,7 @@ func newGatewayHandler(store *postgres.Store) (http.Handler, error) {
 	}
 	feishuAdapter, err := feishu.NewAdapter(
 		store,
-		gateway.New(gateway.WithAdmitter(store)),
+		admitter,
 		secrets,
 		feishu.WithAttachmentIngestor(attachmentIngestor),
 		feishu.WithRecallAdmitter(store),
@@ -344,38 +340,33 @@ func newAdminHandler(store *postgres.Store, token string) (http.Handler, error) 
 		return nil, errors.New("postgres store is required")
 	}
 	return admin.NewHTTPHandler(admin.API{
-		Bindings:            store,
-		Repository:          store,
-		ToolPolicyValidator: runtimeToolResolver{},
+		Bindings:   store,
+		Repository: store,
 	}, token)
 }
 
 func waitForGatewayShutdown(
 	ctx context.Context,
-	health *healthServer,
-	state *healthState,
+	server *serviceServer,
 	shutdownTimeout time.Duration,
 	relayDone <-chan error,
 ) error {
 	select {
 	case err := <-relayDone:
-		state.ready.Store(false)
 		return err
 	case <-ctx.Done():
-		state.ready.Store(false)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		return health.shutdown(shutdownCtx)
-	case <-health.done:
-		return health.wait()
+		return server.shutdown(shutdownCtx)
+	case <-server.done:
+		return server.wait()
 	}
 }
 
 func runWorkerUntilShutdown(
 	ctx context.Context,
 	runtime *workerRuntime,
-	health *healthServer,
-	state *healthState,
+	server *serviceServer,
 	shutdownTimeout time.Duration,
 	relayDone <-chan error,
 ) error {
@@ -398,12 +389,10 @@ func runWorkerUntilShutdown(
 
 	select {
 	case err := <-relayDone:
-		state.ready.Store(false)
 		runtime.consumer.StopClaiming()
 		cancelRun()
 		return err
 	case err := <-done:
-		state.ready.Store(false)
 		cancelRun()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancelShutdown()
@@ -411,7 +400,6 @@ func runWorkerUntilShutdown(
 		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
 		return dataMigrationShutdownResult(errors.Join(err, replyShutdownError(replyErr, replyStopped)), migrationErr, stopped)
 	case err := <-replyDone:
-		state.ready.Store(false)
 		runtime.consumer.StopClaiming()
 		cancelRun()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -424,7 +412,6 @@ func runWorkerUntilShutdown(
 			migrationStopped,
 		)
 	case err := <-migrationDone:
-		state.ready.Store(false)
 		runtime.consumer.StopClaiming()
 		cancelRun()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -436,8 +423,7 @@ func runWorkerUntilShutdown(
 			err,
 			true,
 		)
-	case <-health.done:
-		state.ready.Store(false)
+	case <-server.done:
 		runtime.consumer.StopClaiming()
 		cancelRun()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -445,22 +431,21 @@ func runWorkerUntilShutdown(
 		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
 		migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
 		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
-		return dataMigrationShutdownResult(workerShutdownResult(errors.Join(health.wait(), replyShutdownError(replyErr, replyStopped)), workerErr, stopped), migrationErr, migrationStopped)
+		return dataMigrationShutdownResult(workerShutdownResult(errors.Join(server.wait(), replyShutdownError(replyErr, replyStopped)), workerErr, stopped), migrationErr, migrationStopped)
 	case <-ctx.Done():
-		state.ready.Store(false)
 		runtime.consumer.StopClaiming()
 	}
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancelShutdown()
-	healthErr := health.shutdown(shutdownCtx)
-	if healthErr != nil {
+	serverErr := server.shutdown(shutdownCtx)
+	if serverErr != nil {
 		cancelRun()
 	}
 	workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
 	migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
 	replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
-	return dataMigrationShutdownResult(workerShutdownResult(errors.Join(healthErr, replyShutdownError(replyErr, replyStopped)), workerErr, stopped), migrationErr, migrationStopped)
+	return dataMigrationShutdownResult(workerShutdownResult(errors.Join(serverErr, replyShutdownError(replyErr, replyStopped)), workerErr, stopped), migrationErr, migrationStopped)
 }
 
 func awaitWorkerExit(ctx context.Context, done <-chan error, cancel context.CancelFunc) (error, bool) {
@@ -524,11 +509,11 @@ func nonCancellationError(err error) error {
 	return err
 }
 
-func workerShutdownResult(healthErr, workerErr error, stopped bool) error {
+func workerShutdownResult(serverErr, workerErr error, stopped bool) error {
 	if !stopped {
-		return errors.Join(healthErr, fmt.Errorf("%w: %s", errWorkerShutdownTimeout, platformlog.SafeError(workerErr)))
+		return errors.Join(serverErr, fmt.Errorf("%w: %s", errWorkerShutdownTimeout, platformlog.SafeError(workerErr)))
 	}
-	return errors.Join(healthErr, workerErr)
+	return errors.Join(serverErr, workerErr)
 }
 
 func dataMigrationShutdownResult(baseErr, migrationErr error, stopped bool) error {

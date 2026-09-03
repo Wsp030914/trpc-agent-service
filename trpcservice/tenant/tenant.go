@@ -21,10 +21,9 @@ const (
 
 // Tenant describes the top-level isolation boundary for platform data.
 type Tenant struct {
-	ID     string      `json:"tenant_id"`
-	Name   string      `json:"name"`
-	Status Status      `json:"status"`
-	Audit  AuditPolicy `json:"audit"`
+	ID     string `json:"tenant_id"`
+	Name   string `json:"name"`
+	Status Status `json:"status"`
 }
 
 // Validate checks the persisted tenant configuration. The zero value is invalid.
@@ -37,9 +36,6 @@ func (t Tenant) Validate() error {
 	}
 	if !validStatus(t.Status) {
 		return errors.New("tenant status is invalid")
-	}
-	if err := t.Audit.Validate(); err != nil {
-		return fmt.Errorf("audit policy: %w", err)
 	}
 	return nil
 }
@@ -86,7 +82,6 @@ type AppConfig struct {
 	Model            ModelConfig   `json:"model"`
 	Tools            ToolPolicy    `json:"tools"`
 	BackendConfig    BackendConfig `json:"backend_config"`
-	Audit            AuditPolicy   `json:"audit"`
 	SecretRefs       []SecretRef   `json:"secret_refs"`
 	ChannelBinding   []string      `json:"channel_binding"`
 	KnowledgeBaseIDs []string      `json:"knowledge_base_ids"`
@@ -129,9 +124,6 @@ func (c AppConfig) Validate() error {
 	}
 	if err := validateUniqueStrings(c.KnowledgeBaseIDs, "knowledge base"); err != nil {
 		return err
-	}
-	if err := c.Audit.Validate(); err != nil {
-		return fmt.Errorf("audit policy: %w", err)
 	}
 	for i, ref := range c.SecretRefs {
 		if err := ref.Validate(); err != nil {
@@ -248,7 +240,7 @@ const (
 	BackendRedis BackendKind = "redis"
 	// BackendVector stores derived retrieval indexes.
 	BackendVector BackendKind = "vector"
-	// BackendObject stores artifacts and knowledge source objects.
+	// BackendObject stores artifacts and knowledge objects.
 	BackendObject BackendKind = "object"
 	// BackendExternal stores data through an external managed service.
 	BackendExternal BackendKind = "external"
@@ -337,21 +329,6 @@ func (c BackendConfig) Validate() error {
 	}
 	if err := validateOptionalBackendRef("artifact backend", c.Artifact); err != nil {
 		return err
-	}
-	return nil
-}
-
-// AuditPolicy controls tenant audit behavior.
-type AuditPolicy struct {
-	Enabled       bool `json:"enabled"`
-	RetentionDays int  `json:"retention_days"`
-	RedactPII     bool `json:"redact_pii"`
-}
-
-// Validate checks audit retention values. The zero value disables audit.
-func (p AuditPolicy) Validate() error {
-	if p.RetentionDays < 0 {
-		return errors.New("retention_days must be non-negative")
 	}
 	return nil
 }

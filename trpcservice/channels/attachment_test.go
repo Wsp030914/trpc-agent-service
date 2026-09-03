@@ -27,7 +27,7 @@ func TestArtifactIngestorMaterializesOnlyArtifactRefs(t *testing.T) {
 
 	writer := &recordingArtifactWriter{ref: "artifact://inbound/one"}
 	ingestor, err := channels.NewArtifactIngestor(
-		channels.MediaDownloaderFunc(func(_ context.Context, got channels.ChannelInput, media channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
+		recordingMediaDownloader{download: func(_ context.Context, got channels.ChannelInput, media channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
 			if got.ArtifactRefs != nil {
 				t.Fatalf("downloader received pre-existing artifact refs: %#v", got.ArtifactRefs)
 			}
@@ -35,7 +35,7 @@ func TestArtifactIngestorMaterializesOnlyArtifactRefs(t *testing.T) {
 				t.Fatalf("media reference = %q", media.Reference)
 			}
 			return channels.DownloadedMedia{Filename: "image.png", MIMEType: "image/png", Data: []byte("image")}, nil
-		}),
+		}},
 		writer,
 	)
 	if err != nil {
@@ -77,9 +77,9 @@ func TestArtifactIngestorRejectsOversizedMediaBeforeWrite(t *testing.T) {
 
 	writer := &recordingArtifactWriter{ref: "artifact://inbound/one"}
 	ingestor, err := channels.NewArtifactIngestor(
-		channels.MediaDownloaderFunc(func(context.Context, channels.ChannelInput, channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
+		recordingMediaDownloader{download: func(context.Context, channels.ChannelInput, channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
 			return channels.DownloadedMedia{Data: []byte("12345")}, nil
-		}),
+		}},
 		writer,
 	)
 	if err != nil {
@@ -103,6 +103,18 @@ type recordingArtifactWriter struct {
 	ref      string
 	artifact channels.InboundArtifact
 	called   bool
+}
+
+type recordingMediaDownloader struct {
+	download func(context.Context, channels.ChannelInput, channels.ProviderMediaRef) (channels.DownloadedMedia, error)
+}
+
+func (d recordingMediaDownloader) Download(
+	ctx context.Context,
+	input channels.ChannelInput,
+	media channels.ProviderMediaRef,
+) (channels.DownloadedMedia, error) {
+	return d.download(ctx, input, media)
 }
 
 func (w *recordingArtifactWriter) WriteInboundArtifact(_ context.Context, artifact channels.InboundArtifact) (string, error) {

@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,7 +14,6 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
-	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	frameworkembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
@@ -161,63 +159,6 @@ func (r *Resolver) ResolveKnowledge(
 	return result, nil
 }
 
-// Index writes trusted derived chunks through the configured Qdrant Provider.
-// Every chunk must carry the exact execution scope and immutable generation.
-func (r *Resolver) Index(
-	ctx context.Context,
-	exec worker.Execution,
-	documents []*document.Document,
-) error {
-	if r == nil || r.secrets == nil || r.endpoints == nil || r.catalog == nil || r.policy == nil {
-		return errors.New("qdrant knowledge resolver is not initialized")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	ref := exec.Config.BackendConfig.Knowledge
-	if ref.IsZero() {
-		return errors.New("knowledge backend is not configured")
-	}
-	settings, err := validateBackend(ref)
-	if err != nil {
-		return err
-	}
-	endpoint, err := r.endpoints.ResolveQdrantEndpoint(ctx, ref.Name)
-	if err != nil {
-		return fmt.Errorf("resolve qdrant endpoint: %w", err)
-	}
-	if err := endpoint.Validate(); err != nil {
-		return err
-	}
-	store, err := r.resolveStore(ctx, exec, ref, settings, endpoint)
-	if err != nil {
-		return err
-	}
-	embedder, err := r.newEmbedder(ctx, exec, settings)
-	if err != nil {
-		return err
-	}
-	for _, value := range documents {
-		if err := validateIndexDocument(exec, settings, value); err != nil {
-			return err
-		}
-		embedding, err := embedder.GetEmbedding(ctx, value.Content)
-		if err != nil {
-			return fmt.Errorf("embed knowledge chunk %q: %w", value.ID, err)
-		}
-		if len(embedding) != settings.embeddingDimensions {
-			return fmt.Errorf("embed knowledge chunk %q: expected %d dimensions, got %d", value.ID, settings.embeddingDimensions, len(embedding))
-		}
-		if err := store.Add(ctx, value, embedding); err != nil {
-			return fmt.Errorf("index knowledge chunk %q: %w", value.ID, err)
-		}
-	}
-	return nil
-}
-
 // Close releases all VectorStores created by this resolver.
 func (r *Resolver) Close() error {
 	if r == nil {
@@ -360,41 +301,6 @@ func (r *Resolver) newEmbedder(
 		embedderOptions = append(embedderOptions, openai.WithBaseURL(baseURL))
 	}
 	return openai.New(embedderOptions...), nil
-}
-
-func validateIndexDocument(
-	exec worker.Execution,
-	settings backendSettings,
-	value *document.Document,
-) error {
-	if value == nil || value.ID == "" || value.Metadata == nil {
-		return errors.New("knowledge index document is incomplete")
-	}
-	metadata := value.Metadata
-	if metadataString(metadata, platformknowledge.MetadataTenantID) != exec.Tenant.TenantID ||
-		metadataString(metadata, platformknowledge.MetadataAppID) != exec.Tenant.AppID {
-		return errors.New("knowledge index document scope does not match execution")
-	}
-	baseID := metadataString(metadata, platformknowledge.MetadataKnowledgeBaseID)
-	if !slices.Contains(exec.Config.KnowledgeBaseIDs, baseID) {
-		return errors.New("knowledge index document base is not bound by config")
-	}
-	ref := platformknowledge.ChunkRef{
-		Scope:           exec.Tenant.Scope(),
-		ConfigVersion:   exec.Tenant.ConfigVersion,
-		KnowledgeBaseID: baseID,
-		DocumentID:      metadataString(metadata, platformknowledge.MetadataDocumentID),
-		DocumentVersion: metadataString(metadata, platformknowledge.MetadataDocumentVersion),
-		ChunkID:         metadataString(metadata, platformknowledge.MetadataChunkID),
-		IndexGeneration: metadataString(metadata, platformknowledge.MetadataIndexGeneration),
-	}
-	if err := ref.Validate(); err != nil {
-		return fmt.Errorf("knowledge index document identity: %w", err)
-	}
-	if ref.IndexGeneration != settings.indexGeneration {
-		return errors.New("knowledge index document generation does not match backend")
-	}
-	return nil
 }
 
 func metadataString(metadata map[string]any, key string) string {

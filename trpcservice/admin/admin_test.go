@@ -3,7 +3,6 @@ package admin_test
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -35,20 +34,7 @@ func TestAPIValidateAppConfigRejectsMissingChannelBinding(t *testing.T) {
 	}
 }
 
-func TestAPIValidateAppConfigUsesToolPolicyValidator(t *testing.T) {
-	cfg := testAppConfig()
-	cfg.Tools = tenant.ToolPolicy{VisibleTools: []string{"search"}}
-
-	err := (admin.API{
-		Bindings:            &recordingRepository{},
-		ToolPolicyValidator: rejectingToolPolicyValidator{},
-	}).ValidateAppConfig(context.Background(), cfg)
-	if err == nil || !strings.Contains(err.Error(), "tool policy runtime") {
-		t.Fatalf("validate app config error = %v, want tool policy error", err)
-	}
-}
-
-func TestAPIValidateAppConfigRequiresArtifactCOSForKnowledgeSource(t *testing.T) {
+func TestAPIValidateAppConfigAllowsKnowledgeWithoutArtifact(t *testing.T) {
 	cfg := testAppConfig()
 	cfg.BackendConfig.Knowledge = tenant.BackendRef{
 		Kind:     tenant.BackendVector,
@@ -61,8 +47,13 @@ func TestAPIValidateAppConfigRequiresArtifactCOSForKnowledgeSource(t *testing.T)
 			"index_generation":     "g1",
 		},
 	}
-	if err := (admin.API{Bindings: &recordingRepository{}}).ValidateAppConfig(context.Background(), cfg); err == nil {
-		t.Fatal("validate app config with Knowledge but no Artifact COS succeeded")
+	cfg.KnowledgeBaseIDs = []string{"kb-1"}
+	bindings, err := config.NewStaticBindingResolver(testBinding())
+	if err != nil {
+		t.Fatalf("new binding resolver: %v", err)
+	}
+	if err := (admin.API{Bindings: bindings}).ValidateAppConfig(context.Background(), cfg); err != nil {
+		t.Fatalf("validate app config with Knowledge but no Artifact COS: %v", err)
 	}
 }
 
@@ -142,12 +133,6 @@ type recordingRepository struct {
 	revokedTenantID     string
 	revokedAppID        string
 	revokedCredentialID string
-}
-
-type rejectingToolPolicyValidator struct{}
-
-func (rejectingToolPolicyValidator) ValidateToolPolicy(context.Context, tenant.ToolPolicy) error {
-	return errors.New("configured tools are not supported by this runtime")
 }
 
 func (r *recordingRepository) CreateTenant(_ context.Context, value tenant.Tenant) error {

@@ -6,13 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
 	"strings"
 
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
 
 type environmentSecretProvider struct {
@@ -148,44 +145,4 @@ func scopedSecretEnvironmentKey(scope tenant.Scope, ref tenant.SecretRef) string
 		hex.EncodeToString([]byte(ref.Version)),
 	}
 	return strings.Join(parts, "_")
-}
-
-// defaultEndpointPolicy is the production model endpoint policy: it allows
-// operator-configured https endpoints and blocks addresses that enable
-// server-side request forgery (loopback, link-local, multicast, unspecified).
-type defaultEndpointPolicy struct{}
-
-func (defaultEndpointPolicy) ResolveModelBaseURL(
-	_ context.Context,
-	_ worker.Execution,
-	configuredURL string,
-) (string, error) {
-	parsed, err := url.Parse(configuredURL)
-	if err != nil {
-		return "", fmt.Errorf("parse model base url: %w", err)
-	}
-	host := parsed.Hostname()
-	if parsed.Scheme != "https" || host == "" {
-		return "", errors.New("model base url must use https")
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		if blockedModelEndpointIP(ip) {
-			return "", errors.New("model base url resolves to a blocked address")
-		}
-		return configuredURL, nil
-	}
-	addresses, err := net.LookupIP(host)
-	if err != nil {
-		return "", fmt.Errorf("resolve model base url host: %w", err)
-	}
-	for _, address := range addresses {
-		if blockedModelEndpointIP(address) {
-			return "", errors.New("model base url resolves to a blocked address")
-		}
-	}
-	return configuredURL, nil
-}
-
-func blockedModelEndpointIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
 }

@@ -6,10 +6,8 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.2
 	github.com/larksuite/oapi-sdk-go/v3 v3.11.0
-	github.com/qdrant/go-client v1.19.0
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/tencentyun/cos-go-sdk-v5 v0.7.69
-	go.opentelemetry.io/otel v1.43.0
 	trpc.group/trpc-go/trpc-agent-go v1.11.2
 	trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/qdrant v1.11.0
 	trpc.group/trpc-go/trpc-agent-go/session/postgres v1.11.0
@@ -36,12 +34,13 @@ require (
 	github.com/mozillazg/go-httpheader v0.2.1 // indirect
 	github.com/openai/openai-go v1.12.0 // indirect
 	github.com/panjf2000/ants/v2 v2.10.0 // indirect
+	github.com/qdrant/go-client v1.19.0 // indirect
 	github.com/tidwall/gjson v1.14.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
-	github.com/yuin/goldmark v1.4.13 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.29.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.29.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.38.0 // indirect

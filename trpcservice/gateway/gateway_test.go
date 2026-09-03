@@ -67,7 +67,7 @@ func TestGatewaySubmitsAtomicAdmission(t *testing.T) {
 			TurnSeq:       7,
 		},
 	}
-	gw := gateway.New(gateway.WithAdmitter(admitter))
+	gw := gateway.New(admitter)
 	identity := validAdmissionIdentity()
 
 	result, err := gw.Handle(context.Background(), gateway.Request{
@@ -96,7 +96,7 @@ func TestGatewaySubmitsAtomicAdmission(t *testing.T) {
 }
 
 func TestGatewayRequiresAdmitter(t *testing.T) {
-	_, err := gateway.New().Handle(context.Background(), gateway.Request{})
+	_, err := gateway.New(nil).Handle(context.Background(), gateway.Request{})
 	if !errors.Is(err, gateway.ErrAdmitterRequired) {
 		t.Fatalf("handle error = %v, want admitter required", err)
 	}
@@ -115,7 +115,7 @@ func TestGatewayRequiresAdmissionIdentity(t *testing.T) {
 		IdempotencyKey: "client-key-1",
 		Tenant:         tenantOnlyResolver{tenant: validRuntimeContext()},
 	}
-	_, err := gateway.New(gateway.WithAdmitter(admitter)).Handle(context.Background(), request)
+	_, err := gateway.New(admitter).Handle(context.Background(), request)
 	if !errors.Is(err, gateway.ErrAdmissionIdentityRequired) {
 		t.Fatalf("handle error = %v, want admission identity required", err)
 	}
@@ -144,7 +144,7 @@ func TestGatewayRejectsInvalidAdmissionRequestBeforeBackend(t *testing.T) {
 			withIdentity: true,
 		},
 	}
-	_, err := gateway.New(gateway.WithAdmitter(admitter)).Handle(context.Background(), request)
+	_, err := gateway.New(admitter).Handle(context.Background(), request)
 	if err == nil {
 		t.Fatal("handle request succeeded with incomplete identity")
 	}
@@ -176,7 +176,7 @@ func TestGatewayAcceptsValidatedArtifactReference(t *testing.T) {
 			ArtifactRefs: []string{"artifact://file@1"},
 		},
 	}
-	if _, err := gateway.New(gateway.WithAdmitter(admitter)).Handle(context.Background(), request); err != nil {
+	if _, err := gateway.New(admitter).Handle(context.Background(), request); err != nil {
 		t.Fatalf("handle request: %v", err)
 	}
 	if admitter.request.RequestID == "" || len(admitter.request.Message.ArtifactRefs) != 1 {
