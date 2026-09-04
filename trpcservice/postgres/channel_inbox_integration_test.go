@@ -58,6 +58,66 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
 	}
 }
 
+func TestConfigRollbackPinsAlreadyAdmittedExecutions(t *testing.T) {
+	p := newIM05Fixture(t, newIntegrationTargetProtector(t, "v1"))
+	stable, err := p.store.ResolveAppConfig(p.ctx, p.scope.TenantID, p.scope.AppID, "v1")
+	if err != nil {
+		t.Fatalf("resolve stable config: %v", err)
+	}
+	canary := stable
+	canary.Version = "v2"
+	canary.Model.Model = "rollback-canary-model"
+	if err := p.store.InsertAppConfigVersion(p.ctx, canary); err != nil {
+		t.Fatalf("insert canary config: %v", err)
+	}
+	if err := p.store.ActivateAppConfig(p.ctx, p.scope.TenantID, p.scope.AppID, canary.Version); err != nil {
+		t.Fatalf("activate canary config: %v", err)
+	}
+
+	first, err := p.store.Admit(p.ctx, newIM05Request(t, p.route, p.binding, "message-canary", "request-canary", channels.MessageTypeText, "canary"))
+	if err != nil {
+		t.Fatalf("admit canary execution: %v", err)
+	}
+	if first.ConfigVersion != canary.Version {
+		t.Fatalf("canary admission config = %q, want %q", first.ConfigVersion, canary.Version)
+	}
+
+	if err := p.store.ActivateAppConfig(p.ctx, p.scope.TenantID, p.scope.AppID, stable.Version); err != nil {
+		t.Fatalf("roll back active config: %v", err)
+	}
+	second, err := p.store.Admit(p.ctx, newIM05Request(t, p.route, p.binding, "message-stable", "request-stable", channels.MessageTypeText, "stable"))
+	if err != nil {
+		t.Fatalf("admit rolled-back execution: %v", err)
+	}
+	if second.ConfigVersion != stable.Version {
+		t.Fatalf("rolled-back admission config = %q, want %q", second.ConfigVersion, stable.Version)
+	}
+
+	versions := map[string]string{}
+	rows, err := p.pool.Query(p.ctx, `
+SELECT request_id, config_version
+FROM platform.execution
+WHERE tenant_id = $1 AND app_id = $2 AND request_id = ANY($3)`,
+		p.scope.TenantID, p.scope.AppID, []string{first.RequestID, second.RequestID})
+	if err != nil {
+		t.Fatalf("read execution config versions: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var requestID, version string
+		if err := rows.Scan(&requestID, &version); err != nil {
+			t.Fatalf("scan execution config version: %v", err)
+		}
+		versions[requestID] = version
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate execution config versions: %v", err)
+	}
+	if versions[first.RequestID] != canary.Version || versions[second.RequestID] != stable.Version {
+		t.Fatalf("pinned execution config versions = %#v", versions)
+	}
+}
+
 func TestChannelAdmissionSealsMessageReplyTargetInInbox(t *testing.T) {
 	p := newIM05Fixture(t, newIntegrationTargetProtector(t, "v1"))
 	request := newIM05Request(t, p.route, p.binding, "message-target", "request-target", channels.MessageTypeText, "hello")

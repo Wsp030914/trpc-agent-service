@@ -1,0 +1,80 @@
+name: Fault Injection
+
+on:
+  workflow_dispatch:
+
+jobs:
+  faults:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: start local topology
+        run: docker compose --env-file .env.example up -d postgres redis qdrant gateway worker-1 worker-2
+      - name: worker crash recovery
+        run: |
+          set -euo pipefail
+          for service in gateway worker-1 worker-2; do
+            docker compose --env-file .env.example ps --status running --services | grep -Fx "$service"
+          done
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/readyz >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              echo 'gateway did not become ready'
+              docker compose --env-file .env.example logs --no-color gateway worker-1 worker-2
+              exit 1
+            fi
+            sleep 2
+          done
+          docker compose --env-file .env.example kill -s SIGKILL worker-1
+          docker compose --env-file .env.example up -d worker-1
+          for service in worker-1 worker-2; do
+            docker compose --env-file .env.example ps --status running --services | grep -Fx "$service"
+          done
+      - name: Redis outage recovery
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env.example stop redis
+          sleep 5
+          docker compose --env-file .env.example start redis
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/readyz >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              docker compose --env-file .env.example logs --no-color gateway worker-1 worker-2
+              exit 1
+            fi
+            sleep 2
+          done
+          docker compose --env-file .env.example ps --status running redis worker-1 worker-2
+      - name: PostgreSQL outage recovery
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env.example stop postgres
+          sleep 5
+          docker compose --env-file .env.example start postgres
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/readyz >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              docker compose --env-file .env.example logs --no-color gateway worker-1 worker-2
+              exit 1
+            fi
+            sleep 2
+          done
+          docker compose --env-file .env.example ps --status running postgres worker-1 worker-2
+      - name: graceful worker restart
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env.example kill -s SIGTERM worker-2
+          docker compose --env-file .env.example up -d worker-2
+          docker compose --env-file .env.example ps --status running worker-2
+      - name: collect service logs
+        if: always()
+        run: docker compose --env-file .env.example logs --no-color worker-1 worker-2
+      - name: stop local topology
+        if: always()
+        run: docker compose --env-file .env.example down -v

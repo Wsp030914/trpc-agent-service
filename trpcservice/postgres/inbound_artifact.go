@@ -194,7 +194,7 @@ func attachStagedInboundArtifacts(
 INSERT INTO platform.artifact (
     artifact_id, tenant_id, app_id, session_principal_id, session_id,
     filename, version, object_key, mime_type, size_bytes, status
-) VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, 0, $6, $7, $8, $9, 'AVAILABLE')`,
+) VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, 0, $6, $7, $8, 'AVAILABLE')`,
 			input.TenantID,
 			input.AppID,
 			sessionPrincipalID,

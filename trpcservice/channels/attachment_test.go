@@ -7,6 +7,21 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
 
+func TestDetectMediaMIMETypeUsesOfficeFilename(t *testing.T) {
+	data := []byte("PK\x03\x04not-an-office-file")
+	for _, test := range []struct {
+		filename string
+		want     string
+	}{
+		{filename: "report.docx", want: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+		{filename: "archive.zip", want: "application/zip"},
+	} {
+		if got := channels.DetectMediaMIMEType(test.filename, data); got != test.want {
+			t.Errorf("MIME type for %q = %q, want %q", test.filename, got, test.want)
+		}
+	}
+}
+
 func TestArtifactIngestorMaterializesOnlyArtifactRefs(t *testing.T) {
 	input, err := channels.NewChannelInput(channels.ChannelInput{
 		TenantID:          "tenant-a",

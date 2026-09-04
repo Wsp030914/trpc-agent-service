@@ -62,3 +62,12 @@ func TestSafeErrorBoundsOutput(t *testing.T) {
 		t.Fatalf("safe error length = %d, want at most 512", len([]rune(got)))
 	}
 }
+
+func TestSafeErrorRedactsStandalonePII(t *testing.T) {
+	got := platformlog.SafeError(errors.New("contact alice@example.com or 13800138000"))
+	for _, secret := range []string{"alice@example.com", "13800138000"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("safe error contains %q: %q", secret, got)
+		}
+	}
+}

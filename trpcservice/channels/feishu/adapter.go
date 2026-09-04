@@ -6,14 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	larkdispatcher "github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/internal/callbackhttp"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
@@ -22,32 +25,32 @@ import (
 )
 
 const (
-	defaultMaxCallbackBytes = 1 << 20
-	defaultClockSkew        = 5 * time.Minute
+	defaultReconnectInitial = time.Second
+	defaultReconnectMax     = 30 * time.Second
 	feishuMessageTargetTTL  = time.Hour
 )
 
-var (
-	errCallbackUnavailable   = errors.New("feishu callback verification unavailable")
-	errAttachmentIngestorReq = errors.New("attachment ingestor is required")
-)
+var errAttachmentIngestorReq = errors.New("attachment ingestor is required")
 
-// AdapterOption configures a Feishu callback Adapter.
-type AdapterOption func(*Adapter) error
-
-// WithMaxCallbackBytes sets the maximum callback body size accepted by the
-// adapter.
-func WithMaxCallbackBytes(limit int64) AdapterOption {
-	return func(adapter *Adapter) error {
-		if limit <= 0 {
-			return errors.New("max callback bytes must be positive")
-		}
-		adapter.maxCallbackBytes = limit
-		return nil
-	}
+// Client is the lifecycle surface used by the adapter. The production value
+// is the official Feishu SDK WebSocket client.
+type Client interface {
+	Start(context.Context) error
+	CloseAndWait(context.Context) error
 }
 
-// WithClock supplies the clock used for callback freshness and reply-target expiry.
+// ClientFactory is a test seam for the official SDK client construction. A
+// factory is called once for each active tenant/application/binding.
+type ClientFactory func(
+	binding channels.BindingSnapshot,
+	appSecret string,
+	handler *larkdispatcher.EventDispatcher,
+) Client
+
+// AdapterOption configures a Feishu long-connection adapter.
+type AdapterOption func(*Adapter) error
+
+// WithClock supplies the clock used for inbound timestamps and message target expiry.
 func WithClock(clock func() time.Time) AdapterOption {
 	return func(adapter *Adapter) error {
 		if clock == nil {
@@ -58,20 +61,7 @@ func WithClock(clock func() time.Time) AdapterOption {
 	}
 }
 
-// WithClockSkew sets the maximum accepted difference between the Feishu
-// request timestamp and the adapter clock.
-func WithClockSkew(skew time.Duration) AdapterOption {
-	return func(adapter *Adapter) error {
-		if skew <= 0 {
-			return errors.New("clock skew must be positive")
-		}
-		adapter.clockSkew = skew
-		return nil
-	}
-}
-
 // WithAttachmentIngestor registers the IM-07 media materialization boundary.
-// Verified media callbacks are rejected for retry when no ingestor is set.
 func WithAttachmentIngestor(ingestor channels.AttachmentIngestor) AdapterOption {
 	return func(adapter *Adapter) error {
 		adapter.attachmentIngestor = ingestor
@@ -80,8 +70,6 @@ func WithAttachmentIngestor(ingestor channels.AttachmentIngestor) AdapterOption 
 }
 
 // WithRecallAdmitter registers the durable, provider-neutral recall boundary.
-// A verified recall is rejected for retry when production has no persistence
-// path, so an event is never acknowledged and silently discarded.
 func WithRecallAdmitter(admitter channels.RecallAdmitter) AdapterOption {
 	return func(adapter *Adapter) error {
 		adapter.recallAdmitter = admitter
@@ -89,7 +77,7 @@ func WithRecallAdmitter(admitter channels.RecallAdmitter) AdapterOption {
 	}
 }
 
-// WithMetrics attaches the low-cardinality IM callback metrics recorder.
+// WithMetrics attaches the low-cardinality IM event metrics recorder.
 func WithMetrics(recorder *platformmetrics.Recorder) AdapterOption {
 	return func(adapter *Adapter) error {
 		adapter.metrics = recorder
@@ -97,32 +85,65 @@ func WithMetrics(recorder *platformmetrics.Recorder) AdapterOption {
 	}
 }
 
-// Adapter verifies Feishu callbacks and submits normalized ChannelInput
-// values to Gateway. It does not call Runner or own Reply Outbox delivery.
+// WithClientFactory replaces only the SDK client constructor. Production code
+// should leave it unset so the official Feishu WebSocket SDK is used.
+func WithClientFactory(factory ClientFactory) AdapterOption {
+	return func(adapter *Adapter) error {
+		if factory == nil {
+			return errors.New("client factory is required")
+		}
+		adapter.clientFactory = factory
+		return nil
+	}
+}
+
+// WithReconnectDelay configures the small adapter-level recovery delay used
+// when the SDK client itself terminates. The SDK also performs its own normal
+// WebSocket reconnects.
+func WithReconnectDelay(initial, maximum time.Duration) AdapterOption {
+	return func(adapter *Adapter) error {
+		if initial <= 0 || maximum < initial {
+			return errors.New("reconnect delay is invalid")
+		}
+		adapter.reconnectInitial = initial
+		adapter.reconnectMax = maximum
+		return nil
+	}
+}
+
+// Adapter owns one official Feishu long-connection client per active Binding
+// and submits normalized events to Gateway. It does not call Runner or own
+// Reply Outbox delivery.
 type Adapter struct {
-	routes             gateway.PublicRouteResolver
+	bindings           channels.BindingSource
 	admissionGateway   *gateway.Gateway
 	secrets            platformsecret.SecretProvider
 	attachmentIngestor channels.AttachmentIngestor
 	recallAdmitter     channels.RecallAdmitter
-	maxCallbackBytes   int64
-	clockSkew          time.Duration
 	now                func() time.Time
 	metrics            *platformmetrics.Recorder
+	clientFactory      ClientFactory
+	reconnectInitial   time.Duration
+	reconnectMax       time.Duration
+
+	runMu     sync.Mutex
+	runCancel context.CancelFunc
+	runDone   chan struct{}
+	clientsMu sync.Mutex
+	clients   map[string]Client
 }
 
-// NewAdapter creates a Feishu callback Adapter. Binding.TokenRef is the
-// Feishu Verification Token reference and Binding.SigningSecretRef is the
-// Feishu Encrypt Key reference. Binding.Secret is reserved for the outbound
-// App Secret and is resolved by NewOutboundClient.
+// NewAdapter creates a Feishu adapter using the official SDK's WebSocket
+// event subscription. Binding.ExternalAccount is App ID and Binding.Secret is
+// the App Secret reference.
 func NewAdapter(
-	routes gateway.PublicRouteResolver,
+	bindings channels.BindingSource,
 	admissionGateway *gateway.Gateway,
 	secrets platformsecret.SecretProvider,
 	opts ...AdapterOption,
 ) (*Adapter, error) {
-	if routes == nil {
-		return nil, errors.New("public route resolver is required")
+	if bindings == nil {
+		return nil, errors.New("binding source is required")
 	}
 	if admissionGateway == nil {
 		return nil, errors.New("gateway is required")
@@ -131,12 +152,14 @@ func NewAdapter(
 		return nil, errors.New("secret provider is required")
 	}
 	adapter := &Adapter{
-		routes:           routes,
+		bindings:         bindings,
 		admissionGateway: admissionGateway,
 		secrets:          secrets,
-		maxCallbackBytes: defaultMaxCallbackBytes,
-		clockSkew:        defaultClockSkew,
 		now:              time.Now,
+		clientFactory:    defaultClientFactory,
+		reconnectInitial: defaultReconnectInitial,
+		reconnectMax:     defaultReconnectMax,
+		clients:          make(map[string]Client),
 	}
 	for _, opt := range opts {
 		if opt == nil {
@@ -149,123 +172,172 @@ func NewAdapter(
 	return adapter, nil
 }
 
-// ServeHTTP handles the bound Feishu callback path. The route key is the
-// only caller-supplied routing value; tenant and application scope come from
-// the Binding returned by the route resolver.
-func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if a == nil || w == nil || r == nil {
-		return
-	}
-	callbackCtx, span := platformtelemetry.StartSpan(
-		platformtelemetry.Extract(r.Context(), map[string]string{
-			"traceparent": r.Header.Get("traceparent"),
-			"tracestate":  r.Header.Get("tracestate"),
+func defaultClientFactory(
+	binding channels.BindingSnapshot,
+	appSecret string,
+	handler *larkdispatcher.EventDispatcher,
+) Client {
+	return larkws.NewClient(
+		binding.ExternalAccount,
+		appSecret,
+		larkws.WithEventHandler(handler),
+		larkws.WithAutoReconnect(true),
+		larkws.WithOnError(func(err error) {
+			log.Printf("feishu websocket error: %s", platformlog.SafeError(err))
 		}),
-		"channel.callback",
-		attribute.String("channel", string(channels.ChannelFeishu)),
 	)
-	response := callbackhttp.NewStatusRecorder(w)
-	defer span.End()
-	defer func() {
-		errorType := callbackhttp.CallbackErrorType(response.Status())
-		if errorType != "" {
-			platformtelemetry.MarkError(span, errorType, errors.New(errorType))
-		}
-		if a.metrics != nil {
-			a.metrics.RecordIMCallback(callbackCtx, platformmetrics.Labels{
-				Channel: string(channels.ChannelFeishu),
-			}, errorType)
-		}
-	}()
-	r = r.WithContext(callbackCtx)
-	routeKey, err := callbackhttp.RouteKey(r, channels.ChannelFeishu)
-	if err != nil {
-		http.NotFound(response, r)
-		return
-	}
-	route, err := gateway.ResolveChannelBindingRoute(
-		r.Context(),
-		a.routes,
-		channels.ChannelFeishu,
-		routeKey,
-	)
-	if err != nil {
-		callbackhttp.WriteRouteError(response, r, err)
-		return
-	}
-	if r.Method != http.MethodPost {
-		response.Header().Set("Allow", http.MethodPost)
-		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	a.handleCallback(response, r, route)
 }
 
-func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route gateway.LocatedChannelBinding) {
-	if r.Body == nil {
-		callbackhttp.WriteProtocolError(w, callbackhttp.ErrBodyRequired)
-		return
+// Run enumerates active bindings and runs one SDK client for each binding.
+// Cancellation stops every client and waits for all client loops to exit.
+func (a *Adapter) Run(ctx context.Context) error {
+	if a == nil || a.bindings == nil || a.admissionGateway == nil || a.secrets == nil {
+		return errors.New("feishu adapter is not initialized")
 	}
+	if ctx == nil {
+		return errors.New("context is required")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	a.runMu.Lock()
+	if a.runCancel != nil {
+		a.runMu.Unlock()
+		cancel()
+		return errors.New("feishu adapter is already running")
+	}
+	a.runCancel = cancel
+	a.runDone = runDone
+	a.runMu.Unlock()
 	defer func() {
-		_ = r.Body.Close()
+		cancel()
+		close(runDone)
+		a.runMu.Lock()
+		a.runCancel = nil
+		a.runDone = nil
+		a.runMu.Unlock()
 	}()
-	if err := callbackhttp.ValidateJSONContentType(r); err != nil {
-		callbackhttp.WriteProtocolError(w, err)
-		return
-	}
-	body, err := callbackhttp.ReadBody(w, r, a.maxCallbackBytes)
-	if err != nil {
-		callbackhttp.WriteProtocolError(w, err)
-		return
-	}
-	binding := route.Snapshot()
-	verificationToken, encryptKey, err := a.callbackSecrets(r.Context(), binding)
-	if err != nil {
-		http.Error(w, "callback verification unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	plain, metadata, err := decodeCallback(body, r.Header, encryptKey, a.now().UTC(), a.clockSkew)
-	if err != nil {
-		callbackhttp.WriteProtocolError(w, err)
-		return
-	}
-	if err := verifyCallbackMetadata(metadata, binding, verificationToken); err != nil {
-		callbackhttp.WriteProtocolError(w, err)
-		return
-	}
-	if metadata.RequestType == feishuChallengeType {
-		writeChallenge(w, metadata.Challenge)
-		return
-	}
-	if metadata.EventType == feishuRecallEventType {
-		a.handleRecall(w, r, binding, plain, metadata)
-		return
-	}
-	if metadata.EventType != feishuMessageEventType {
-		// The callback has been authenticated, but this task only admits
-		// message receive events. Acknowledge other subscribed events so the
-		// provider does not retry them indefinitely.
-		writeEventAck(w)
-		return
-	}
-	var received larkim.P2MessageReceiveV1
-	if err := json.Unmarshal(plain, &received); err != nil {
-		callbackhttp.WriteProtocolError(w, fmt.Errorf("%w: typed event", errFeishuCallbackEvent))
-		return
-	}
-	envelope, err := normalizeMessageEvent(binding, &received)
-	if err != nil {
-		callbackhttp.WriteProtocolError(w, err)
-		return
-	}
-	input, err := a.channelInput(r.Context(), envelope)
-	if err != nil {
-		if errors.Is(err, errAttachmentIngestorReq) {
-			http.Error(w, "attachment processing unavailable", http.StatusServiceUnavailable)
-			return
+	for {
+		bindings, err := a.bindings.ListActiveChannelBindings(runCtx, channels.ChannelFeishu)
+		if err != nil {
+			return fmt.Errorf("list active feishu bindings: %w", err)
 		}
-		callbackhttp.WriteProtocolError(w, err)
-		return
+		if len(bindings) == 0 {
+			if err := waitReconnect(runCtx, a.reconnectInitial, a.reconnectMax); err != nil {
+				return err
+			}
+			continue
+		}
+		done := make(chan error, len(bindings))
+		for _, binding := range bindings {
+			binding := binding
+			go func() {
+				done <- a.runBinding(runCtx, binding)
+			}()
+		}
+		var firstErr error
+		for range bindings {
+			if runErr := <-done; runErr != nil && !errors.Is(runErr, context.Canceled) && firstErr == nil {
+				firstErr = runErr
+				cancel()
+			}
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if firstErr != nil {
+			return firstErr
+		}
+		if err := waitReconnect(runCtx, a.reconnectInitial, a.reconnectMax); err != nil {
+			return err
+		}
+	}
+}
+
+func (a *Adapter) runBinding(ctx context.Context, binding channels.Binding) error {
+	if err := binding.Validate(); err != nil {
+		return fmt.Errorf("feishu binding: %w", err)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		current, err := a.bindings.ResolveBinding(ctx, binding.TenantID, binding.AppID, binding.BindingID)
+		if err != nil {
+			return fmt.Errorf("resolve feishu binding: %w", err)
+		}
+		if current.Status != channels.BindingActive {
+			return nil
+		}
+		if current.Channel != channels.ChannelFeishu || current.BindingRevision != binding.BindingRevision || current.ExternalAccount != binding.ExternalAccount {
+			if current.Channel != channels.ChannelFeishu {
+				return nil
+			}
+			if err := current.Validate(); err != nil {
+				return fmt.Errorf("updated feishu binding: %w", err)
+			}
+			binding = current
+			continue
+		}
+		appSecret, err := a.secrets.ResolveSecret(ctx, current.Scope(), current.Secret)
+		if err != nil {
+			return fmt.Errorf("resolve feishu app secret: %w", err)
+		}
+		if appSecret == "" {
+			return errors.New("feishu app secret is required")
+		}
+		bindingSnapshot := current.Snapshot()
+		handler := a.eventDispatcher(bindingSnapshot)
+		client := a.clientFactory(bindingSnapshot, appSecret, handler)
+		if client == nil {
+			return errors.New("feishu client factory returned nil")
+		}
+		key := bindingKey(bindingSnapshot)
+		a.trackClient(key, client)
+		startErr := client.Start(ctx)
+		a.untrackClient(key, client)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if startErr != nil {
+			// Recreate the SDK client after a terminal SDK failure; its normal
+			// connection drops are already handled by WithAutoReconnect(true).
+		}
+		if err := waitReconnect(ctx, a.reconnectInitial, a.reconnectMax); err != nil {
+			return err
+		}
+	}
+}
+
+func (a *Adapter) eventDispatcher(binding channels.BindingSnapshot) *larkdispatcher.EventDispatcher {
+	dispatcher := larkdispatcher.NewEventDispatcher("", "")
+	dispatcher.OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
+		return a.HandleMessage(ctx, binding, event)
+	})
+	if a.recallAdmitter != nil {
+		dispatcher.OnP2MessageRecalledV1(func(ctx context.Context, event *larkim.P2MessageRecalledV1) error {
+			return a.HandleRecall(ctx, binding, event)
+		})
+	}
+	return dispatcher
+}
+
+// HandleMessage is the authenticated SDK event boundary. It is also useful
+// for contract tests because it exercises the exact SDK event conversion.
+func (a *Adapter) HandleMessage(
+	ctx context.Context,
+	binding channels.BindingSnapshot,
+	received *larkim.P2MessageReceiveV1,
+) error {
+	if err := a.ensureCurrentBinding(ctx, binding); err != nil {
+		return err
+	}
+	envelope, err := normalizeMessageEvent(binding, received)
+	if err != nil {
+		return err
+	}
+	input, err := a.channelInput(ctx, envelope)
+	if err != nil {
+		return err
 	}
 	requestID := uuid.NewString()
 	runtimeContext := tenant.RuntimeContext{
@@ -276,67 +348,80 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request, route g
 		SessionID: channels.DefaultSessionID,
 		TraceID:   requestID,
 	}
-	identityResolver, err := gateway.NewChannelBindingInputIdentityResolver(route, runtimeContext)
+	identityResolver, err := gateway.NewChannelBindingInputIdentityResolverFromBinding(binding, runtimeContext)
 	if err != nil {
-		http.Error(w, "callback admission unavailable", http.StatusServiceUnavailable)
-		return
+		return fmt.Errorf("feishu admission identity: %w", err)
 	}
-	_, err = a.admissionGateway.Handle(r.Context(), gateway.Request{
+	eventCtx, span := platformtelemetry.StartSpan(ctx, "channel.event",
+		attribute.String("channel", string(channels.ChannelFeishu)),
+		attribute.String("binding_id", binding.BindingID),
+	)
+	defer span.End()
+	_, err = a.admissionGateway.Handle(eventCtx, gateway.Request{
 		RequestID:      requestID,
 		IdempotencyKey: envelope.ExternalMessageID,
 		Tenant:         identityResolver,
 		ChannelInput:   &input,
 	})
 	if err != nil {
-		callbackhttp.WriteAdmissionError(w, err)
-		return
+		platformtelemetry.MarkError(span, "admission", err)
 	}
-	writeEventAck(w)
+	if a.metrics != nil {
+		a.metrics.RecordIMCallback(eventCtx, platformmetrics.Labels{Channel: string(channels.ChannelFeishu)}, errorType(err))
+	}
+	return err
 }
 
-func (a *Adapter) handleRecall(
-	w http.ResponseWriter,
-	r *http.Request,
+// HandleRecall forwards an SDK recall event through the existing durable
+// recall boundary.
+func (a *Adapter) HandleRecall(
+	ctx context.Context,
 	binding channels.BindingSnapshot,
-	plain []byte,
-	metadata callbackMetadata,
-) {
+	recalled *larkim.P2MessageRecalledV1,
+) error {
 	if a.recallAdmitter == nil {
-		http.Error(w, "recall admission unavailable", http.StatusServiceUnavailable)
-		return
+		return errors.New("recall admitter is required")
 	}
-	var recalled larkim.P2MessageRecalledV1
-	if err := json.Unmarshal(plain, &recalled); err != nil {
-		callbackhttp.WriteProtocolError(w, fmt.Errorf("%w: typed recall event", errFeishuRecallEvent))
-		return
+	if err := a.ensureCurrentBinding(ctx, binding); err != nil {
+		return err
 	}
-	payloadHash := sha256.Sum256(plain)
-	request, err := normalizeRecallEvent(binding, metadata, &recalled, payloadHash[:])
+	payload := []byte(nil)
+	if recalled != nil && recalled.EventReq != nil {
+		payload = recalled.EventReq.Body
+	}
+	if len(payload) == 0 {
+		var err error
+		payload, err = json.Marshal(recalled)
+		if err != nil {
+			return fmt.Errorf("encode feishu recall event: %w", err)
+		}
+	}
+	payloadHash := sha256.Sum256(payload)
+	request, err := normalizeRecallEvent(binding, recalled, payloadHash[:])
 	if err != nil {
-		callbackhttp.WriteProtocolError(w, err)
-		return
+		return err
 	}
-	if _, err := a.recallAdmitter.AdmitRecall(r.Context(), request); err != nil {
-		callbackhttp.WriteAdmissionError(w, err)
-		return
+	if _, err := a.recallAdmitter.AdmitRecall(ctx, request); err != nil {
+		return fmt.Errorf("admit feishu recall: %w", err)
 	}
-	writeEventAck(w)
+	return nil
 }
 
-func (a *Adapter) callbackSecrets(ctx context.Context, binding channels.BindingSnapshot) (string, string, error) {
-	scope := binding.Scope()
-	verificationToken, err := a.secrets.ResolveSecret(ctx, scope, binding.TokenRef)
-	if err != nil || verificationToken == "" {
-		if err != nil {
-			return "", "", fmt.Errorf("resolve feishu verification token: %w", err)
-		}
-		return "", "", errCallbackUnavailable
+func (a *Adapter) ensureCurrentBinding(ctx context.Context, snapshot channels.BindingSnapshot) error {
+	if ctx == nil {
+		return errors.New("context is required")
 	}
-	encryptKey, err := a.secrets.ResolveSecret(ctx, scope, binding.SigningSecretRef)
+	current, err := a.bindings.ResolveBinding(ctx, snapshot.TenantID, snapshot.AppID, snapshot.BindingID)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve feishu encrypt key: %w", err)
+		return err
 	}
-	return verificationToken, encryptKey, nil
+	if current.Status != channels.BindingActive {
+		return channels.ErrBindingInactive
+	}
+	if current.Channel != snapshot.Channel || current.BindingRevision != snapshot.BindingRevision || current.ExternalAccount != snapshot.ExternalAccount {
+		return gateway.ErrChannelBindingSnapshotStale
+	}
+	return nil
 }
 
 func (a *Adapter) channelInput(ctx context.Context, envelope VerifiedProviderEnvelope) (channels.ChannelInput, error) {
@@ -350,9 +435,7 @@ func (a *Adapter) channelInput(ctx context.Context, envelope VerifiedProviderEnv
 		BindingID:         envelope.BindingID,
 		BindingRevision:   envelope.BindingRevision,
 		ExternalMessageID: envelope.ExternalMessageID,
-		Conversation: channels.ChannelConversation{
-			Kind: envelope.ConversationKind,
-		},
+		Conversation:      channels.ChannelConversation{Kind: envelope.ConversationKind},
 		MessageType:       envelope.MessageType,
 		Text:              envelope.Text,
 		ProviderTimestamp: envelope.ProviderTimestamp,
@@ -366,39 +449,90 @@ func (a *Adapter) channelInput(ctx context.Context, envelope VerifiedProviderEnv
 		if a.attachmentIngestor == nil {
 			return channels.ChannelInput{}, errAttachmentIngestorReq
 		}
-		media := append([]channels.ProviderMediaRef(nil), envelope.Media...)
-		input, err = a.attachmentIngestor.Prepare(ctx, input, media)
+		input, err = a.attachmentIngestor.Prepare(ctx, input, append([]channels.ProviderMediaRef(nil), envelope.Media...))
 		if err != nil {
 			return channels.ChannelInput{}, fmt.Errorf("prepare feishu media: %w", err)
 		}
 	}
-	input, err = channels.WithMessageReplyTarget(input, channels.MessageReplyTarget{
+	return channels.WithMessageReplyTarget(input, channels.MessageReplyTarget{
 		ProviderTarget: envelope.replyTarget,
 		ExpiresAt:      a.now().UTC().Add(feishuMessageTargetTTL),
 	})
-	if err != nil {
-		return channels.ChannelInput{}, err
+}
+
+// Close requests every active SDK client to stop and waits for graceful exit.
+func (a *Adapter) Close(ctx context.Context) error {
+	if a == nil {
+		return nil
 	}
-	return input, nil
-}
-
-func writeChallenge(w http.ResponseWriter, challenge string) {
-	payload, err := json.Marshal(struct {
-		Challenge string `json:"challenge"`
-	}{Challenge: challenge})
-	if err != nil {
-		http.Error(w, "callback verification unavailable", http.StatusInternalServerError)
-		return
+	if ctx == nil {
+		return errors.New("context is required")
 	}
-	writeJSON(w, http.StatusOK, payload)
+	a.runMu.Lock()
+	runCancel := a.runCancel
+	runDone := a.runDone
+	a.runMu.Unlock()
+	if runCancel != nil {
+		runCancel()
+	}
+	a.clientsMu.Lock()
+	clients := make([]Client, 0, len(a.clients))
+	for _, client := range a.clients {
+		clients = append(clients, client)
+	}
+	a.clientsMu.Unlock()
+	var result error
+	for _, client := range clients {
+		result = errors.Join(result, client.CloseAndWait(ctx))
+	}
+	if runDone != nil {
+		select {
+		case <-runDone:
+		case <-ctx.Done():
+			result = errors.Join(result, ctx.Err())
+		}
+	}
+	return result
 }
 
-func writeEventAck(w http.ResponseWriter) {
-	writeJSON(w, http.StatusOK, []byte(`{"code":0}`))
+func (a *Adapter) trackClient(key string, client Client) {
+	a.clientsMu.Lock()
+	a.clients[key] = client
+	a.clientsMu.Unlock()
 }
 
-func writeJSON(w http.ResponseWriter, status int, payload []byte) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(payload)
+func (a *Adapter) untrackClient(key string, client Client) {
+	a.clientsMu.Lock()
+	if current, ok := a.clients[key]; ok && current == client {
+		delete(a.clients, key)
+	}
+	a.clientsMu.Unlock()
+}
+
+func bindingKey(binding channels.BindingSnapshot) string {
+	return binding.TenantID + "\x00" + binding.AppID + "\x00" + binding.BindingID
+}
+
+func waitReconnect(ctx context.Context, initial, maximum time.Duration) error {
+	if initial <= 0 {
+		initial = defaultReconnectInitial
+	}
+	if maximum < initial {
+		maximum = initial
+	}
+	timer := time.NewTimer(initial)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func errorType(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "admission"
 }

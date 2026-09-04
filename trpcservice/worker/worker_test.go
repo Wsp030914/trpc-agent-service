@@ -486,6 +486,67 @@ func TestWorkerRunCancelsManagedRunnerWhenExecutionContextEnds(t *testing.T) {
 	}
 }
 
+func TestWorkerRunModelTimeoutCancelsAndDrainsManagedRunner(t *testing.T) {
+	runner := &managedBlockingRunner{
+		started: make(chan struct{}),
+		events:  make(chan *event.Event),
+	}
+	locker := &recordingSessionLocker{}
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = fixedRunner(runner)
+	w.SessionLocker = locker
+	w.ModelTimeout = time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.Run(context.Background(), testJob("request-model-timeout", "tenant-a", "session-1"))
+		done <- err
+	}()
+	<-runner.started
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("run error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("model timeout did not finish worker run")
+	}
+	if !runner.canceled.Load() {
+		t.Fatal("model timeout did not cancel managed runner")
+	}
+	if !runner.closed.Load() {
+		t.Fatal("runner was not closed after timeout event drain")
+	}
+	if locker.lock == nil || !locker.lock.released.Load() {
+		t.Fatal("session lock was not released after model timeout")
+	}
+}
+
+func TestWorkerRunTimeoutCancelsManagedRunnerBlockedInStart(t *testing.T) {
+	runner := &managedStartBlockingRunner{started: make(chan struct{})}
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = fixedRunner(runner)
+	w.ModelTimeout = time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.Run(context.Background(), testJob("request-timeout-start", "tenant-a", "session-1"))
+		done <- err
+	}()
+	<-runner.started
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("run error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("model timeout did not stop a runner blocked in Run")
+	}
+	if !runner.canceled.Load() || !runner.closed.Load() {
+		t.Fatal("blocked managed runner was not canceled and closed")
+	}
+}
+
 func testJob(requestID, tenantID, sessionID string) execution.Job {
 	return testJobWith(requestID, tenantID, sessionID, nil)
 }
@@ -599,6 +660,7 @@ type managedBlockingRunner struct {
 	started  chan struct{}
 	events   chan *event.Event
 	canceled atomic.Bool
+	closed   atomic.Bool
 }
 
 func (r *managedBlockingRunner) Run(
@@ -624,7 +686,37 @@ func (*managedBlockingRunner) RunStatus(string) (frameworkrunner.RunStatus, bool
 	return frameworkrunner.RunStatus{}, false
 }
 
-func (*managedBlockingRunner) Close() error {
+func (r *managedBlockingRunner) Close() error {
+	r.closed.Store(true)
+	return nil
+}
+
+type managedStartBlockingRunner struct {
+	started  chan struct{}
+	canceled atomic.Bool
+	closed   atomic.Bool
+}
+
+func (r *managedStartBlockingRunner) Run(ctx context.Context, _ string, _ string, _ model.Message, _ ...agent.RunOption) (<-chan *event.Event, error) {
+	close(r.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (r *managedStartBlockingRunner) Cancel(requestID string) bool {
+	if requestID == "" {
+		return false
+	}
+	r.canceled.Store(true)
+	return true
+}
+
+func (*managedStartBlockingRunner) RunStatus(string) (frameworkrunner.RunStatus, bool) {
+	return frameworkrunner.RunStatus{}, false
+}
+
+func (r *managedStartBlockingRunner) Close() error {
+	r.closed.Store(true)
 	return nil
 }
 

@@ -1,3 +1,3 @@
-// Package feishu will contain Feishu channel verification and message delivery
-// adapters.
+// Package feishu contains the official Feishu WebSocket event adapter and API
+// reply client.
 package feishu

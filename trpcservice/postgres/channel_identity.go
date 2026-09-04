@@ -432,6 +432,9 @@ func (m *IdentityMapper) resolveIdentityTx(
 			return channels.Identity{}, err
 		}
 		if found {
+			if identity.Status != channels.IdentityActive {
+				return channels.Identity{}, fmt.Errorf("channel identity status %q: %w", identity.Status, channels.ErrIdentityInactive)
+			}
 			return identity, nil
 		}
 	}
@@ -488,6 +491,9 @@ ON CONFLICT (tenant_id, app_id, binding_id, external_user_key_hash) DO NOTHING`,
 	}
 	if !found {
 		return channels.Identity{}, errors.New("channel identity was not available after insert")
+	}
+	if identity.Status != channels.IdentityActive {
+		return channels.Identity{}, fmt.Errorf("channel identity status %q: %w", identity.Status, channels.ErrIdentityInactive)
 	}
 	return identity, nil
 }

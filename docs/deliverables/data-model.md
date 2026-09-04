@@ -14,8 +14,8 @@ tenant (tenant_id)
        └─ im_identity / channel_conversation
 ```
 
-`Channel Binding` 保存通道凭据的 `SecretRef` 和当前 revision。验签/解密后，
-身份映射只在该 Binding 的 tenant/app 范围内产生 `user_id`、
+`Channel Binding` 保存通道凭据的 `SecretRef` 和当前 revision。长连接认证与 event
+校验后，身份映射只在该 Binding 的 tenant/app 范围内产生 `user_id`、
 `session_principal_id` 和 `session_id`。入站 payload 不能覆盖这些可信字段。
 
 配置持久化字段：

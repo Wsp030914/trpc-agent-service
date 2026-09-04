@@ -1,170 +1,362 @@
 package wecom
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"crypto/sha1"
-	"crypto/subtle"
-	"encoding/base64"
-	"encoding/binary"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"sort"
+	"slices"
 	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
 
-const wecomPaddingBlockSize = 32
+const maxProviderURLLength = 16 << 10
 
 var (
-	errInvalidWeComSignature = errors.New("invalid wecom signature")
-	errWeComDecryptFailed    = errors.New("wecom message decryption failed")
+	errWeComBindingAccountMismatch  = errors.New("wecom binding account does not match event")
+	errWeComMessageIDRequired       = errors.New("wecom message id is required")
+	errWeComSenderRequired          = errors.New("wecom sender id is required")
+	errWeComConversationInvalid     = errors.New("wecom conversation is invalid")
+	errWeComMessageInvalid          = errors.New("wecom message is invalid")
+	errWeComUnsupportedMediaPayload = errors.New("wecom media payload is invalid")
 )
 
-type callbackCodec struct {
-	token string
-	key   []byte
+// Message is the message body delivered by the official WeCom AI Bot
+// long-connection protocol. It contains only provider event fields.
+type Message struct {
+	MessageID   string          `json:"msgid"`
+	AIBotID     string          `json:"aibotid"`
+	ChatID      string          `json:"chatid"`
+	ChatType    string          `json:"chattype"`
+	From        MessageFrom     `json:"from"`
+	MessageType string          `json:"msgtype"`
+	CreateTime  int64           `json:"create_time"`
+	Text        MessageText     `json:"text"`
+	Image       MessageMedia    `json:"image"`
+	File        MessageMedia    `json:"file"`
+	Mixed       MessageMixed    `json:"mixed"`
+	Stream      MessageStream   `json:"stream"`
+	Event       json.RawMessage `json:"event"`
+	EventType   string          `json:"eventtype"`
 }
 
-func newCallbackCodec(token, encodingAESKey string) (callbackCodec, error) {
-	if token == "" {
-		return callbackCodec{}, errors.New("wecom token is required")
-	}
-	key, err := decodeEncodingAESKey(encodingAESKey)
-	if err != nil {
-		return callbackCodec{}, err
-	}
-	return callbackCodec{token: token, key: key}, nil
+type MessageFrom struct {
+	UserID string `json:"userid"`
 }
 
-func decodeEncodingAESKey(value string) ([]byte, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil, errors.New("wecom encoding aes key is required")
+type MessageText struct {
+	Content string `json:"content"`
+}
+
+type MessageMedia struct {
+	URL    string `json:"url"`
+	AESKey string `json:"aeskey,omitempty"`
+}
+
+type MessageMixed struct {
+	Items []MessageMixedItem `json:"msg_item"`
+}
+
+type MessageMixedItem struct {
+	MessageType string       `json:"msgtype"`
+	Text        MessageText  `json:"text"`
+	Image       MessageMedia `json:"image"`
+	File        MessageMedia `json:"file"`
+}
+
+type MessageStream struct {
+	ID string `json:"id"`
+}
+
+// ProviderEventContext keeps provider-specific event data at the adapter
+// boundary. It is never copied into Gateway, Worker, Runner, or persistence.
+type ProviderEventContext struct {
+	StreamID     string
+	EventType    string
+	EventPayload []byte
+}
+
+// VerifiedProviderEnvelope is the normalized result of one authenticated
+// WeCom long-connection message.
+type VerifiedProviderEnvelope struct {
+	TenantID          string
+	AppID             string
+	Channel           channels.Channel
+	BindingID         string
+	BindingRevision   int64
+	ExternalMessageID string
+	SenderID          string
+	ConversationKind  channels.ConversationKind
+	ChatID            string
+	MessageType       channels.MessageType
+	Text              string
+	Media             []channels.ProviderMediaRef
+	ProviderTimestamp time.Time
+	Context           ProviderEventContext
+
+	mapping channels.ChannelMappingInput
+}
+
+// Validate checks the normalized fields needed to build ChannelInput.
+func (e VerifiedProviderEnvelope) Validate() error {
+	if e.TenantID == "" || e.AppID == "" {
+		return errors.New("verified wecom envelope scope is required")
 	}
-	encodings := []*base64.Encoding{
-		base64.RawStdEncoding,
-		base64.StdEncoding,
+	if e.Channel != channels.ChannelWeCom {
+		return errors.New("verified wecom envelope channel is invalid")
 	}
-	for _, encoding := range encodings {
-		decoded, err := encoding.DecodeString(value)
-		if err == nil && len(decoded) == 32 {
-			return decoded, nil
+	if e.BindingID == "" || e.BindingRevision <= 0 {
+		return errors.New("verified wecom envelope binding is invalid")
+	}
+	normalizedMessageID, err := channels.NormalizeExternalID(e.ExternalMessageID)
+	if err != nil || normalizedMessageID != e.ExternalMessageID {
+		return errWeComMessageIDRequired
+	}
+	normalizedSenderID, err := channels.NormalizeExternalID(e.SenderID)
+	if err != nil || normalizedSenderID != e.SenderID {
+		return errWeComSenderRequired
+	}
+	if err := e.ConversationKind.Validate(); err != nil {
+		return err
+	}
+	switch e.ConversationKind {
+	case channels.ConversationDirect:
+		if e.ChatID != "" {
+			return errWeComConversationInvalid
+		}
+	case channels.ConversationGroup:
+		if _, err := channels.NormalizeExternalID(e.ChatID); err != nil {
+			return errWeComConversationInvalid
+		}
+	default:
+		return errWeComConversationInvalid
+	}
+	if err := e.MessageType.Validate(); err != nil {
+		return err
+	}
+	if e.MessageType == channels.MessageTypeText && e.Text == "" {
+		return errWeComMessageInvalid
+	}
+	if e.MessageType == channels.MessageTypeMixed && e.Text == "" && len(e.Media) == 0 {
+		return errWeComMessageInvalid
+	}
+	if !utf8.ValidString(e.Text) {
+		return errWeComMessageInvalid
+	}
+	for _, media := range e.Media {
+		if err := media.Validate(); err != nil {
+			return fmt.Errorf("wecom media: %w", err)
 		}
 	}
-	return nil, errors.New("wecom encoding aes key must decode to 32 bytes")
-}
-
-func (c callbackCodec) verifySignature(timestamp, nonce, encrypted, signature string) error {
-	if timestamp == "" || nonce == "" || encrypted == "" || signature == "" {
-		return errInvalidWeComSignature
+	if e.Context.StreamID != "" && e.Context.EventType != "" {
+		return errWeComMessageInvalid
 	}
-	expected := c.signature(timestamp, nonce, encrypted)
-	if len(signature) != len(expected) ||
-		subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) != 1 {
-		return errInvalidWeComSignature
+	if e.MessageType == channels.MessageTypeEvent {
+		if e.Context.StreamID == "" && e.Context.EventType == "" {
+			return errWeComMessageInvalid
+		}
+		if len(e.Context.EventPayload) > 0 && !json.Valid(e.Context.EventPayload) {
+			return errWeComMessageInvalid
+		}
+	} else if e.Context.StreamID != "" || e.Context.EventType != "" || len(e.Context.EventPayload) > 0 {
+		return errWeComMessageInvalid
+	}
+	if err := e.mapping.Validate(e.ConversationKind); err != nil {
+		return fmt.Errorf("wecom mapping: %w", err)
 	}
 	return nil
 }
 
-func (c callbackCodec) signature(timestamp, nonce, encrypted string) string {
-	values := []string{c.token, timestamp, nonce, encrypted}
-	sort.Strings(values)
-	digest := sha1.Sum([]byte(strings.Join(values, "")))
-	return hex.EncodeToString(digest[:])
+func normalizeMessage(binding channels.BindingSnapshot, message Message) (VerifiedProviderEnvelope, error) {
+	if message.AIBotID == "" || message.AIBotID != binding.ExternalAccount {
+		return VerifiedProviderEnvelope{}, errWeComBindingAccountMismatch
+	}
+	messageID, err := channels.NormalizeExternalID(message.MessageID)
+	if err != nil {
+		return VerifiedProviderEnvelope{}, errWeComMessageIDRequired
+	}
+	senderID, err := channels.NormalizeExternalID(message.From.UserID)
+	if err != nil {
+		return VerifiedProviderEnvelope{}, errWeComSenderRequired
+	}
+	conversationKind, chatID, err := normalizeConversation(message.ChatType, message.ChatID)
+	if err != nil {
+		return VerifiedProviderEnvelope{}, err
+	}
+	messageType, text, media, providerContext, err := normalizeContent(message)
+	if err != nil {
+		return VerifiedProviderEnvelope{}, err
+	}
+	var providerTimestamp time.Time
+	if message.CreateTime > 0 {
+		providerTimestamp = time.Unix(message.CreateTime, 0).UTC()
+	}
+	mapping := channels.ChannelMappingInput{
+		ExternalSenderID:     senderID,
+		ProviderSenderTarget: senderID,
+	}
+	if conversationKind == channels.ConversationGroup {
+		mapping.ExternalChatID = chatID
+		mapping.ProviderConversationTarget = chatID
+	}
+	envelope := VerifiedProviderEnvelope{
+		TenantID:          binding.TenantID,
+		AppID:             binding.AppID,
+		Channel:           channels.ChannelWeCom,
+		BindingID:         binding.BindingID,
+		BindingRevision:   binding.BindingRevision,
+		ExternalMessageID: messageID,
+		SenderID:          senderID,
+		ConversationKind:  conversationKind,
+		ChatID:            chatID,
+		MessageType:       messageType,
+		Text:              text,
+		Media:             media,
+		ProviderTimestamp: providerTimestamp,
+		Context:           providerContext,
+		mapping:           mapping,
+	}
+	if err := envelope.Validate(); err != nil {
+		return VerifiedProviderEnvelope{}, err
+	}
+	return envelope, nil
 }
 
-func (c callbackCodec) decrypt(encrypted string) ([]byte, error) {
-	ciphertext, err := decodeWeComBase64(encrypted)
-	if err != nil {
-		return nil, fmt.Errorf("%w: ciphertext encoding", errWeComDecryptFailed)
+func normalizeConversation(chatType, chatID string) (channels.ConversationKind, string, error) {
+	switch strings.ToLower(strings.TrimSpace(chatType)) {
+	case "single":
+		if strings.TrimSpace(chatID) != "" {
+			return "", "", errWeComConversationInvalid
+		}
+		return channels.ConversationDirect, "", nil
+	case "group":
+		normalizedChatID, err := channels.NormalizeExternalID(chatID)
+		if err != nil {
+			return "", "", errWeComConversationInvalid
+		}
+		return channels.ConversationGroup, normalizedChatID, nil
+	default:
+		return "", "", errWeComConversationInvalid
 	}
-	if len(c.key) != 32 || len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
-		return nil, errWeComDecryptFailed
-	}
-	block, err := aes.NewCipher(c.key)
-	if err != nil {
-		return nil, fmt.Errorf("%w: cipher: %v", errWeComDecryptFailed, err)
-	}
-	plaintext := make([]byte, len(ciphertext))
-	decrypter := cipher.NewCBCDecrypter(block, c.key[:aes.BlockSize])
-	decrypter.CryptBlocks(plaintext, ciphertext)
-	plaintext, err = unpadWeCom(plaintext)
-	if err != nil || len(plaintext) < aes.BlockSize+4 {
-		return nil, errWeComDecryptFailed
-	}
-	messageLength := binary.BigEndian.Uint32(plaintext[aes.BlockSize : aes.BlockSize+4])
-	messageStart := aes.BlockSize + 4
-	if messageLength > uint32(len(plaintext)-messageStart) {
-		return nil, errWeComDecryptFailed
-	}
-	messageEnd := messageStart + int(messageLength)
-	if messageEnd != len(plaintext) {
-		return nil, errWeComDecryptFailed
-	}
-	return append([]byte(nil), plaintext[messageStart:messageEnd]...), nil
 }
 
-func (c callbackCodec) encrypt(message []byte) (string, error) {
-	if len(c.key) != 32 {
-		return "", errors.New("wecom encoding aes key is invalid")
+func normalizeContent(message Message) (channels.MessageType, string, []channels.ProviderMediaRef, ProviderEventContext, error) {
+	var emptyContext ProviderEventContext
+	switch strings.ToLower(strings.TrimSpace(message.MessageType)) {
+	case "text":
+		if message.Text.Content == "" || !utf8.ValidString(message.Text.Content) {
+			return "", "", nil, emptyContext, errWeComMessageInvalid
+		}
+		return channels.MessageTypeText, message.Text.Content, nil, emptyContext, nil
+	case "image":
+		kind, text, media, err := singleMedia(channels.MessageTypeImage, message.Image)
+		return kind, text, media, emptyContext, err
+	case "file":
+		kind, text, media, err := singleMedia(channels.MessageTypeFile, message.File)
+		return kind, text, media, emptyContext, err
+	case "mixed":
+		kind, text, media, err := normalizeMixed(message.Mixed.Items)
+		return kind, text, media, emptyContext, err
+	case "card":
+		return channels.MessageTypeCard, "", nil, emptyContext, nil
+	case "stream":
+		streamID, err := channels.NormalizeExternalID(message.Stream.ID)
+		if err != nil {
+			return "", "", nil, emptyContext, errWeComMessageInvalid
+		}
+		return channels.MessageTypeEvent, "", nil, ProviderEventContext{StreamID: streamID}, nil
+	case "event":
+		eventType := message.EventType
+		payload := message.Event
+		if eventType == "" && len(payload) > 0 {
+			var event struct {
+				EventType string `json:"eventtype"`
+			}
+			if err := json.Unmarshal(payload, &event); err != nil {
+				return "", "", nil, emptyContext, errWeComMessageInvalid
+			}
+			eventType = event.EventType
+		}
+		normalized, err := channels.NormalizeExternalID(eventType)
+		if err != nil {
+			return "", "", nil, emptyContext, errWeComMessageInvalid
+		}
+		if len(payload) == 0 {
+			payload, err = json.Marshal(map[string]string{"eventtype": normalized})
+			if err != nil {
+				return "", "", nil, emptyContext, errWeComMessageInvalid
+			}
+		}
+		return channels.MessageTypeEvent, "", nil, ProviderEventContext{EventType: normalized, EventPayload: slices.Clone(payload)}, nil
+	default:
+		return channels.MessageTypeUnsupported, "", nil, emptyContext, nil
 	}
-	randomPrefix := make([]byte, aes.BlockSize)
-	if _, err := io.ReadFull(rand.Reader, randomPrefix); err != nil {
-		return "", fmt.Errorf("generate wecom message prefix: %w", err)
-	}
-	plaintext := make([]byte, aes.BlockSize+4+len(message))
-	copy(plaintext, randomPrefix)
-	binary.BigEndian.PutUint32(plaintext[aes.BlockSize:aes.BlockSize+4], uint32(len(message)))
-	copy(plaintext[aes.BlockSize+4:], message)
-	plaintext = padWeCom(plaintext)
-	block, err := aes.NewCipher(c.key)
-	if err != nil {
-		return "", fmt.Errorf("create wecom cipher: %w", err)
-	}
-	ciphertext := make([]byte, len(plaintext))
-	encrypter := cipher.NewCBCEncrypter(block, c.key[:aes.BlockSize])
-	encrypter.CryptBlocks(ciphertext, plaintext)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
-func decodeWeComBase64(value string) ([]byte, error) {
-	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding} {
-		decoded, err := encoding.DecodeString(value)
-		if err == nil {
-			return decoded, nil
+func singleMedia(kind channels.MessageType, media MessageMedia) (channels.MessageType, string, []channels.ProviderMediaRef, error) {
+	if err := validateMediaURL(media.URL); err != nil {
+		return "", "", nil, errWeComUnsupportedMediaPayload
+	}
+	return kind, "", []channels.ProviderMediaRef{{
+		Kind:          kind,
+		Reference:     media.URL,
+		DecryptionKey: media.AESKey,
+	}}, nil
+}
+
+func normalizeMixed(items []MessageMixedItem) (channels.MessageType, string, []channels.ProviderMediaRef, error) {
+	if len(items) == 0 {
+		return "", "", nil, errWeComMessageInvalid
+	}
+	var texts []string
+	var media []channels.ProviderMediaRef
+	for _, item := range items {
+		switch strings.ToLower(strings.TrimSpace(item.MessageType)) {
+		case "text":
+			if item.Text.Content == "" || !utf8.ValidString(item.Text.Content) {
+				return "", "", nil, errWeComMessageInvalid
+			}
+			texts = append(texts, item.Text.Content)
+		case "image":
+			if err := validateMediaURL(item.Image.URL); err != nil {
+				return "", "", nil, errWeComUnsupportedMediaPayload
+			}
+			media = append(media, channels.ProviderMediaRef{
+				Kind:          channels.MessageTypeImage,
+				Reference:     item.Image.URL,
+				DecryptionKey: item.Image.AESKey,
+			})
+		case "file":
+			if err := validateMediaURL(item.File.URL); err != nil {
+				return "", "", nil, errWeComUnsupportedMediaPayload
+			}
+			media = append(media, channels.ProviderMediaRef{
+				Kind:          channels.MessageTypeFile,
+				Reference:     item.File.URL,
+				DecryptionKey: item.File.AESKey,
+			})
+		default:
+			return "", "", nil, errWeComUnsupportedMediaPayload
 		}
 	}
-	return nil, errors.New("invalid base64")
+	text := strings.Join(texts, "\n")
+	if len(media) == 0 {
+		return channels.MessageTypeText, text, nil, nil
+	}
+	if text == "" && len(media) == 1 {
+		return media[0].Kind, text, media, nil
+	}
+	return channels.MessageTypeMixed, text, media, nil
 }
 
-func padWeCom(value []byte) []byte {
-	padding := wecomPaddingBlockSize - len(value)%wecomPaddingBlockSize
-	return append(value, bytesOf(byte(padding), padding)...)
-}
-
-func unpadWeCom(value []byte) ([]byte, error) {
-	if len(value) == 0 || len(value)%wecomPaddingBlockSize != 0 {
-		return nil, errors.New("invalid padding")
+func validateMediaURL(value string) error {
+	if value == "" || len(value) > maxProviderURLLength || !utf8.ValidString(value) {
+		return errors.New("wecom media url is invalid")
 	}
-	padding := int(value[len(value)-1])
-	if padding == 0 || padding > wecomPaddingBlockSize || padding > len(value) {
-		return nil, errors.New("invalid padding")
+	if !strings.HasPrefix(value, "https://") || strings.ContainsAny(value, "\r\n\t") {
+		return errors.New("wecom media url is invalid")
 	}
-	for _, current := range value[len(value)-padding:] {
-		if int(current) != padding {
-			return nil, errors.New("invalid padding")
-		}
-	}
-	return value[:len(value)-padding], nil
-}
-
-func bytesOf(value byte, count int) []byte {
-	result := make([]byte, count)
-	for index := range result {
-		result[index] = value
-	}
-	return result
+	return nil
 }

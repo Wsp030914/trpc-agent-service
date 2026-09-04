@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
@@ -129,6 +130,51 @@ func TestRelayDeliversAdmittedExecutionToWorker(t *testing.T) {
 	}
 	if err := <-relayResult; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("relay run: %v", err)
+	}
+}
+
+func TestExpiredExecutionLeaseIsRecoveredWithoutConcurrentOwner(t *testing.T) {
+	p := newIM05Fixture(t, newIntegrationTargetProtector(t, "v1"))
+	admitted, err := p.store.Admit(p.ctx, newIM05Request(t, p.route, p.binding, "message-lease-recovery", "request-lease-recovery", channels.MessageTypeText, "recover"))
+	if err != nil {
+		t.Fatalf("admit execution: %v", err)
+	}
+	dispatches, err := p.store.ClaimDispatches(p.ctx, "relay-first", time.Second, 1)
+	if err != nil || len(dispatches) != 1 {
+		t.Fatalf("claim initial dispatches = %#v, %v", dispatches, err)
+	}
+	first, found, err := p.store.Claim(p.ctx, dispatches[0], queue.ClaimRequest{Owner: "worker-a", LeaseDuration: time.Second})
+	if err != nil || !found {
+		t.Fatalf("first claim = %#v, found=%t, err=%v", first, found, err)
+	}
+	if _, found, err := p.store.Claim(p.ctx, dispatches[0], queue.ClaimRequest{Owner: "worker-b", LeaseDuration: time.Second}); err != nil || found {
+		t.Fatalf("concurrent claim found=%t err=%v, want no second owner", found, err)
+	}
+
+	wait := time.Until(first.Lease.Until)
+	if wait < 0 {
+		wait = 0
+	}
+	time.Sleep(wait + 50*time.Millisecond)
+	if err := p.store.RecoverDispatches(p.ctx, time.Second); err != nil {
+		t.Fatalf("recover expired execution: %v", err)
+	}
+	recovered, err := p.store.ClaimDispatches(p.ctx, "relay-recovery", time.Second, 1)
+	if err != nil || len(recovered) != 1 {
+		t.Fatalf("claim recovered dispatches = %#v, %v", recovered, err)
+	}
+	second, found, err := p.store.Claim(p.ctx, recovered[0], queue.ClaimRequest{Owner: "worker-b", LeaseDuration: time.Second})
+	if err != nil || !found {
+		t.Fatalf("recovery claim = %#v, found=%t, err=%v", second, found, err)
+	}
+	if first.Lease.Token == second.Lease.Token || second.Lease.Owner != "worker-b" || second.Job.RequestID() != admitted.RequestID {
+		t.Fatalf("recovered claim = %#v", second)
+	}
+	if err := p.store.Complete(p.ctx, second, queue.CompletionSucceeded); err != nil {
+		t.Fatalf("complete recovered execution: %v", err)
+	}
+	if _, found, err := p.store.Claim(p.ctx, recovered[0], queue.ClaimRequest{Owner: "worker-c", LeaseDuration: time.Second}); err != nil || found {
+		t.Fatalf("completed execution claim found=%t err=%v, want no claim", found, err)
 	}
 }
 

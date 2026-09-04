@@ -424,7 +424,7 @@ SELECT drain_deadline <= clock_timestamp(),
            WHERE tenant_id = data_migration.tenant_id
              AND app_id = data_migration.app_id
              AND config_version = data_migration.source_config_version
-             AND status IN ('PENDING', 'RUNNING')
+             AND status IN ('PENDING', 'RUNNING', 'WAITING_APPROVAL')
        )
 FROM platform.data_migration AS data_migration
 WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3

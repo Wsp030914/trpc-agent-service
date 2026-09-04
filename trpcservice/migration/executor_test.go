@@ -80,6 +80,35 @@ func TestExecutorFailsWhenDrainDeadlineExpires(t *testing.T) {
 	}
 }
 
+func TestExecutorLeavesDurablePhaseOpenForRetryableBackendFailure(t *testing.T) {
+	t.Parallel()
+	record := migration.Record{
+		ID:                  "migration-retry",
+		TenantID:            "tenant-1",
+		AppID:               "app-1",
+		SourceConfigVersion: "v1",
+		TargetConfigVersion: "v2",
+		Status:              migration.StatusCopying,
+		LeaseOwner:          "worker-1",
+		LeaseUntil:          time.Now().Add(time.Minute),
+		RunToken:            "run-1",
+	}
+	repository := &testMigrationRepository{}
+	executor := migration.Executor{
+		Catalog:    testSessionCatalog{keys: []session.Key{{AppName: "tenant:tenant-1:app:app-1:runner", UserID: "user-1", SessionID: "session-1"}}},
+		Repository: repository,
+		Copier:     &retryingSessionCopier{},
+	}
+
+	err := executor.Run(context.Background(), record)
+	if !errors.Is(err, errMigrationBackendUnavailable) {
+		t.Fatalf("run migration error = %v, want backend unavailable", err)
+	}
+	if len(repository.transitions) != 0 {
+		t.Fatalf("durable transitions = %v, want no terminal transition", repository.transitions)
+	}
+}
+
 type testSessionCatalog struct {
 	keys []session.Key
 	err  error
@@ -117,6 +146,16 @@ type testSessionCopier struct {
 	copied   int
 	verified int
 }
+
+var errMigrationBackendUnavailable = errors.New("migration backend unavailable")
+
+type retryingSessionCopier struct{}
+
+func (*retryingSessionCopier) CopySession(_ context.Context, _ session.Key) error {
+	return migration.NewRetryableError(errMigrationBackendUnavailable)
+}
+
+func (*retryingSessionCopier) VerifySession(_ context.Context, _ session.Key) error { return nil }
 
 func (c *testSessionCopier) CopySession(_ context.Context, _ session.Key) error {
 	c.copied++

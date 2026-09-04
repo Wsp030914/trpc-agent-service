@@ -257,7 +257,7 @@ func (r *Runtime) BuildRunner(
 			return nil, fmt.Errorf("resolve session ingestor: %w", err)
 		}
 		if ingestor != nil {
-			ingestor = &tracedSessionIngestor{Ingestor: ingestor, exec: exec}
+			ingestor = &tracedSessionIngestor{Ingestor: ingestor, exec: exec, metrics: r.metrics}
 		}
 	}
 	var artifactService frameworkartifact.Service

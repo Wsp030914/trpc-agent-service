@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -24,6 +25,11 @@ const (
 
 	IMAccessDenied = "im_access_denied"
 	BudgetRejected = "budget_rejected"
+
+	ApprovalCreated  = "approval_created"
+	ApprovalApproved = "approval_approved"
+	ApprovalDenied   = "approval_denied"
+	ApprovalExpired  = "approval_expired"
 )
 
 // Sink is the best-effort audit persistence boundary. Implementations must
@@ -35,25 +41,83 @@ type Sink interface {
 // Event is the complete audit record. It deliberately has no raw request,
 // message, tool argument, provider target, secret, or artifact fields.
 type Event struct {
+	TenantID      string        `json:"tenant_id"`
+	AppID         string        `json:"app_id"`
+	Channel       string        `json:"channel"`
+	UserID        string        `json:"user_id"`
+	SessionID     string        `json:"session_id"`
+	AgentName     string        `json:"agent_name"`
+	ToolName      string        `json:"tool_name"`
+	Decision      string        `json:"decision"`
+	Latency       time.Duration `json:"latency"`
+	ErrorType     string        `json:"error_type"`
+	Cost          *float64      `json:"cost,omitempty"`
+	InputTokens   int           `json:"input_tokens"`
+	OutputTokens  int           `json:"output_tokens"`
+	TotalTokens   int           `json:"total_tokens"`
+	TraceID       string        `json:"trace_id"`
+	RequestID     string        `json:"request_id"`
+	ConfigVersion string        `json:"config_version"`
+	EventType     string        `json:"event_type"`
+	CreatedAt     time.Time     `json:"created_at"`
+}
+
+// Query selects metadata-only events from one exact tenant/application scope.
+// Optional filters are intentionally finite and low-cardinality at the API
+// boundary; no payload search is supported.
+type Query struct {
 	TenantID      string
 	AppID         string
-	Channel       string
-	UserID        string
-	SessionID     string
-	AgentName     string
-	ToolName      string
-	Decision      string
-	Latency       time.Duration
-	ErrorType     string
-	Cost          *float64
-	InputTokens   int
-	OutputTokens  int
-	TotalTokens   int
-	TraceID       string
-	RequestID     string
-	ConfigVersion string
 	EventType     string
-	CreatedAt     time.Time
+	TraceID       string
+	Limit         int
+	CreatedAfter  *time.Time
+	CreatedBefore *time.Time
+}
+
+var (
+	redactEmailPattern       = regexp.MustCompile(`(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b`)
+	redactPhonePattern       = regexp.MustCompile(`(?:\+?86[ -]?)?1[3-9][0-9]{9}`)
+	redactAuthorization      = regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[A-Z0-9._~+/=\-]+`)
+	redactSecretFieldPattern = regexp.MustCompile(`(?i)(\b(?:api[_-]?key|password|passwd|secret|token|authorization|credential|dsn)\b\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)`)
+	redactURLCredential      = regexp.MustCompile(`(?i)(://[^/\s:@]+:)[^@/\s]+(@)`)
+	redactOpenAIKey          = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}\b`)
+)
+
+// RedactString applies the limited PII and credential rules used for audit
+// metadata. It intentionally does not normalize or truncate identifiers.
+func RedactString(value string) string {
+	value = redactEmailPattern.ReplaceAllString(value, "[REDACTED]")
+	value = redactPhonePattern.ReplaceAllString(value, "[REDACTED]")
+	value = redactAuthorization.ReplaceAllString(value, "[REDACTED]")
+	value = redactSecretFieldPattern.ReplaceAllString(value, `${1}[REDACTED]`)
+	value = redactURLCredential.ReplaceAllString(value, `${1}[REDACTED]${2}`)
+	value = redactOpenAIKey.ReplaceAllString(value, "[REDACTED]")
+	return value
+}
+
+// RedactEvent returns an audit event with user-controlled identity metadata
+// redacted. Prompts and raw tool arguments are not part of Event.
+func RedactEvent(e Event) Event {
+	e.UserID = RedactString(e.UserID)
+	e.SessionID = RedactString(e.SessionID)
+	e.AgentName = RedactString(e.AgentName)
+	e.ToolName = RedactString(e.ToolName)
+	e.ErrorType = RedactString(e.ErrorType)
+	return e
+}
+
+func (q Query) Validate() error {
+	if strings.TrimSpace(q.TenantID) == "" || strings.TrimSpace(q.AppID) == "" {
+		return errors.New("tenant_id and app_id are required")
+	}
+	if q.Limit < 0 || q.Limit > 1000 {
+		return errors.New("audit limit is invalid")
+	}
+	if q.CreatedAfter != nil && q.CreatedBefore != nil && q.CreatedAfter.After(*q.CreatedBefore) {
+		return errors.New("audit created_after must not be after created_before")
+	}
+	return nil
 }
 
 // Validate checks metadata invariants before it reaches persistence.
@@ -63,7 +127,6 @@ func (e Event) Validate() error {
 		"app_id":         e.AppID,
 		"event_type":     e.EventType,
 		"decision":       e.Decision,
-		"trace_id":       e.TraceID,
 		"request_id":     e.RequestID,
 		"config_version": e.ConfigVersion,
 	} {

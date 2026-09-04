@@ -1,6 +1,7 @@
 package tenant_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -191,6 +192,60 @@ func TestBudgetPolicyValidation(t *testing.T) {
 	}
 	if err := (tenant.BudgetPolicy{MaxTokensPerExecution: -1}).Validate(); err == nil {
 		t.Fatal("negative token budget was accepted")
+	}
+}
+
+func TestAuditPolicyCannotWidenTenantPolicy(t *testing.T) {
+	tests := []struct {
+		name string
+		app  tenant.AuditPolicy
+		want string
+	}{
+		{
+			name: "tool decisions",
+			app:  tenant.AuditPolicy{Enabled: true, RecordToolDecisions: true, RedactPII: true},
+			want: "tool audit",
+		},
+		{
+			name: "retention",
+			app:  tenant.AuditPolicy{Enabled: true, RetentionDays: 31, RedactPII: true},
+			want: "retention",
+		},
+		{
+			name: "redaction",
+			app:  tenant.AuditPolicy{Enabled: true},
+			want: "redaction",
+		},
+	}
+	parent := tenant.AuditPolicy{
+		Enabled:             true,
+		RecordToolDecisions: false,
+		RecordExecutions:    true,
+		RetentionDays:       30,
+		RedactPII:           true,
+	}
+	if err := (tenant.AuditPolicy{}).ValidateAppConfig(tenant.AuditPolicy{Enabled: true}); err == nil || !strings.Contains(err.Error(), "tenant audit is disabled") {
+		t.Fatalf("disabled tenant error = %v", err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := parent.ValidateAppConfig(tt.app); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestAuditPolicyZeroRetentionInheritsAtApplicationScope(t *testing.T) {
+	parent := tenant.AuditPolicy{Enabled: true, RecordExecutions: true}
+	if err := parent.ValidateAppConfig(tenant.AuditPolicy{Enabled: true, RecordExecutions: true, RetentionDays: 365}); err != nil {
+		t.Fatalf("zero tenant retention rejected finite app retention: %v", err)
+	}
+	if got := (tenant.AuditPolicy{RetentionDays: 30}).EffectiveRetentionDays(tenant.AuditPolicy{}); got != 30 {
+		t.Fatalf("zero app retention = %d, want tenant retention 30", got)
+	}
+	if got := parent.EffectiveRetentionDays(tenant.AuditPolicy{RetentionDays: 365}); got != 365 {
+		t.Fatalf("finite app retention under unlimited tenant = %d, want 365", got)
 	}
 }
 

@@ -18,6 +18,28 @@ var (
 	ErrLeaseLost = errors.New("data migration lease lost")
 )
 
+// RetryableError tells the migration executor that an operation failed because
+// its backend is temporarily unavailable and the durable phase must remain
+// resumable. The copier must make each phase idempotent when returning one.
+type RetryableError struct{ Err error }
+
+func (e RetryableError) Error() string {
+	if e.Err == nil {
+		return "retryable data migration error"
+	}
+	return e.Err.Error()
+}
+
+func (e RetryableError) Unwrap() error     { return e.Err }
+func (e RetryableError) IsRetryable() bool { return true }
+
+func NewRetryableError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return RetryableError{Err: err}
+}
+
 // Status identifies the durable lifecycle of one backend data migration.
 type Status string
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -57,7 +58,11 @@ func (e Executor) Run(ctx context.Context, record Record) error {
 
 	keys, err := e.Catalog.ListDataMigrationSessionKeys(ctx, record)
 	if err != nil {
-		return e.fail(ctx, record, fmt.Errorf("list migration sessions: %w", err))
+		cause := fmt.Errorf("list migration sessions: %w", err)
+		if isRetryableError(err) {
+			return cause
+		}
+		return e.fail(ctx, record, cause)
 	}
 
 	if record.Status == StatusDraining {
@@ -75,7 +80,11 @@ func (e Executor) Run(ctx context.Context, record Record) error {
 				return err
 			}
 			if err := e.Copier.CopySession(ctx, keys[index]); err != nil {
-				return e.fail(ctx, record, fmt.Errorf("copy session %d: %w", index, err))
+				cause := fmt.Errorf("copy session %d: %w", index, err)
+				if isRetryableError(err) {
+					return cause
+				}
+				return e.fail(ctx, record, cause)
 			}
 		}
 		if err := e.Repository.AdvanceDataMigration(ctx, record, StatusVerifying); err != nil {
@@ -89,7 +98,11 @@ func (e Executor) Run(ctx context.Context, record Record) error {
 				return err
 			}
 			if err := e.Copier.VerifySession(ctx, keys[index]); err != nil {
-				return e.fail(ctx, record, fmt.Errorf("verify session %d: %w", index, err))
+				cause := fmt.Errorf("verify session %d: %w", index, err)
+				if isRetryableError(err) {
+					return cause
+				}
+				return e.fail(ctx, record, cause)
 			}
 		}
 		if err := e.Repository.AdvanceDataMigration(ctx, record, StatusSucceeded); err != nil {
@@ -97,6 +110,22 @@ func (e Executor) Run(ctx context.Context, record Record) error {
 		}
 	}
 	return nil
+}
+
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrDrainIncomplete) || errors.Is(err, ErrLeaseLost) {
+		return true
+	}
+	var retryable interface{ IsRetryable() bool }
+	if errors.As(err, &retryable) && retryable.IsRetryable() {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
 }
 
 func (e Executor) fail(ctx context.Context, record Record, cause error) error {

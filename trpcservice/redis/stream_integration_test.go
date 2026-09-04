@@ -55,6 +55,46 @@ func TestStreamPublishesAndAcknowledgesDelivery(t *testing.T) {
 	}
 }
 
+func TestStreamReclaimsAbandonedPendingDelivery(t *testing.T) {
+	if *redisTestURL == "" {
+		t.Skip("TRPC_AGENT_SERVICE_REDIS_TEST_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := platformredis.NewClient(ctx, *redisTestURL)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	stream, err := platformredis.NewStream(client, "trpc-agent-service:reclaim-test:"+uuid.NewString(), "workers", 5*time.Millisecond)
+	if err != nil {
+		t.Fatalf("new stream: %v", err)
+	}
+	if err := stream.Init(ctx); err != nil {
+		t.Fatalf("init stream: %v", err)
+	}
+	dispatch := queue.Dispatch{OutboxID: 1, TenantID: "tenant-a", AppID: "support", RequestID: "request-reclaim"}
+	if err := stream.Publish(ctx, dispatch); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	first, err := stream.Receive(ctx, "worker-a", time.Second)
+	if err != nil {
+		t.Fatalf("first receive: %v", err)
+	}
+	// Simulate worker-a crashing before ACK. No local cleanup is performed.
+	time.Sleep(20 * time.Millisecond)
+	recovered, err := stream.Receive(ctx, "worker-b", time.Second)
+	if err != nil {
+		t.Fatalf("reclaim pending delivery: %v", err)
+	}
+	if recovered.ID != first.ID || recovered.Dispatch != dispatch {
+		t.Fatalf("recovered delivery = %#v, want id=%q dispatch=%#v", recovered, first.ID, dispatch)
+	}
+	if err := stream.Ack(ctx, recovered); err != nil {
+		t.Fatalf("ack recovered delivery: %v", err)
+	}
+}
+
 func TestSessionLeaseSerializesOnePartition(t *testing.T) {
 	if *redisTestURL == "" {
 		t.Skip("TRPC_AGENT_SERVICE_REDIS_TEST_URL is not set")

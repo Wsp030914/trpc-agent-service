@@ -22,7 +22,7 @@ tenant_id + app_id + binding_id + external_message_id
 ```
 
 Gateway 在事务内校验 payload hash；相同 payload 返回原 request，冲突拒绝。Inbox、
-Execution 和 Dispatch Outbox 同事务提交，成功提交前不确认外部 callback。
+Execution 和 Dispatch Outbox 同事务提交，成功提交前不把外部 event 视为已处理。
 
 HTTP/RPC 使用可信身份和 client idempotency key；请求一旦固定 config version，重试不
 创建新的 Session turn。

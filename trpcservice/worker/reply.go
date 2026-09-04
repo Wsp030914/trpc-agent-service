@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"math/rand/v2"
 	"net"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"go.opentelemetry.io/otel/attribute"
@@ -17,10 +20,13 @@ import (
 )
 
 const (
-	defaultReplyPollInterval = time.Second
-	defaultReplyLease        = 30 * time.Second
-	defaultReplyBatch        = 32
-	defaultReplyMaxAttempts  = 8
+	defaultReplyPollInterval     = time.Second
+	defaultReplyLease            = 30 * time.Second
+	defaultReplyBatch            = 32
+	defaultReplyMaxAttempts      = 8
+	replyRetryInitial            = time.Second
+	replyRetryMax                = time.Minute
+	replyUncertainPersistTimeout = 5 * time.Second
 )
 
 var (
@@ -101,6 +107,7 @@ func BuildReplyEvent(
 type ReplyOutbox interface {
 	ClaimReplies(context.Context, string, time.Duration, int) ([]ReplyDelivery, error)
 	CompleteReply(context.Context, ReplyDelivery, channels.ProviderReceipt) error
+	MarkReplyUncertain(context.Context, ReplyDelivery, string, error) error
 	RetryReply(context.Context, ReplyDelivery, string, time.Duration, error) error
 	FailReply(context.Context, ReplyDelivery, string, error) error
 	RecoverReplyLeases(context.Context) error
@@ -166,6 +173,37 @@ type ReplySender struct {
 	batchSize    int
 	maxAttempts  int
 	metrics      *platformmetrics.Recorder
+}
+
+// RetryableReplyError marks a reply dependency failure that is safe to retry
+// without invoking the provider. It lets target resolution distinguish a
+// backend outage from a permanently missing target.
+type RetryableReplyError struct {
+	Err       error
+	ErrorKind string
+}
+
+func (e RetryableReplyError) Error() string {
+	if e.Err == nil {
+		return "retryable reply dependency error"
+	}
+	return e.Err.Error()
+}
+
+func (e RetryableReplyError) Unwrap() error     { return e.Err }
+func (e RetryableReplyError) IsRetryable() bool { return true }
+func (e RetryableReplyError) RetryErrorType() string {
+	if e.ErrorKind == "" {
+		return "reply_dependency"
+	}
+	return e.ErrorKind
+}
+
+func NewRetryableReplyError(err error, errorKind string) error {
+	if err == nil {
+		return nil
+	}
+	return RetryableReplyError{Err: err, ErrorKind: errorKind}
 }
 
 // NewReplySender creates a finite-retry Reply Outbox sender.
@@ -236,7 +274,9 @@ func (s *ReplySender) SendBatch(ctx context.Context) (int, error) {
 	return len(deliveries), nil
 }
 
-// Run delivers replies until ctx is canceled.
+// Run delivers replies until ctx is canceled. Backend outages do not stop the
+// sender: they wait with bounded exponential backoff and jitter. Per-reply
+// provider failures remain bounded by MaxAttempts in recordFailure.
 func (s *ReplySender) Run(ctx context.Context) error {
 	if s == nil {
 		return errors.New("reply sender is not initialized")
@@ -244,16 +284,21 @@ func (s *ReplySender) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ticker := time.NewTicker(s.pollInterval)
-	defer ticker.Stop()
-	for {
-		if _, err := s.SendBatch(ctx); err != nil && ctx.Err() == nil {
-			return err
+	for attempt := 0; ; {
+		if _, err := s.SendBatch(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("reply sender batch failed: %s", platformlog.SafeError(err))
+			if err := waitForReplySender(ctx, replyLoopRetryDelay(attempt)); err != nil {
+				return err
+			}
+			attempt++
+			continue
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
+		attempt = 0
+		if err := waitForReplySender(ctx, s.pollInterval); err != nil {
+			return err
 		}
 	}
 }
@@ -300,18 +345,31 @@ func (s *ReplySender) sendOne(ctx context.Context, delivery ReplyDelivery) error
 	}
 	providerTarget, err := s.targets(sendCtx, delivery)
 	if err != nil {
-		return s.recordFailure(ctx, delivery, err, false, "target_resolution", started, span)
+		retryable, errorType := classifyReplyError(err)
+		if errors.Is(err, channels.ErrBindingInactive) {
+			retryable = true
+			errorType = "binding_inactive"
+		} else if errors.Is(err, channels.ErrIdentityInactive) {
+			retryable = true
+			errorType = "identity_inactive"
+		} else if errorType == "provider_permanent" {
+			errorType = "target_resolution"
+		}
+		return s.recordFailure(ctx, delivery, err, retryable, errorType, started, span)
 	}
 	receipt, err := provider.Client.SendOnce(sendCtx, delivery.Reply, providerTarget)
 	if err != nil {
+		if isReplySideEffectUncertain(err) {
+			return s.recordUncertain(ctx, delivery, "", err, "provider_result_unknown", started, span)
+		}
 		retryable, errorType := classifyReplyError(err)
 		return s.recordFailure(ctx, delivery, err, retryable, errorType, started, span)
 	}
 	if err := receipt.Validate(); err != nil {
-		return s.recordFailure(ctx, delivery, err, false, "invalid_provider_receipt", started, span)
+		return s.recordUncertain(ctx, delivery, receipt.ProviderMessageID, err, "invalid_provider_receipt", started, span)
 	}
 	if err := s.outbox.CompleteReply(ctx, delivery, receipt); err != nil {
-		return fmt.Errorf("complete reply: %w", err)
+		return s.recordUncertain(ctx, delivery, receipt.ProviderMessageID, err, "reply_completion_unknown", started, span)
 	}
 	if s.metrics != nil {
 		s.metrics.RecordReply(ctx, platformmetrics.Labels{
@@ -323,6 +381,39 @@ func (s *ReplySender) sendOne(ctx context.Context, delivery ReplyDelivery) error
 	return nil
 }
 
+func (s *ReplySender) recordUncertain(
+	ctx context.Context,
+	delivery ReplyDelivery,
+	providerMessageID string,
+	cause error,
+	errorType string,
+	started time.Time,
+	span trace.Span,
+) error {
+	platformtelemetry.MarkError(span, errorType, cause)
+	if s.metrics != nil {
+		s.metrics.RecordReply(ctx, platformmetrics.Labels{
+			TenantID: delivery.Reply.TenantID,
+			AppID:    delivery.Reply.AppID,
+			Channel:  string(delivery.Reply.Channel),
+		}, time.Since(started), errorType)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replyUncertainPersistTimeout)
+	defer cancel()
+	if err := s.outbox.MarkReplyUncertain(persistCtx, delivery, providerMessageID, cause); err != nil {
+		return fmt.Errorf("mark uncertain reply: %w", err)
+	}
+	return nil
+}
+
+func isReplySideEffectUncertain(err error) bool {
+	var marker interface{ IsSideEffectUncertain() bool }
+	return errors.As(err, &marker) && marker.IsSideEffectUncertain()
+}
+
 func (s *ReplySender) recordFailure(
 	ctx context.Context,
 	delivery ReplyDelivery,
@@ -332,6 +423,9 @@ func (s *ReplySender) recordFailure(
 	started time.Time,
 	span trace.Span,
 ) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if errorType == "" {
 		errorType = "provider_send"
 	}
@@ -345,6 +439,13 @@ func (s *ReplySender) recordFailure(
 	}
 	if retryable && delivery.Attempt < s.maxAttempts {
 		delay := retryDelay(delivery.Attempt)
+		retryAfter := retryAfterDelay(cause)
+		if retryAfter > replyRetryMax {
+			retryAfter = replyRetryMax
+		}
+		if retryAfter > delay {
+			delay = retryAfter
+		}
 		if err := s.outbox.RetryReply(ctx, delivery, errorType, delay, cause); err != nil {
 			return fmt.Errorf("retry reply: %w", err)
 		}
@@ -366,20 +467,63 @@ func classifyReplyError(err error) (bool, string) {
 	}
 	var retryableErr interface{ IsRetryable() bool }
 	if errors.As(err, &retryableErr) && retryableErr.IsRetryable() {
+		var typed interface{ RetryErrorType() string }
+		if errors.As(err, &typed) && typed.RetryErrorType() != "" {
+			return true, typed.RetryErrorType()
+		}
 		return true, "provider_retryable"
 	}
 	return false, "provider_permanent"
 }
 
 func retryDelay(attempt int) time.Duration {
-	if attempt <= 0 {
-		return time.Second
+	if attempt < 1 {
+		attempt = 1
 	}
-	delay := time.Duration(attempt) * time.Second
-	if delay > time.Minute {
-		return time.Minute
+	delay := replyRetryInitial
+	for attempt > 1 && delay < replyRetryMax {
+		delay *= 2
+		attempt--
+	}
+	if delay > replyRetryMax {
+		delay = replyRetryMax
+	}
+	half := delay / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+
+type retryAfterError interface {
+	RetryAfter() time.Duration
+}
+
+func retryAfterDelay(err error) time.Duration {
+	var providerError retryAfterError
+	if !errors.As(err, &providerError) {
+		return 0
+	}
+	delay := providerError.RetryAfter()
+	if delay < 0 {
+		return 0
 	}
 	return delay
+}
+
+func replyLoopRetryDelay(attempt int) time.Duration {
+	return retryDelay(attempt + 1)
+}
+
+func waitForReplySender(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		delay = defaultReplyPollInterval
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func visibleAssistantText(evt *event.Event) string {

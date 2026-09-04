@@ -2,27 +2,23 @@ package feishu
 
 import (
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
 
 const (
-	feishuMessageEventType  = "im.message.receive_v1"
-	feishuRecallEventType   = "im.message.recalled_v1"
-	feishuChallengeType     = "url_verification"
-	feishuEventCallbackType = "event_callback"
+	feishuMessageEventType = "im.message.receive_v1"
+	feishuRecallEventType  = "im.message.recalled_v1"
 
 	feishuTargetUser         = "open_id"
 	feishuTargetConversation = "chat_id"
@@ -31,13 +27,8 @@ const (
 )
 
 var (
-	errFeishuCallbackBody      = errors.New("feishu callback body is invalid")
-	errFeishuCallbackSignature = errors.New("invalid feishu callback signature")
-	errFeishuCallbackTimestamp = errors.New("invalid feishu callback timestamp")
-	errFeishuCallbackToken     = errors.New("invalid feishu verification token")
-	errFeishuCallbackEvent     = errors.New("feishu callback event is invalid")
-	errFeishuCallbackType      = errors.New("feishu callback type is invalid")
-	errFeishuBindingAccount    = errors.New("feishu binding account does not match callback")
+	errFeishuEvent             = errors.New("feishu event is invalid")
+	errFeishuBindingAccount    = errors.New("feishu binding account does not match event")
 	errFeishuMessageID         = errors.New("feishu message id is required")
 	errFeishuSenderID          = errors.New("feishu sender open_id is required")
 	errFeishuConversation      = errors.New("feishu conversation is invalid")
@@ -48,8 +39,8 @@ var (
 	errFeishuRecallEventID     = errors.New("feishu recall event id is required")
 )
 
-// VerifiedProviderEnvelope is the provider-neutral result of Feishu callback
-// verification. Provider JSON and provider secrets stop at this boundary.
+// VerifiedProviderEnvelope is the provider-neutral result of one authenticated
+// Feishu long-connection event. Provider JSON stops at this boundary.
 type VerifiedProviderEnvelope struct {
 	TenantID          string
 	AppID             string
@@ -141,183 +132,22 @@ func (e VerifiedProviderEnvelope) Validate() error {
 	return nil
 }
 
-type callbackEnvelope struct {
-	Type      string                 `json:"type"`
-	Token     string                 `json:"token"`
-	Challenge string                 `json:"challenge"`
-	Encrypt   string                 `json:"encrypt"`
-	Header    *larkevent.EventHeader `json:"header"`
-}
-
-type callbackMetadata struct {
-	RequestType string
-	EventType   string
-	EventID     string
-	Token       string
-	Challenge   string
-	AppID       string
-	TenantKey   string
-}
-
-func decodeCallback(
-	body []byte,
-	headers http.Header,
-	encryptKey string,
-	now time.Time,
-	maxClockSkew time.Duration,
-) ([]byte, callbackMetadata, error) {
-	if len(body) == 0 {
-		return nil, callbackMetadata{}, errFeishuCallbackBody
-	}
-	var outer callbackEnvelope
-	if err := json.Unmarshal(body, &outer); err != nil {
-		return nil, callbackMetadata{}, fmt.Errorf("%w: json", errFeishuCallbackBody)
-	}
-	plain := body
-	if outer.Encrypt != "" {
-		if encryptKey == "" {
-			return nil, callbackMetadata{}, errFeishuCallbackSignature
-		}
-		var err error
-		plain, err = larkevent.EventDecrypt(outer.Encrypt, encryptKey)
-		if err != nil {
-			return nil, callbackMetadata{}, fmt.Errorf("%w: decrypt", errFeishuCallbackBody)
-		}
-	}
-	metadata, err := parseCallbackMetadata(plain)
-	if err != nil {
-		return nil, callbackMetadata{}, err
-	}
-	// The official SDK skips signature verification for URL challenges. Keep
-	// that behavior, while requiring a fresh request timestamp for every
-	// normal callback and a signature when an Encrypt Key is configured.
-	if metadata.RequestType != feishuChallengeType {
-		if err := verifyCallbackTimestamp(headers, now, maxClockSkew); err != nil {
-			return nil, callbackMetadata{}, err
-		}
-		if encryptKey != "" {
-			if err := verifyCallbackSignature(headers, encryptKey, body); err != nil {
-				return nil, callbackMetadata{}, err
-			}
-		}
-	}
-	return plain, metadata, nil
-}
-
-func parseCallbackMetadata(body []byte) (callbackMetadata, error) {
-	var envelope callbackEnvelope
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return callbackMetadata{}, fmt.Errorf("%w: json", errFeishuCallbackBody)
-	}
-	metadata := callbackMetadata{
-		RequestType: strings.TrimSpace(envelope.Type),
-		Token:       envelope.Token,
-		Challenge:   envelope.Challenge,
-	}
-	if envelope.Header != nil {
-		metadata.EventID = envelope.Header.EventID
-		metadata.EventType = envelope.Header.EventType
-		metadata.AppID = envelope.Header.AppID
-		metadata.TenantKey = envelope.Header.TenantKey
-		if envelope.Header.Token != "" {
-			metadata.Token = envelope.Header.Token
-		}
-	}
-	if metadata.RequestType == "" && metadata.EventType != "" {
-		metadata.RequestType = feishuEventCallbackType
-	}
-	if metadata.RequestType == "" {
-		return callbackMetadata{}, errFeishuCallbackType
-	}
-	return metadata, nil
-}
-
-func verifyCallbackTimestamp(headers http.Header, now time.Time, maxClockSkew time.Duration) error {
-	timestamp, err := oneHeaderValue(headers, larkevent.EventRequestTimestamp)
-	if err != nil {
-		return errFeishuCallbackTimestamp
-	}
-	seconds, err := strconv.ParseInt(strings.TrimSpace(timestamp), 10, 64)
-	if err != nil || seconds <= 0 || now.IsZero() || maxClockSkew <= 0 {
-		return errFeishuCallbackTimestamp
-	}
-	providerTime := time.Unix(seconds, 0)
-	if providerTime.Before(now.Add(-maxClockSkew)) || providerTime.After(now.Add(maxClockSkew)) {
-		return errFeishuCallbackTimestamp
-	}
-	return nil
-}
-
-func verifyCallbackSignature(headers http.Header, encryptKey string, body []byte) error {
-	timestamp, err := oneHeaderValue(headers, larkevent.EventRequestTimestamp)
-	if err != nil {
-		return errFeishuCallbackSignature
-	}
-	nonce, err := oneHeaderValue(headers, larkevent.EventRequestNonce)
-	if err != nil {
-		return errFeishuCallbackSignature
-	}
-	signature, err := oneHeaderValue(headers, larkevent.EventSignature)
-	if err != nil {
-		return errFeishuCallbackSignature
-	}
-	expected := larkevent.Signature(timestamp, nonce, encryptKey, string(body))
-	if len(signature) != len(expected) || subtle.ConstantTimeCompare([]byte(signature), []byte(expected)) != 1 {
-		return errFeishuCallbackSignature
-	}
-	return nil
-}
-
-func oneHeaderValue(headers http.Header, name string) (string, error) {
-	values := headers.Values(name)
-	if len(values) != 1 || values[0] == "" {
-		return "", errFeishuCallbackSignature
-	}
-	return values[0], nil
-}
-
-func verifyCallbackMetadata(metadata callbackMetadata, binding channels.BindingSnapshot, verificationToken string) error {
-	if verificationToken == "" || metadata.Token == "" ||
-		len(verificationToken) != len(metadata.Token) ||
-		subtle.ConstantTimeCompare([]byte(verificationToken), []byte(metadata.Token)) != 1 {
-		return errFeishuCallbackToken
-	}
-	if metadata.AppID != "" && metadata.AppID != binding.ExternalAccount {
-		return errFeishuBindingAccount
-	}
-	if metadata.TenantKey != "" && metadata.TenantKey != binding.ExternalAccountScope {
-		return errFeishuBindingAccount
-	}
-	if metadata.RequestType == feishuChallengeType {
-		if metadata.Challenge == "" {
-			return errFeishuCallbackType
-		}
-		return nil
-	}
-	if metadata.RequestType != feishuEventCallbackType || metadata.EventType == "" {
-		return errFeishuCallbackType
-	}
-	if metadata.AppID == "" || metadata.AppID != binding.ExternalAccount ||
-		metadata.TenantKey == "" || binding.ExternalAccountScope == "" ||
-		metadata.TenantKey != binding.ExternalAccountScope {
-		return errFeishuBindingAccount
-	}
-	return nil
-}
-
+// normalizeMessageEvent converts the event delivered by the official Feishu
+// WebSocket SDK. TenantKey is event metadata, not a required Binding input;
+// Binding scope is established by the client credentials and App ID check.
 func normalizeMessageEvent(binding channels.BindingSnapshot, received *larkim.P2MessageReceiveV1) (VerifiedProviderEnvelope, error) {
 	if received == nil || received.EventV2Base == nil || received.EventV2Base.Header == nil || received.Event == nil || received.Event.Message == nil {
-		return VerifiedProviderEnvelope{}, errFeishuCallbackEvent
+		return VerifiedProviderEnvelope{}, errFeishuEvent
 	}
 	header := received.EventV2Base.Header
-	if header.AppID != binding.ExternalAccount ||
-		header.TenantKey == "" || binding.ExternalAccountScope == "" ||
-		header.TenantKey != binding.ExternalAccountScope {
+	if header.AppID != binding.ExternalAccount {
 		return VerifiedProviderEnvelope{}, errFeishuBindingAccount
 	}
+	if header.EventType != "" && header.EventType != feishuMessageEventType {
+		return VerifiedProviderEnvelope{}, errFeishuEvent
+	}
 	message := received.Event.Message
-	senderID := senderOpenID(received.Event.Sender)
-	normalizedSenderID, err := channels.NormalizeExternalID(senderID)
+	senderID, err := channels.NormalizeExternalID(senderOpenID(received.Event.Sender))
 	if err != nil {
 		return VerifiedProviderEnvelope{}, errFeishuSenderID
 	}
@@ -340,8 +170,8 @@ func normalizeMessageEvent(binding channels.BindingSnapshot, received *larkim.P2
 		return VerifiedProviderEnvelope{}, err
 	}
 	mapping := channels.ChannelMappingInput{
-		ExternalSenderID:     normalizedSenderID,
-		ProviderSenderTarget: providerTarget(feishuTargetUser, normalizedSenderID),
+		ExternalSenderID:     senderID,
+		ProviderSenderTarget: providerTarget(feishuTargetUser, senderID),
 	}
 	if conversationKind == channels.ConversationGroup || conversationKind == channels.ConversationTopic {
 		mapping.ExternalChatID = chatID
@@ -358,7 +188,7 @@ func normalizeMessageEvent(binding channels.BindingSnapshot, received *larkim.P2
 		BindingID:         binding.BindingID,
 		BindingRevision:   binding.BindingRevision,
 		ExternalMessageID: messageID,
-		SenderID:          normalizedSenderID,
+		SenderID:          senderID,
 		ConversationKind:  conversationKind,
 		ChatID:            chatID,
 		ThreadID:          threadID,
@@ -376,12 +206,10 @@ func normalizeMessageEvent(binding channels.BindingSnapshot, received *larkim.P2
 }
 
 // normalizeRecallEvent converts the official Feishu recall event into the
-// provider-neutral recall boundary. The payload digest is calculated over the
-// already verified/decrypted callback, while scope and binding authorization
-// come only from the route snapshot.
+// existing durable recall boundary. It only checks App ID and event identity;
+// TenantKey remains metadata and is never a required deployment setting.
 func normalizeRecallEvent(
 	binding channels.BindingSnapshot,
-	metadata callbackMetadata,
 	recalled *larkim.P2MessageRecalledV1,
 	payloadHash []byte,
 ) (channels.RecallRequest, error) {
@@ -389,14 +217,14 @@ func normalizeRecallEvent(
 		return channels.RecallRequest{}, errFeishuRecallEvent
 	}
 	header := recalled.EventV2Base.Header
-	if header.EventType != feishuRecallEventType ||
-		header.AppID != binding.ExternalAccount ||
-		header.TenantKey == "" || binding.ExternalAccountScope == "" ||
-		header.TenantKey != binding.ExternalAccountScope {
+	if header.EventType != "" && header.EventType != feishuRecallEventType {
+		return channels.RecallRequest{}, errFeishuRecallEvent
+	}
+	if header.AppID != binding.ExternalAccount {
 		return channels.RecallRequest{}, errFeishuBindingAccount
 	}
-	eventID, err := channels.NormalizeExternalID(metadata.EventID)
-	if err != nil || eventID != metadata.EventID || eventID != header.EventID {
+	eventID, err := channels.NormalizeExternalID(header.EventID)
+	if err != nil || eventID != header.EventID {
 		return channels.RecallRequest{}, errFeishuRecallEventID
 	}
 	messageID, err := channels.NormalizeExternalID(valueOf(recalled.Event.MessageId))
@@ -434,8 +262,6 @@ func normalizeConversation(chatType, chatID, threadID string) (channels.Conversa
 		if threadID != "" {
 			return "", "", "", errFeishuConversation
 		}
-		// Feishu supplies a chat_id for some private events. Direct-message
-		// mapping intentionally uses only the sender identity.
 		return channels.ConversationDirect, "", "", nil
 	case "group":
 		normalizedChatID, err := channels.NormalizeExternalID(chatID)
@@ -474,9 +300,7 @@ func normalizeMessageContent(messageType, raw string) (channels.MessageType, str
 		if err := unmarshalObject(raw, &content); err != nil || !isNormalizedID(content.ImageKey) {
 			return "", "", nil, errFeishuMessageContent
 		}
-		return channels.MessageTypeImage, "", []channels.ProviderMediaRef{{
-			Kind: channels.MessageTypeImage, Reference: content.ImageKey,
-		}}, nil
+		return channels.MessageTypeImage, "", []channels.ProviderMediaRef{{Kind: channels.MessageTypeImage, Reference: content.ImageKey}}, nil
 	case "file":
 		var content struct {
 			FileKey string `json:"file_key"`
@@ -484,21 +308,14 @@ func normalizeMessageContent(messageType, raw string) (channels.MessageType, str
 		if err := unmarshalObject(raw, &content); err != nil || !isNormalizedID(content.FileKey) {
 			return "", "", nil, errFeishuMessageContent
 		}
-		return channels.MessageTypeFile, "", []channels.ProviderMediaRef{{
-			Kind: channels.MessageTypeFile, Reference: content.FileKey,
-		}}, nil
+		return channels.MessageTypeFile, "", []channels.ProviderMediaRef{{Kind: channels.MessageTypeFile, Reference: content.FileKey}}, nil
 	case "interactive":
 		var content map[string]json.RawMessage
 		if err := unmarshalObject(raw, &content); err != nil || len(content) == 0 {
 			return "", "", nil, errFeishuMessageContent
 		}
-		// The current shared ChannelInput has no action-event contract. Do not
-		// silently turn a provider card into an empty executable message; let
-		// admission durably reject it as an unsupported inbound type.
 		return channels.MessageTypeUnsupported, "", nil, nil
 	default:
-		// Verification succeeded, but the current platform contract does not
-		// expose this provider content to Gateway or Runner.
 		return channels.MessageTypeUnsupported, "", nil, nil
 	}
 }
@@ -545,9 +362,7 @@ func normalizePost(raw string) (channels.MessageType, string, []channels.Provide
 				if !isNormalizedID(element.ImageKey) {
 					return "", "", nil, errFeishuMessageContent
 				}
-				media = append(media, channels.ProviderMediaRef{
-					Kind: channels.MessageTypeImage, Reference: element.ImageKey,
-				})
+				media = append(media, channels.ProviderMediaRef{Kind: channels.MessageTypeImage, Reference: element.ImageKey})
 			case "text", "a", "at", "emoji":
 				value := element.Text
 				if value == "" {
@@ -581,7 +396,7 @@ func unmarshalObject(raw string, target any) error {
 	if err := decoder.Decode(&object); err != nil || object == nil {
 		return errFeishuMessageContent
 	}
-	if err := decoder.Decode(&struct{}{}); err == nil {
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return errFeishuMessageContent
 	}
 	if err := json.Unmarshal([]byte(raw), target); err != nil {
@@ -596,7 +411,7 @@ func providerTimestamp(value string) (time.Time, error) {
 	}
 	millis, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || millis < 0 {
-		return time.Time{}, errFeishuCallbackEvent
+		return time.Time{}, errFeishuEvent
 	}
 	if millis == 0 {
 		return time.Time{}, nil

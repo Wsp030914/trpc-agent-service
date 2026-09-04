@@ -12,6 +12,7 @@ import (
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -186,8 +187,12 @@ func (r *Runtime) toolCallbacks(exec worker.Execution) *frameworktool.Callbacks 
 	callbacks := frameworktool.NewCallbacks()
 	callbacks.RegisterBeforeTool(func(ctx context.Context, args *frameworktool.BeforeToolArgs) (*frameworktool.BeforeToolResult, error) {
 		name := ""
+		toolCallID := ""
+		var arguments []byte
 		if args != nil {
 			name = args.ToolName
+			toolCallID = args.ToolCallID
+			arguments = args.Arguments
 		}
 		toolCtx, span := platformtelemetry.StartSpan(ctx, "tool.execute",
 			attribute.String("tenant_id", exec.Tenant.TenantID),
@@ -196,6 +201,14 @@ func (r *Runtime) toolCallbacks(exec worker.Execution) *frameworktool.Callbacks 
 			attribute.String("request_id", exec.RequestID),
 			attribute.String("tool.name", name),
 		)
+		toolCtx = platformtool.WithIdempotencyKey(toolCtx, platformtool.StableIdempotencyKey(
+			exec.Tenant.TenantID,
+			exec.Tenant.AppID,
+			exec.RequestID,
+			toolCallID,
+			name,
+			arguments,
+		))
 		return &frameworktool.BeforeToolResult{
 			Context: context.WithValue(toolCtx, toolSpanStateKey{}, toolSpanState{
 				span:  span,
@@ -284,6 +297,9 @@ func (r *Runtime) recordAudit(ctx context.Context, exec worker.Execution, event 
 	}
 	if event.ConfigVersion == "" {
 		event.ConfigVersion = exec.Tenant.ConfigVersion
+	}
+	if exec.Config.Audit.RedactPII {
+		event = platformaudit.RedactEvent(event)
 	}
 	if ctx == nil {
 		ctx = context.Background()

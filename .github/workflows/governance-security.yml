@@ -1,0 +1,37 @@
+name: Governance and Security
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  governance-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: governance, approval, audit, and security contracts
+        run: >-
+          go test
+          ./trpcservice/tenant
+          ./trpcservice/tool
+          ./trpcservice/worker
+          ./trpcservice/admin
+          ./trpcservice/audit
+          ./trpcservice/metrics
+          ./trpcservice/telemetry
+          ./trpcservice/ingress
+          ./trpcservice/channels/feishu
+          ./trpcservice/channels/wecom
+      - name: static secret scan of tracked source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -n -E 'sk-test-super-secret|password=secret123|Bearer token123' -- ':!docs/spec-04-05-hardening.md' ':!**/*_test.go'; then
+            echo 'test credentials must not be committed outside the specification' >&2
+            exit 1
+          fi

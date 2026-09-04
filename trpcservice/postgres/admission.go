@@ -42,7 +42,7 @@ func (s *Store) Admit(
 		return gateway.AdmissionResult{}, gateway.ErrChannelInputRequired
 	}
 	if request.ChannelInput != nil {
-		// Channel webhook idempotency is defined by the binding-scoped provider
+		// Channel event idempotency is defined by the binding-scoped provider
 		// message ID. Do not let a caller-supplied key alias another message.
 		request.IdempotencyKey = request.ChannelInput.ExternalMessageID
 	}
@@ -263,6 +263,9 @@ func (s *Store) Admit(
 					ConfigVersion: app.ActiveConfigVersion,
 					EventType:     platformaudit.IMAccessDenied,
 				}
+				if appConfig.Audit.RedactPII {
+					event = platformaudit.RedactEvent(event)
+				}
 				s.recordAuditBestEffort(ctx, event)
 			}
 			if s.metrics != nil {
@@ -450,75 +453,21 @@ func (a admissionTransaction) reconcileExisting(existing admissionExecution) (ga
 	if !bytes.Equal(existing.PayloadHash, a.payloadHash[:]) {
 		return gateway.AdmissionResult{}, gateway.ErrIdempotencyConflict
 	}
-	if existing.Status != "FAILED" {
-		status := gateway.AdmissionStatus("")
-		if a.channelAdmission {
-			status = gateway.AdmissionStatusAdmitted
-		}
-		result := gateway.AdmissionResult{
-			RequestID:     existing.RequestID,
-			ConfigVersion: existing.ConfigVersion,
-			TurnSeq:       existing.TurnSeq,
-			Replayed:      true,
-			Status:        status,
-		}
-		if err := a.tx.Commit(a.ctx); err != nil {
-			return gateway.AdmissionResult{}, fmt.Errorf("commit replayed admission: %w", err)
-		}
-		return result, nil
-	}
+	status := gateway.AdmissionStatus("")
 	if a.channelAdmission {
-		result := gateway.AdmissionResult{
-			RequestID:     existing.RequestID,
-			ConfigVersion: existing.ConfigVersion,
-			TurnSeq:       existing.TurnSeq,
-			Replayed:      true,
-			Status:        gateway.AdmissionStatusAdmitted,
-		}
-		if err := a.tx.Commit(a.ctx); err != nil {
-			return gateway.AdmissionResult{}, fmt.Errorf("commit failed channel replay: %w", err)
-		}
-		return result, nil
+		status = gateway.AdmissionStatusAdmitted
 	}
-	blocked, err := migrationBlocksAdmission(a.ctx, a.tx, a.app.TenantID, a.app.AppID)
-	if err != nil {
-		return gateway.AdmissionResult{}, err
-	}
-	if blocked {
-		return gateway.AdmissionResult{}, gateway.ErrAdmissionDraining
-	}
-	// A failed terminal execution is re-armed instead of replayed so
-	// clients can retry the same logical request. The retry keeps the
-	// execution's pinned configuration and receives a fresh attempt budget;
-	// the relay recovery refills its dispatch record.
-	tag, err := a.tx.Exec(
-		a.ctx,
-		`UPDATE platform.execution
-SET status = 'PENDING', attempt = 0, last_error = NULL,
-    lease_owner = NULL, run_token = NULL, lease_until = NULL, finished_at = NULL,
-    next_attempt_at = clock_timestamp(), updated_at = clock_timestamp()
-WHERE tenant_id = $1
-  AND app_id = $2
-  AND request_id = $3
-  AND status = 'FAILED'`,
-		a.credential.TenantID,
-		a.credential.AppID,
-		existing.RequestID,
-	)
-	if err != nil {
-		return gateway.AdmissionResult{}, fmt.Errorf("re-arm failed execution: %w", err)
-	}
-	if tag.RowsAffected() != 1 {
-		return gateway.AdmissionResult{}, fmt.Errorf("re-arm failed execution: %w", ErrNotFound)
-	}
-	if err := a.tx.Commit(a.ctx); err != nil {
-		return gateway.AdmissionResult{}, fmt.Errorf("commit re-armed admission: %w", err)
-	}
-	return gateway.AdmissionResult{
+	result := gateway.AdmissionResult{
 		RequestID:     existing.RequestID,
 		ConfigVersion: existing.ConfigVersion,
 		TurnSeq:       existing.TurnSeq,
-	}, nil
+		Replayed:      true,
+		Status:        status,
+	}
+	if err := a.tx.Commit(a.ctx); err != nil {
+		return gateway.AdmissionResult{}, fmt.Errorf("commit replayed admission: %w", err)
+	}
+	return result, nil
 }
 
 func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error) {

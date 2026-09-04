@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"mime"
+	"net/http"
+	"path"
 	"strings"
 )
 
@@ -16,6 +19,21 @@ type DownloadedMedia struct {
 	Filename string
 	MIMEType string
 	Data     []byte
+}
+
+// DetectMediaMIMEType prefers a trustworthy filename extension over magic-byte
+// sniffing. Office Open XML files are ZIP containers, so sniffing alone would
+// make .docx/.xlsx/.pptx unreadable to models that use the MIME type.
+func DetectMediaMIMEType(filename string, data []byte) string {
+	if extension := path.Ext(strings.TrimSpace(filename)); extension != "" {
+		if detected := mime.TypeByExtension(strings.ToLower(extension)); detected != "" {
+			if detected == "application/x-zip-compressed" {
+				return "application/zip"
+			}
+			return detected
+		}
+	}
+	return http.DetectContentType(data)
 }
 
 // InboundArtifact identifies one deterministic, tenant-scoped artifact write.

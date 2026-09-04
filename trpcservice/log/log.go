@@ -18,6 +18,8 @@ var (
 	urlCredentialPattern = regexp.MustCompile(`(?i)(://[^/\s:@]+:)[^@/\s]+(@)`)
 	openAIKeyPattern     = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{16,}\b`)
 	awsKeyPattern        = regexp.MustCompile(`\b(AKIA|ASIA)[A-Z0-9]{16}\b`)
+	emailPattern         = regexp.MustCompile(`(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b`)
+	phonePattern         = regexp.MustCompile(`(?:\+?86[- ]?)?1[3-9]\d{9}\b`)
 )
 
 // RoutingFields returns the allowlisted tenant routing fields safe for logs.
@@ -65,6 +67,8 @@ func SafeError(err error) string {
 	value = urlCredentialPattern.ReplaceAllString(value, `${1}[REDACTED]${2}`)
 	value = openAIKeyPattern.ReplaceAllString(value, `[REDACTED]`)
 	value = awsKeyPattern.ReplaceAllString(value, `[REDACTED]`)
+	value = emailPattern.ReplaceAllString(value, `[REDACTED]`)
+	value = phonePattern.ReplaceAllString(value, `[REDACTED]`)
 	if len([]rune(value)) > safeErrorMaxLength {
 		value = string([]rune(value)[:safeErrorMaxLength])
 	}

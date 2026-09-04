@@ -15,6 +15,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
 const executionEventPollInterval = 200 * time.Millisecond
@@ -159,7 +160,11 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
 		return fmt.Errorf("insert execution event: %w", err)
 	}
 	if j.replyBuilder != nil {
-		replies, err := j.replyBuilder(ctx, exec, sequence, evt)
+		replyEvent, err := j.replyProjectionEvent(ctx, tx, exec, sequence, evt)
+		if err != nil {
+			return fmt.Errorf("resolve reply projection event: %w", err)
+		}
+		replies, err := j.replyBuilder(ctx, exec, sequence, replyEvent)
 		if err != nil {
 			return fmt.Errorf("build reply projection: %w", err)
 		}
@@ -179,6 +184,85 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
 		return fmt.Errorf("commit execution event append: %w", err)
 	}
 	return nil
+}
+
+// replyProjectionEvent preserves the terminal runner event as the durable
+// event while supplying its preceding final assistant response to the reply
+// projector. The framework's runner.completion event intentionally contains
+// completion metadata only; the user-visible choices are on the preceding
+// chat.completion event.
+func (j *ExecutionEventJournal) replyProjectionEvent(
+	ctx context.Context,
+	tx pgx.Tx,
+	exec worker.Execution,
+	sequence int64,
+	completion *event.Event,
+) (*event.Event, error) {
+	if completion == nil || !completion.IsRunnerCompletion() ||
+		completion.Error != nil || completion.IsTerminalError() ||
+		hasAssistantReplyText(completion) {
+		return completion, nil
+	}
+	rows, err := tx.Query(ctx, `
+SELECT payload
+FROM platform.execution_event
+WHERE tenant_id = $1
+  AND app_id = $2
+  AND request_id = $3
+  AND event_seq < $4
+  AND event_type = $5
+ORDER BY event_seq DESC`,
+		exec.Tenant.TenantID,
+		exec.Tenant.AppID,
+		exec.RequestID,
+		sequence,
+		model.ObjectTypeChatCompletion,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query final assistant event: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, fmt.Errorf("scan final assistant event: %w", err)
+		}
+		candidate := &event.Event{}
+		if err := json.Unmarshal(payload, candidate); err != nil {
+			return nil, fmt.Errorf("decode final assistant event: %w", err)
+		}
+		if candidate.RequestID != "" && candidate.RequestID != exec.RequestID {
+			continue
+		}
+		if candidate.Response == nil || candidate.Object != model.ObjectTypeChatCompletion ||
+			!candidate.Done || candidate.IsPartial || !hasAssistantReplyText(candidate) {
+			continue
+		}
+		merged := *completion
+		response := *completion.Response
+		response.Choices = append([]model.Choice(nil), candidate.Response.Choices...)
+		merged.Response = &response
+		return &merged, nil
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate final assistant events: %w", err)
+	}
+	return completion, nil
+}
+
+func hasAssistantReplyText(evt *event.Event) bool {
+	if evt == nil || evt.Response == nil {
+		return false
+	}
+	for _, choice := range evt.Response.Choices {
+		if choice.Message.Role != "" && choice.Message.Role != model.RoleAssistant {
+			continue
+		}
+		if choice.Message.Content != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // SubscribeExecutionEvents streams persisted events after afterSequence. The
@@ -231,6 +315,7 @@ func (j *ExecutionEventJournal) streamExecutionEvents(
 	for {
 		items, err := j.executionEventsAfter(ctx, scope, requestID, afterSequence)
 		if err != nil {
+			sendExecutionStreamError(ctx, output, requestID, afterSequence, err)
 			return
 		}
 		for _, item := range items {
@@ -246,10 +331,11 @@ func (j *ExecutionEventJournal) streamExecutionEvents(
 		}
 		status, err := j.executionStatus(ctx, scope, requestID)
 		if err != nil {
+			sendExecutionStreamError(ctx, output, requestID, afterSequence, err)
 			return
 		}
 		switch status {
-		case "FAILED", "CANCELED":
+		case "FAILED", "UNCERTAIN", "CANCELED":
 			terminal := event.NewErrorEvent(
 				requestID,
 				"platform",
@@ -274,6 +360,28 @@ func (j *ExecutionEventJournal) streamExecutionEvents(
 			return
 		case <-timer.C:
 		}
+	}
+}
+
+func sendExecutionStreamError(
+	ctx context.Context,
+	output chan<- gateway.ExecutionEvent,
+	requestID string,
+	afterSequence int64,
+	_ error,
+) {
+	if ctx.Err() != nil {
+		return
+	}
+	terminal := event.NewErrorEvent(
+		requestID,
+		"platform",
+		"execution_stream_unavailable",
+		"execution result is incomplete because durable events are temporarily unavailable",
+	)
+	select {
+	case <-ctx.Done():
+	case output <- gateway.ExecutionEvent{Sequence: afterSequence + 1, Event: terminal}:
 	}
 }
 

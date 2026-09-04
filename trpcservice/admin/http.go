@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	platformapproval "github.com/liuzengh/trpc-agent-service/trpcservice/approval"
 	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -42,6 +43,8 @@ func NewHTTPHandler(api API, token string) (http.Handler, error) {
 	mux.HandleFunc("/admin/v1/credentials", methodHandler(http.MethodPost, handler.issueCredential))
 	mux.HandleFunc("/admin/v1/credentials/revoke", methodHandler(http.MethodPost, handler.revokeCredential))
 	mux.HandleFunc("/admin/v1/audit-events", methodHandler(http.MethodGet, handler.listAuditEvents))
+	mux.HandleFunc("/admin/v1/approvals", methodHandler(http.MethodGet, handler.listApprovals))
+	mux.HandleFunc("/admin/v1/approvals/", methodHandler(http.MethodPost, handler.decideApproval))
 	return handler.authorize(mux), nil
 }
 
@@ -128,6 +131,15 @@ type credentialResponse struct {
 
 type auditEventsResponse struct {
 	Events []platformaudit.Event `json:"events"`
+}
+
+type approvalsResponse struct {
+	Approvals []platformapproval.Record `json:"approvals"`
+}
+
+type approvalDecisionRequest struct {
+	TenantID string `json:"tenant_id"`
+	AppID    string `json:"app_id"`
 }
 
 func (h adminHTTPHandler) authorize(next http.Handler) http.Handler {
@@ -321,15 +333,99 @@ func (h adminHTTPHandler) listAuditEvents(w http.ResponseWriter, r *http.Request
 		}
 		limit = parsed
 	}
-	events, err := h.api.ListAuditEvents(r.Context(), tenant.Scope{
-		TenantID: strings.TrimSpace(query.Get("tenant_id")),
-		AppID:    strings.TrimSpace(query.Get("app_id")),
-	}, limit)
+	filter := platformaudit.Query{
+		TenantID:  strings.TrimSpace(query.Get("tenant_id")),
+		AppID:     strings.TrimSpace(query.Get("app_id")),
+		EventType: strings.TrimSpace(query.Get("event_type")),
+		TraceID:   strings.TrimSpace(query.Get("trace_id")),
+		Limit:     limit,
+	}
+	if raw := strings.TrimSpace(query.Get("created_after")); raw != "" {
+		value, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid audit created_after")
+			return
+		}
+		filter.CreatedAfter = &value
+	}
+	if raw := strings.TrimSpace(query.Get("created_before")); raw != "" {
+		value, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid audit created_before")
+			return
+		}
+		filter.CreatedBefore = &value
+	}
+	var events []platformaudit.Event
+	var err error
+	if filter.EventType != "" || filter.TraceID != "" || filter.CreatedAfter != nil || filter.CreatedBefore != nil {
+		events, err = h.api.ListAuditEventsQuery(r.Context(), filter)
+	} else {
+		events, err = h.api.ListAuditEvents(r.Context(), tenant.Scope{
+			TenantID: filter.TenantID,
+			AppID:    filter.AppID,
+		}, filter.Limit)
+	}
 	if err != nil {
 		writeAdminOperationError(w, err, "list audit events failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, auditEventsResponse{Events: events})
+}
+
+func (h adminHTTPHandler) listApprovals(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	limit := 0
+	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 1000 {
+			writeJSONError(w, http.StatusBadRequest, "invalid approval limit")
+			return
+		}
+		limit = parsed
+	}
+	status := platformapproval.Status(strings.TrimSpace(query.Get("status")))
+	approvals, err := h.api.ListApprovals(r.Context(), platformapproval.Query{
+		TenantID: strings.TrimSpace(query.Get("tenant_id")),
+		AppID:    strings.TrimSpace(query.Get("app_id")),
+		Status:   status,
+		Limit:    limit,
+	})
+	if err != nil {
+		writeAdminOperationError(w, err, "list approvals failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, approvalsResponse{Approvals: approvals})
+}
+
+func (h adminHTTPHandler) decideApproval(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/v1/approvals/"), "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || (parts[1] != "approve" && parts[1] != "deny") {
+		http.NotFound(w, r)
+		return
+	}
+	var request approvalDecisionRequest
+	request.TenantID = strings.TrimSpace(r.URL.Query().Get("tenant_id"))
+	request.AppID = strings.TrimSpace(r.URL.Query().Get("app_id"))
+	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+		if !decodeJSON(w, r, &request) {
+			writeJSONError(w, http.StatusBadRequest, "invalid approval decision")
+			return
+		}
+	}
+	status := platformapproval.StatusDenied
+	if parts[1] == "approve" {
+		status = platformapproval.StatusApproved
+	}
+	record, err := h.api.DecideApproval(r.Context(), tenant.Scope{
+		TenantID: strings.TrimSpace(request.TenantID),
+		AppID:    strings.TrimSpace(request.AppID),
+	}, parts[0], status)
+	if err != nil {
+		writeAdminOperationError(w, err, "decide approval failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, record)
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
@@ -370,6 +466,12 @@ func writeAdminOperationError(w http.ResponseWriter, err error, message string) 
 	var inputErr *inputError
 	if errors.As(err, &inputErr) {
 		status = http.StatusBadRequest
+	}
+	if errors.Is(err, platformapproval.ErrNotFound) {
+		status = http.StatusNotFound
+	}
+	if errors.Is(err, platformapproval.ErrAlreadyDecided) || errors.Is(err, platformapproval.ErrExpired) {
+		status = http.StatusConflict
 	}
 	writeJSONError(w, status, message)
 }

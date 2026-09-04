@@ -238,7 +238,10 @@ func (s *InboundObjectStore) Put(
 	}
 	key := s.prefix + ":" + objectID
 	_, err := s.client.Object.Put(ctx, key, bytes.NewReader(value.Data), &cosclient.ObjectPutOptions{
-		ObjectPutHeaderOptions: &cosclient.ObjectPutHeaderOptions{ContentType: value.MimeType},
+		ObjectPutHeaderOptions: &cosclient.ObjectPutHeaderOptions{
+			ContentType:        value.MimeType,
+			ContentDisposition: mime.FormatMediaType("attachment", map[string]string{"filename": value.Name}),
+		},
 	})
 	if err != nil {
 		return "", fmt.Errorf("upload inbound artifact: %w", err)
@@ -290,7 +293,13 @@ func (s *versionedService) LoadArtifactObject(
 	if int64(len(data)) != size {
 		return nil, errors.New("cos artifact object size does not match metadata")
 	}
-	return &artifact.Artifact{Data: data, MimeType: mimeType}, nil
+	filename := ""
+	if disposition := response.Header.Get("Content-Disposition"); disposition != "" {
+		if _, params, parseErr := mime.ParseMediaType(disposition); parseErr == nil {
+			filename = params["filename"]
+		}
+	}
+	return &artifact.Artifact{Data: data, MimeType: mimeType, Name: filename}, nil
 }
 
 func (s *versionedService) DeleteArtifactObject(ctx context.Context, objectKey string) error {

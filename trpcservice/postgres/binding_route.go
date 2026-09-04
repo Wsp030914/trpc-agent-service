@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 )
 
@@ -38,6 +41,51 @@ WHERE public_route_id = $1`, publicRouteID))
 		return channels.BindingSnapshot{}, channels.ErrBindingChannelMismatch
 	}
 	return binding.Snapshot(), nil
+}
+
+// ListActiveChannelBindings returns the authoritative active bindings used to
+// construct one provider client per tenant/application/binding scope.
+func (s *Store) ListActiveChannelBindings(
+	ctx context.Context,
+	channel channels.Channel,
+) ([]channels.Binding, error) {
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	if err := channel.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, channelBindingSelect+`
+WHERE channel = $1 AND status = $2
+ORDER BY tenant_id, app_id, binding_id`, channel, channels.BindingActive)
+	if err != nil {
+		return nil, fmt.Errorf("list active channel bindings: %w", err)
+	}
+	defer rows.Close()
+	bindings := make([]channels.Binding, 0)
+	for rows.Next() {
+		binding, err := scanChannelBinding(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan active channel binding: %w", err)
+		}
+		if err := binding.Validate(); err != nil {
+			return nil, fmt.Errorf("stored active channel binding: %w", err)
+		}
+		bindings = append(bindings, binding)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active channel bindings: %w", err)
+	}
+	slices.SortFunc(bindings, func(left, right channels.Binding) int {
+		if left.TenantID != right.TenantID {
+			return strings.Compare(left.TenantID, right.TenantID)
+		}
+		if left.AppID != right.AppID {
+			return strings.Compare(left.AppID, right.AppID)
+		}
+		return strings.Compare(left.BindingID, right.BindingID)
+	})
+	return bindings, nil
 }
 
 // RotateChannelBindingRoute replaces a binding's public route. The database
@@ -123,39 +171,39 @@ const channelBindingSelect = `SELECT
     binding_id,
     channel,
     external_account,
-    external_account_scope,
-    webhook_url,
-    token_ref,
-    signing_secret_ref,
     secret_ref,
     public_route_id,
     binding_revision,
     status
 FROM platform.channel_binding`
 
-func scanChannelBinding(row pgx.Row) (channels.Binding, error) {
+type channelBindingRow interface {
+	Scan(dest ...any) error
+}
+
+func scanChannelBinding(row channelBindingRow) (channels.Binding, error) {
 	var binding channels.Binding
-	var tokenRef, signingSecretRef, secret []byte
+	var secret []byte
+	var publicRouteID pgtype.Text
 	err := row.Scan(
 		&binding.TenantID,
 		&binding.AppID,
 		&binding.BindingID,
 		&binding.Channel,
 		&binding.ExternalAccount,
-		&binding.ExternalAccountScope,
-		&binding.WebhookURL,
-		&tokenRef,
-		&signingSecretRef,
 		&secret,
-		&binding.PublicRouteID,
+		&publicRouteID,
 		&binding.BindingRevision,
 		&binding.Status,
 	)
 	if err != nil {
 		return channels.Binding{}, err
 	}
-	if err := unmarshalBindingSecretRefs(&binding, tokenRef, signingSecretRef, secret); err != nil {
+	if err := unmarshalBindingSecretRef(&binding, secret); err != nil {
 		return channels.Binding{}, err
+	}
+	if publicRouteID.Valid {
+		binding.PublicRouteID = publicRouteID.String
 	}
 	return binding, nil
 }

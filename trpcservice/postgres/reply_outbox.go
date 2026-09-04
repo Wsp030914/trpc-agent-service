@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
@@ -281,6 +282,51 @@ WHERE reply_id = $1 AND status = 'SENDING' AND lease_owner = $2
 	return fmt.Errorf("complete reply: %w", ErrReplyLeaseLost)
 }
 
+// MarkReplyUncertain records that the provider may have accepted a reply but
+// the sender cannot prove the local SENT transition. Such rows are never
+// automatically retried because these providers offer no safe
+// result query or idempotency contract here.
+func (s *Store) MarkReplyUncertain(
+	ctx context.Context,
+	delivery worker.ReplyDelivery,
+	providerMessageID string,
+	cause error,
+) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := delivery.Validate(); err != nil {
+		return err
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE platform.reply_outbox
+SET status='UNCERTAIN', lease_owner=NULL, lease_until=NULL,
+    provider_message_id=CASE WHEN $3 <> '' THEN $3 ELSE provider_message_id END,
+    last_error_type='provider_result_unknown', last_error=$4,
+    updated_at=clock_timestamp()
+WHERE reply_id=$1 AND status='SENDING' AND lease_owner=$2
+  AND lease_until > clock_timestamp()`,
+		delivery.Reply.ReplyID, delivery.LeaseOwner, providerMessageID, platformlog.SafeError(cause))
+	if err != nil {
+		return fmt.Errorf("mark uncertain reply: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var status string
+	err = s.pool.QueryRow(ctx, `SELECT status FROM platform.reply_outbox WHERE reply_id=$1`, delivery.Reply.ReplyID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("mark uncertain reply: %w", ErrReplyLeaseLost)
+	}
+	if err != nil {
+		return fmt.Errorf("read uncertain reply: %w", err)
+	}
+	if status == "SENT" || status == "UNCERTAIN" {
+		return nil
+	}
+	return fmt.Errorf("mark uncertain reply: %w", ErrReplyLeaseLost)
+}
+
 // RetryReply returns a leased row to PENDING with a bounded retry timestamp.
 func (s *Store) RetryReply(
 	ctx context.Context,
@@ -350,15 +396,19 @@ WHERE reply_id = $1 AND status = 'SENDING' AND lease_owner = $2
 	return fmt.Errorf("transition reply failure: %w", ErrReplyLeaseLost)
 }
 
-// RecoverReplyLeases makes expired SENDING rows claimable again.
+// RecoverReplyLeases records expired SENDING rows as uncertain. The provider
+// may have accepted the request, so these rows are intentionally not claimable
+// for blind retry.
 func (s *Store) RecoverReplyLeases(ctx context.Context) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
 	if _, err := s.pool.Exec(ctx, `
 UPDATE platform.reply_outbox
-SET status = 'PENDING', lease_owner = NULL, lease_until = NULL,
-    updated_at = clock_timestamp()
+	SET status = 'UNCERTAIN', lease_owner = NULL, lease_until = NULL,
+	    last_error_type = 'provider_result_unknown',
+	    last_error = 'reply sender lease expired before result was recorded',
+	    updated_at = clock_timestamp()
 WHERE status = 'SENDING' AND lease_until <= clock_timestamp()`); err != nil {
 		return fmt.Errorf("recover reply leases: %w", err)
 	}
@@ -391,7 +441,7 @@ FROM platform.channel_binding
 WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`,
 		reply.TenantID, reply.AppID, reply.BindingID,
 	).Scan(&bindingStatus, &bindingChannel, &bindingRevision); err != nil {
-		return "", resolveError("reply binding", err)
+		return "", resolveReplyTargetError("reply binding", err)
 	}
 	if bindingStatus != string(channels.BindingActive) {
 		return "", channels.ErrBindingInactive
@@ -400,16 +450,17 @@ WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`,
 		return "", errors.New("reply binding authorization changed")
 	}
 	var targetJSON []byte
-	var expiresAt *time.Time
+	var targetExpired bool
 	err := s.pool.QueryRow(ctx, `
-SELECT provider_reply_target_envelope, reply_target_expires_at
+SELECT provider_reply_target_envelope,
+       COALESCE(reply_target_expires_at <= clock_timestamp(), TRUE)
 FROM platform.channel_inbox
 WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND request_id = $4
   AND provider_reply_target_envelope IS NOT NULL
 ORDER BY created_at
-LIMIT 1`, reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID).Scan(&targetJSON, &expiresAt)
+	LIMIT 1`, reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID).Scan(&targetJSON, &targetExpired)
 	if err == nil {
-		if expiresAt == nil || !time.Now().UTC().Before(expiresAt.UTC()) {
+		if targetExpired {
 			return "", ErrReplyTargetExpired
 		}
 		plaintext, err := s.openReplyTarget(ctx, reply, channels.TargetContext{
@@ -425,18 +476,22 @@ LIMIT 1`, reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID).Scan(&t
 		return plaintext.ProviderTarget, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("find message reply target: %w", err)
+		return "", retryableReplyTargetError("find message reply target", err)
 	}
 	scope := tenant.Scope{TenantID: reply.TenantID, AppID: reply.AppID}
 	switch reply.Target.Kind {
 	case channels.TargetKindUser:
+		var identityStatus string
 		err = s.pool.QueryRow(ctx, `
-SELECT provider_target_envelope
+	SELECT provider_target_envelope, status
 FROM platform.channel_identity
 WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND user_id = $4`,
-			reply.TenantID, reply.AppID, reply.BindingID, reply.Target.InternalEntityID).Scan(&targetJSON)
+			reply.TenantID, reply.AppID, reply.BindingID, reply.Target.InternalEntityID).Scan(&targetJSON, &identityStatus)
 		if err != nil {
-			return "", resolveError("reply identity target", err)
+			return "", resolveReplyTargetError("reply identity target", err)
+		}
+		if identityStatus != channels.IdentityActive {
+			return "", channels.ErrIdentityInactive
 		}
 		plaintext, err := s.openReplyTarget(ctx, reply, channels.TargetContext{
 			Scope: scope, BindingID: reply.BindingID, Channel: reply.Channel,
@@ -453,7 +508,7 @@ FROM platform.channel_conversation
 WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND conversation_id = $4`,
 			reply.TenantID, reply.AppID, reply.BindingID, reply.Target.InternalEntityID).Scan(&targetJSON, new(string))
 		if err != nil {
-			return "", resolveError("reply conversation target", err)
+			return "", resolveReplyTargetError("reply conversation target", err)
 		}
 		purpose := channels.TargetPurposeConversationChat
 		if reply.Target.Kind == channels.TargetKindTopic {
@@ -470,6 +525,17 @@ WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND conversation_id = $
 	default:
 		return "", errors.New("reply target kind is unsupported")
 	}
+}
+
+func resolveReplyTargetError(entity string, err error) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return resolveError(entity, err)
+	}
+	return retryableReplyTargetError(entity, err)
+}
+
+func retryableReplyTargetError(entity string, err error) error {
+	return worker.NewRetryableReplyError(fmt.Errorf("%s: %w", entity, err), "target_backend")
 }
 
 func (s *Store) openReplyTarget(

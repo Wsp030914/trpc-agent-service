@@ -66,6 +66,20 @@ func TestAPIRejectsCallerSuppliedChannelBindingRoute(t *testing.T) {
 	}
 }
 
+func TestAPIProvisionLongConnectionBindingDoesNotCreatePublicRoute(t *testing.T) {
+	repository := &recordingRepository{}
+	binding := testBinding()
+	binding.PublicRouteID = ""
+	binding.BindingRevision = 0
+	prepared, err := (admin.API{Repository: repository}).ProvisionChannelBinding(context.Background(), binding)
+	if err != nil {
+		t.Fatalf("provision long-connection binding: %v", err)
+	}
+	if prepared.PublicRouteID != "" || prepared.BindingRevision != 1 {
+		t.Fatalf("prepared binding = %#v, want no route and revision 1", prepared)
+	}
+}
+
 func TestAPIIssueCredentialRejectsExpiredCredential(t *testing.T) {
 	api := admin.API{Repository: &recordingRepository{}}
 	_, err := api.IssueCredential(
@@ -75,6 +89,18 @@ func TestAPIIssueCredentialRejectsExpiredCredential(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("issue credential succeeded with expired time")
+	}
+}
+
+func TestAPIListAuditEventsRejectsInvalidLimit(t *testing.T) {
+	api := admin.API{Repository: &recordingRepository{}}
+	_, err := api.ListAuditEvents(
+		context.Background(),
+		tenant.Scope{TenantID: "tenant-a", AppID: "support"},
+		1001,
+	)
+	if err == nil {
+		t.Fatal("audit query accepted a limit above the API maximum")
 	}
 }
 
@@ -107,12 +133,8 @@ func testBinding() channels.Binding {
 		BindingID:       "binding-1",
 		Channel:         channels.ChannelWeCom,
 		ExternalAccount: "corp-agent-1",
-		WebhookURL:      "https://example.com/im/wecom/binding-1",
-		TokenRef: tenant.SecretRef{
-			Name: "wecom-token",
-		},
-		SigningSecretRef: tenant.SecretRef{
-			Name: "wecom-signing-secret",
+		Secret: tenant.SecretRef{
+			Name: "wecom-bot-secret",
 		},
 		PublicRouteID:   "route-binding-1",
 		BindingRevision: 1,

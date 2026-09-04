@@ -114,7 +114,7 @@ func (m *artifactHydratingModel) hydratePart(ctx context.Context, part *model.Co
 		}
 		file.Data = append(file.Data[:0], artifactValue.Data...)
 		if file.Name == "" {
-			file.Name = chooseArtifactName(part.ContentRef, name)
+			file.Name = chooseArtifactName(part.ContentRef, artifactValue.Name, name)
 		}
 		if file.MimeType == "" {
 			file.MimeType = chooseArtifactMimeType(part.ContentRef, artifactValue.MimeType)
@@ -165,9 +165,12 @@ func validateLoadedArtifact(ref *model.ContentRef, data []byte) error {
 	return nil
 }
 
-func chooseArtifactName(ref *model.ContentRef, fallback string) string {
+func chooseArtifactName(ref *model.ContentRef, objectName, fallback string) string {
 	if ref.OriginalName != "" {
 		return ref.OriginalName
+	}
+	if objectName != "" {
+		return objectName
 	}
 	if ref.ArtifactName != "" {
 		return ref.ArtifactName

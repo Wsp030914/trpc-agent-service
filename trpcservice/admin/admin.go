@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	platformapproval "github.com/liuzengh/trpc-agent-service/trpcservice/approval"
 	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
 	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
@@ -45,6 +46,18 @@ type auditReader interface {
 	ListAuditEvents(context.Context, string, string, int) ([]platformaudit.Event, error)
 }
 
+type auditQueryReader interface {
+	ListAuditEventsQuery(context.Context, platformaudit.Query) ([]platformaudit.Event, error)
+}
+
+type tenantReader interface {
+	ResolveTenant(context.Context, string) (tenant.Tenant, error)
+}
+
+type approvalRepository interface {
+	platformapproval.Repository
+}
+
 type dataMigrationRepository interface {
 	CreateDataMigration(context.Context, migration.Record) error
 	BeginDataMigration(context.Context, string, string, string, string, time.Time, time.Duration) (migration.Record, error)
@@ -70,9 +83,9 @@ func invalidInput(err error) error {
 }
 
 // ProvisionChannelBinding is the canonical channel binding creation path. It
-// generates the opaque public route and initial revision, then persists an IM
-// account binding owned by one tenant application. Callers must not provide
-// either generated field.
+// generates a public route only for the remaining HTTP channel and sets the
+// initial revision before persisting the tenant-owned binding. Callers must
+// not provide either generated field.
 func (a API) ProvisionChannelBinding(
 	ctx context.Context,
 	binding channels.Binding,
@@ -102,11 +115,13 @@ func prepareChannelBinding(binding channels.Binding) (channels.Binding, error) {
 			cause: errors.New("binding_revision must be omitted when creating a channel binding"),
 		}
 	}
-	publicRouteID, err := channels.NewPublicRouteID()
-	if err != nil {
-		return channels.Binding{}, err
+	if binding.Channel == channels.ChannelWeChatCustomer {
+		publicRouteID, err := channels.NewPublicRouteID()
+		if err != nil {
+			return channels.Binding{}, err
+		}
+		binding.PublicRouteID = publicRouteID
 	}
-	binding.PublicRouteID = publicRouteID
 	binding.BindingRevision = 1
 	if err := binding.Validate(); err != nil {
 		return channels.Binding{}, &inputError{cause: err}
@@ -124,6 +139,15 @@ type API struct {
 func (a API) ValidateAppConfig(ctx context.Context, cfg tenant.AppConfig) error {
 	if err := cfg.Validate(); err != nil {
 		return err
+	}
+	if reader, ok := a.Repository.(tenantReader); ok {
+		value, err := reader.ResolveTenant(ctx, cfg.TenantID)
+		if err != nil {
+			return fmt.Errorf("resolve tenant audit policy: %w", err)
+		}
+		if err := value.Audit.ValidateAppConfig(cfg.Audit); err != nil {
+			return err
+		}
 	}
 	if err := platformsession.ValidateBackend(cfg.BackendConfig.Session); err != nil {
 		return fmt.Errorf("session backend provider: %w", err)
@@ -367,15 +391,84 @@ func (a API) ListAuditEvents(ctx context.Context, scope tenant.Scope, limit int)
 	if err := scope.Validate(); err != nil {
 		return nil, invalidInput(err)
 	}
+	query := platformaudit.Query{
+		TenantID: scope.TenantID,
+		AppID:    scope.AppID,
+		Limit:    limit,
+	}
+	if err := query.Validate(); err != nil {
+		return nil, invalidInput(err)
+	}
 	reader, err := a.auditReader()
 	if err != nil {
 		return nil, err
 	}
-	events, err := reader.ListAuditEvents(ctx, scope.TenantID, scope.AppID, limit)
+	var events []platformaudit.Event
+	if queryReader, ok := a.Repository.(auditQueryReader); ok {
+		events, err = queryReader.ListAuditEventsQuery(ctx, query)
+	} else {
+		events, err = reader.ListAuditEvents(ctx, query.TenantID, query.AppID, query.Limit)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("list audit events: %w", err)
 	}
 	return events, nil
+}
+
+// ListAuditEventsQuery returns metadata-only audit events with optional
+// operator filters while preserving exact tenant/application scope.
+func (a API) ListAuditEventsQuery(ctx context.Context, query platformaudit.Query) ([]platformaudit.Event, error) {
+	if err := query.Validate(); err != nil {
+		return nil, invalidInput(err)
+	}
+	reader, ok := a.Repository.(auditQueryReader)
+	if !ok {
+		return nil, errors.New("admin repository does not support audit queries")
+	}
+	events, err := reader.ListAuditEventsQuery(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list audit events: %w", err)
+	}
+	return events, nil
+}
+
+// ListApprovals returns metadata-only approval rows from one exact scope.
+func (a API) ListApprovals(ctx context.Context, query platformapproval.Query) ([]platformapproval.Record, error) {
+	if err := query.Validate(); err != nil {
+		return nil, invalidInput(err)
+	}
+	repository, err := a.approvalRepository()
+	if err != nil {
+		return nil, err
+	}
+	approvals, err := repository.List(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list approvals: %w", err)
+	}
+	return approvals, nil
+}
+
+// DecideApproval records one administrator decision in exact tenant/app
+// scope. The repository makes repeated identical decisions idempotent.
+func (a API) DecideApproval(ctx context.Context, scope tenant.Scope, approvalID string, status platformapproval.Status) (platformapproval.Record, error) {
+	if err := scope.Validate(); err != nil {
+		return platformapproval.Record{}, invalidInput(err)
+	}
+	if approvalID == "" {
+		return platformapproval.Record{}, invalidInput(errors.New("approval_id is required"))
+	}
+	if status != platformapproval.StatusApproved && status != platformapproval.StatusDenied {
+		return platformapproval.Record{}, invalidInput(errors.New("approval decision must be approved or denied"))
+	}
+	repository, err := a.approvalRepository()
+	if err != nil {
+		return platformapproval.Record{}, err
+	}
+	record, err := repository.Decide(ctx, scope.TenantID, scope.AppID, approvalID, status)
+	if err != nil {
+		return platformapproval.Record{}, fmt.Errorf("decide approval: %w", err)
+	}
+	return record, nil
 }
 
 func (a API) repository() (Repository, error) {
@@ -407,6 +500,18 @@ func (a API) auditReader() (auditReader, error) {
 		return nil, errors.New("admin repository does not support audit queries")
 	}
 	return reader, nil
+}
+
+func (a API) approvalRepository() (approvalRepository, error) {
+	repository, err := a.repository()
+	if err != nil {
+		return nil, err
+	}
+	approvals, ok := repository.(approvalRepository)
+	if !ok {
+		return nil, errors.New("admin repository does not support approvals")
+	}
+	return approvals, nil
 }
 
 func generateCredentialValues(random io.Reader) (string, string, error) {

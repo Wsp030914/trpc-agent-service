@@ -19,6 +19,16 @@ func (s *Store) InsertAppConfigVersion(ctx context.Context, cfg tenant.AppConfig
 	if err := s.validate(); err != nil {
 		return err
 	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	tnt, err := s.ResolveTenant(ctx, cfg.TenantID)
+	if err != nil {
+		return fmt.Errorf("resolve tenant for app config: %w", err)
+	}
+	if err := tnt.Audit.ValidateAppConfig(cfg.Audit); err != nil {
+		return err
+	}
 	if err := s.validateKnowledgeBaseIDs(ctx, cfg); err != nil {
 		return err
 	}

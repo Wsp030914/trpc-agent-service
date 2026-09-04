@@ -8,6 +8,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestResolveChannelBindingRouteRejectsInactiveAndMismatchedSnapshots(t *testing.T) {
@@ -106,6 +107,61 @@ func TestChannelBindingIdentityResolverCarriesTrustedScopeToGateway(t *testing.T
 	if admitter.request.Identity.Tenant.TenantID != binding.TenantID ||
 		admitter.request.Identity.Tenant.AppID != binding.AppID {
 		t.Fatalf("gateway trusted scope = %#v", admitter.request.Identity.Tenant)
+	}
+}
+
+func TestChannelBindingInputIdentitySurvivesTracePropagation(t *testing.T) {
+	binding := testChannelBinding()
+	resolver, err := gateway.NewChannelBindingInputIdentityResolverFromBinding(
+		binding.Snapshot(),
+		tenant.RuntimeContext{
+			TenantID:  binding.TenantID,
+			AppID:     binding.AppID,
+			Channel:   string(binding.Channel),
+			BindingID: binding.BindingID,
+			TraceID:   "request-1",
+		},
+	)
+	if err != nil {
+		t.Fatalf("new channel binding input resolver: %v", err)
+	}
+	input, err := channels.NewChannelInput(
+		channels.ChannelInput{
+			TenantID:          binding.TenantID,
+			AppID:             binding.AppID,
+			Channel:           binding.Channel,
+			BindingID:         binding.BindingID,
+			BindingRevision:   binding.BindingRevision,
+			ExternalMessageID: "message-1",
+			Conversation:      channels.ChannelConversation{Kind: channels.ConversationDirect},
+			MessageType:       channels.MessageTypeText,
+			Text:              "hello",
+		},
+		channels.ChannelMappingInput{
+			ExternalSenderID:     "user-1",
+			ProviderSenderTarget: "user-1",
+		},
+	)
+	if err != nil {
+		t.Fatalf("new channel input: %v", err)
+	}
+	admitter := &captureAdmitter{result: gateway.AdmissionResult{
+		RequestID:     "request-1",
+		ConfigVersion: "v1",
+		TurnSeq:       1,
+	}}
+	traceContext := trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{1},
+		SpanID:     trace.SpanID{2},
+		TraceFlags: trace.FlagsSampled,
+	}))
+	if _, err := gateway.New(admitter).Handle(traceContext, gateway.Request{
+		RequestID:      "request-1",
+		IdempotencyKey: "message-1",
+		Tenant:         resolver,
+		ChannelInput:   &input,
+	}); err != nil {
+		t.Fatalf("handle channel input: %v", err)
 	}
 }
 
@@ -217,10 +273,8 @@ func testChannelBinding() channels.Binding {
 		BindingID:       "binding-channel-1",
 		Channel:         channels.ChannelWeCom,
 		ExternalAccount: "corp-agent-1",
-		WebhookURL:      "https://example.com/im/wecom/route-channel-1",
-		TokenRef:        tenant.SecretRef{Name: "wecom-token", Version: "v1"},
-		SigningSecretRef: tenant.SecretRef{
-			Name:    "wecom-signing-secret",
+		Secret: tenant.SecretRef{
+			Name:    "wecom-bot-secret",
 			Version: "v1",
 		},
 		PublicRouteID:   "route-channel-1",

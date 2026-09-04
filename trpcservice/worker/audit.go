@@ -50,6 +50,9 @@ func (w Worker) recordAudit(ctx context.Context, exec Execution, event platforma
 	if event.ConfigVersion == "" {
 		event.ConfigVersion = exec.Tenant.ConfigVersion
 	}
+	if exec.Config.Audit.RedactPII {
+		event = platformaudit.RedactEvent(event)
+	}
 	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	if err := w.Audit.Record(auditCtx, event); err != nil {

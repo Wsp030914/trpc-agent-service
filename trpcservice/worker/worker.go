@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
+	platformapproval "github.com/liuzengh/trpc-agent-service/trpcservice/approval"
 	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
@@ -23,7 +25,10 @@ import (
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
-const defaultEventSinkTimeout = 5 * time.Second
+const (
+	defaultEventSinkTimeout = 5 * time.Second
+	defaultModelTimeout     = time.Minute
+)
 
 // ErrExecutionCanceled means a verified recall stopped the current run.
 var ErrExecutionCanceled = errors.New("execution canceled by recall")
@@ -66,11 +71,44 @@ type EventSink interface {
 type RunResult struct {
 	Execution       Execution
 	EventCount      int
+	RunnerStarted   bool
 	RunnerCompleted bool
+	// ApprovalPending means the runner stopped at a durable human-review
+	// boundary. The consumer must park the execution until the decision is
+	// persisted; it must not mark this run successful.
+	ApprovalPending bool
+	ApprovalID      string
 	InputTokens     int
 	OutputTokens    int
 	TotalTokens     int
 	Cost            *float64
+}
+
+type approvalContinuation struct {
+	mu      sync.Mutex
+	pending bool
+	id      string
+}
+
+func (s *approvalContinuation) mark(id string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.pending = true
+	if id != "" {
+		s.id = id
+	}
+	s.mu.Unlock()
+}
+
+func (s *approvalContinuation) snapshot() (bool, string) {
+	if s == nil {
+		return false, ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending, s.id
 }
 
 // Worker prepares jobs for execution without owning session state locally.
@@ -80,9 +118,16 @@ type Worker struct {
 	SessionLocker    SessionLocker
 	Events           EventSink
 	EventSinkTimeout time.Duration
-	Cancellation     CancellationCheck
-	Audit            platformaudit.Sink
-	Metrics          *platformmetrics.Recorder
+	// ModelTimeout is an operator-owned upper bound for one Runner model
+	// invocation path. The context is still drained and Runner.Close is called
+	// after expiry.
+	ModelTimeout time.Duration
+	Cancellation CancellationCheck
+	Audit        platformaudit.Sink
+	Metrics      *platformmetrics.Recorder
+	// Approvals is optional for local/test runtimes. Production workers attach
+	// the durable repository; without it review-required tools remain ASK.
+	Approvals platformapproval.Repository
 }
 
 // New creates a Worker with all execution dependencies explicitly attached.
@@ -105,14 +150,14 @@ func New(
 // Prepare validates a job and resolves the tenant backend_config.
 func (w Worker) Prepare(ctx context.Context, job execution.Job) (Execution, error) {
 	if err := job.Validate(); err != nil {
-		return Execution{}, err
+		return Execution{}, NewPermanentExecutionError(err)
 	}
 	partitionKey, err := job.PartitionKey()
 	if err != nil {
-		return Execution{}, err
+		return Execution{}, NewPermanentExecutionError(err)
 	}
 	if w.Config == nil {
-		return Execution{}, errors.New("config resolver is required")
+		return Execution{}, NewPermanentExecutionError(errors.New("config resolver is required"))
 	}
 	tenantContext := job.Tenant()
 	cfg, err := w.Config.ResolveAppConfig(
@@ -127,7 +172,7 @@ func (w Worker) Prepare(ctx context.Context, job execution.Job) (Execution, erro
 	if cfg.TenantID != tenantContext.TenantID ||
 		cfg.AppID != tenantContext.AppID ||
 		cfg.Version != tenantContext.ConfigVersion {
-		return Execution{}, errors.New("resolved app config does not match job scope")
+		return Execution{}, NewPermanentExecutionError(errors.New("resolved app config does not match job scope"))
 	}
 	requestID := job.RequestID()
 	if w.Cancellation != nil {
@@ -136,7 +181,7 @@ func (w Worker) Prepare(ctx context.Context, job execution.Job) (Execution, erro
 			return Execution{}, fmt.Errorf("check execution cancellation: %w", err)
 		}
 		if canceled {
-			return Execution{}, ErrExecutionCanceled
+			return Execution{}, NewPermanentExecutionError(ErrExecutionCanceled)
 		}
 	}
 	return Execution{
@@ -162,6 +207,10 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		return RunResult{}, err
 	}
 	result = RunResult{Execution: exec}
+	approval := &approvalContinuation{}
+	defer func() {
+		result.ApprovalPending, result.ApprovalID = approval.snapshot()
+	}()
 	executionStartedAt := time.Now()
 	if exec.Config.Audit.Enabled {
 		defer func() {
@@ -207,25 +256,25 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		}()
 	}
 	if w.Runner == nil {
-		return result, errors.New("runner builder is required")
+		return result, NewPermanentExecutionError(errors.New("runner builder is required"))
 	}
 	message, err := w.runnerMessage(exec)
 	if err != nil {
-		return result, err
+		return result, NewPermanentExecutionError(err)
 	}
 	appName, err := exec.Tenant.Scope().Key("runner")
 	if err != nil {
-		return result, err
+		return result, NewPermanentExecutionError(err)
 	}
 	if w.SessionLocker == nil {
-		return result, errors.New("session locker is required")
+		return result, NewPermanentExecutionError(errors.New("session locker is required"))
 	}
 	lock, err := w.SessionLocker.Lock(ctx, exec.PartitionKey)
 	if err != nil {
 		return result, fmt.Errorf("lock session partition: %w", err)
 	}
 	if lock == nil {
-		return result, errors.New("session lock is required")
+		return result, NewPermanentExecutionError(errors.New("session lock is required"))
 	}
 	defer func() {
 		if releaseErr := lock.Release(); releaseErr != nil {
@@ -234,7 +283,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	}()
 	runCtx := lock.Context()
 	if runCtx == nil {
-		return result, errors.New("session lock context is required")
+		return result, NewPermanentExecutionError(errors.New("session lock context is required"))
 	}
 	runCtx = platformtelemetry.Extract(runCtx, map[string]string{
 		"traceparent": exec.Tenant.TraceParent,
@@ -260,7 +309,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		return result, err
 	}
 	if r == nil {
-		return result, errors.New("runner is required")
+		return result, NewPermanentExecutionError(errors.New("runner is required"))
 	}
 	defer func() {
 		if closeErr := r.Close(); closeErr != nil {
@@ -274,7 +323,15 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		attribute.String("request_id", exec.RequestID),
 	)
 	defer runnerSpan.End()
+	runnerCtx, cancelModel := context.WithTimeout(runnerCtx, w.modelTimeout())
+	defer cancelModel()
 	modelAttempted = true
+	result.RunnerStarted = true
+	// Register cancellation before Run: a managed runner may block while it
+	// starts a model request, and that request must still be canceled on the
+	// configured deadline.
+	stopManagedCancel := cancelManagedRunnerOnContextDone(runnerCtx, r, exec.RequestID)
+	defer stopManagedCancel()
 	events, err := r.Run(
 		runnerCtx,
 		exec.Tenant.SessionPrincipalID,
@@ -283,7 +340,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		agent.WithRequestID(exec.RequestID),
 		agent.WithAppName(appName),
 		agent.MergeRuntimeState(runnerRuntimeState(exec)),
-		agent.WithToolPermissionPolicy(w.toolPermissionPolicy(exec)),
+		agent.WithToolPermissionPolicy(w.toolPermissionPolicyWithState(exec, approval)),
 		// Framework payload tracing is disabled at this boundary because this
 		// service owns the safe metadata-only spans above. It prevents raw
 		// prompts, tool arguments, and provider errors from entering spans.
@@ -293,10 +350,8 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		return result, err
 	}
 	if events == nil {
-		return result, errors.New("runner event channel is nil")
+		return result, NewSideEffectUncertainError(errors.New("runner event channel is nil"))
 	}
-	stopManagedCancel := cancelManagedRunnerOnContextDone(runnerCtx, r, exec.RequestID)
-	defer stopManagedCancel()
 	var sinkErr error
 	var runnerErr error
 	sinkTimedOut := false
@@ -336,6 +391,13 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	return result, nil
 }
 
+func (w Worker) modelTimeout() time.Duration {
+	if w.ModelTimeout > 0 {
+		return w.ModelTimeout
+	}
+	return defaultModelTimeout
+}
+
 func cancelManagedRunnerOnContextDone(
 	ctx context.Context,
 	r runner.Runner,
@@ -345,18 +407,30 @@ func cancelManagedRunnerOnContextDone(
 	if !ok || requestID == "" {
 		return func() {}
 	}
-	done := make(chan struct{})
+	stop := make(chan struct{})
+	finished := make(chan struct{})
+	var once sync.Once
 	go func() {
+		defer close(finished)
 		select {
 		case <-ctx.Done():
 			managed.Cancel(requestID)
-		case <-done:
+		case <-stop:
 		}
 	}()
-	return func() { close(done) }
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-finished
+		})
+	}
 }
 
 func (w Worker) toolPermissionPolicy(exec Execution) frameworktool.PermissionPolicy {
+	return w.toolPermissionPolicyWithState(exec, nil)
+}
+
+func (w Worker) toolPermissionPolicyWithState(exec Execution, approval *approvalContinuation) frameworktool.PermissionPolicy {
 	return frameworktool.PermissionPolicyFunc(func(
 		ctx context.Context,
 		request *frameworktool.PermissionRequest,
@@ -369,7 +443,10 @@ func (w Worker) toolPermissionPolicy(exec Execution) frameworktool.PermissionPol
 			return decision, nil
 		}
 		if exec.Config.Tools.RequiresReview(name) {
-			decision := frameworktool.AskPermission("human review is required")
+			decision, approvalID := w.reviewDecisionWithID(ctx, exec, request, name)
+			if decision.Action == frameworktool.PermissionActionAsk {
+				approval.mark(approvalID)
+			}
 			w.recordToolDecision(ctx, exec, name, decision, started)
 			return decision, nil
 		}
@@ -380,6 +457,60 @@ func (w Worker) toolPermissionPolicy(exec Execution) frameworktool.PermissionPol
 		w.recordToolDecision(ctx, exec, name, decision, started)
 		return decision, nil
 	})
+}
+
+func (w Worker) reviewDecision(
+	ctx context.Context,
+	exec Execution,
+	request *frameworktool.PermissionRequest,
+	name string,
+) frameworktool.PermissionDecision {
+	decision, _ := w.reviewDecisionWithID(ctx, exec, request, name)
+	return decision
+}
+
+func (w Worker) reviewDecisionWithID(
+	ctx context.Context,
+	exec Execution,
+	request *frameworktool.PermissionRequest,
+	name string,
+) (frameworktool.PermissionDecision, string) {
+	if w.Approvals == nil {
+		return frameworktool.AskPermission("human review is required"), ""
+	}
+	toolCallID := ""
+	var arguments []byte
+	if request != nil {
+		toolCallID = request.ToolCallID
+		arguments = request.Arguments
+	}
+	record, err := w.Approvals.ResolveOrCreate(ctx, platformapproval.Request{
+		TenantID:       exec.Tenant.TenantID,
+		AppID:          exec.Tenant.AppID,
+		ConfigVersion:  exec.Tenant.ConfigVersion,
+		RequestID:      exec.RequestID,
+		SessionID:      exec.Tenant.SessionID,
+		ToolName:       name,
+		ToolCallID:     toolCallID,
+		ArgumentDigest: platformapproval.DigestArguments(arguments),
+		ExpiresAt:      time.Now().UTC().Add(platformapproval.DefaultTTL),
+	})
+	if err != nil {
+		// Fail closed when the durable approval store is unavailable. Returning
+		// an ASK here would allow a caller to mistake an unavailable control
+		// plane for an approval.
+		return frameworktool.DenyPermission("human approval is unavailable"), ""
+	}
+	switch record.Status {
+	case platformapproval.StatusApproved:
+		return frameworktool.AllowPermission(), ""
+	case platformapproval.StatusDenied:
+		return frameworktool.DenyPermission("human approval was denied"), ""
+	case platformapproval.StatusExpired:
+		return frameworktool.DenyPermission("human approval expired"), ""
+	default:
+		return frameworktool.AskPermission("human review is required"), record.ApprovalID
+	}
 }
 
 func permissionToolName(request *frameworktool.PermissionRequest) string {

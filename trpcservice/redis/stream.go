@@ -106,7 +106,9 @@ func (s *Stream) Receive(ctx context.Context, consumer string, block time.Durati
 	if len(claimed) > 0 {
 		delivery, err := decodeDelivery(claimed[0])
 		if err != nil {
-			return queue.Delivery{}, err
+			// Preserve the Redis id so the consumer can dead-letter a
+			// permanently malformed payload instead of retrying it forever.
+			return queue.Delivery{ID: claimed[0].ID}, err
 		}
 		if s.isOwnedBy(delivery.ID, consumer) {
 			// XAUTOCLAIM cannot distinguish a crashed consumer from this
@@ -139,7 +141,9 @@ func (s *Stream) receiveNew(ctx context.Context, consumer string, block time.Dur
 	}
 	delivery, err := decodeDelivery(result[0].Messages[0])
 	if err != nil {
-		return queue.Delivery{}, err
+		// Preserve the Redis id so the consumer can dead-letter a
+		// permanently malformed payload instead of retrying it forever.
+		return queue.Delivery{ID: result[0].Messages[0].ID}, err
 	}
 	s.remember(delivery.ID, consumer)
 	return delivery, nil
@@ -202,7 +206,7 @@ func (s *Stream) forget(id string) {
 func decodeDelivery(message goredis.XMessage) (queue.Delivery, error) {
 	raw, ok := message.Values[dispatchPayloadField]
 	if !ok {
-		return queue.Delivery{}, errors.New("redis dispatch payload is missing")
+		return queue.Delivery{ID: message.ID}, errors.New("redis dispatch payload is missing")
 	}
 	var bytes []byte
 	switch value := raw.(type) {
@@ -211,15 +215,15 @@ func decodeDelivery(message goredis.XMessage) (queue.Delivery, error) {
 	case []byte:
 		bytes = value
 	default:
-		return queue.Delivery{}, fmt.Errorf("redis dispatch payload type %T is unsupported", raw)
+		return queue.Delivery{ID: message.ID}, fmt.Errorf("redis dispatch payload type %T is unsupported", raw)
 	}
 	var dispatch queue.Dispatch
 	if err := json.Unmarshal(bytes, &dispatch); err != nil {
-		return queue.Delivery{}, fmt.Errorf("decode redis dispatch: %w", err)
+		return queue.Delivery{ID: message.ID}, fmt.Errorf("decode redis dispatch: %w", err)
 	}
 	delivery := queue.Delivery{ID: message.ID, Dispatch: dispatch}
 	if err := delivery.Validate(); err != nil {
-		return queue.Delivery{}, err
+		return queue.Delivery{ID: message.ID}, err
 	}
 	return delivery, nil
 }

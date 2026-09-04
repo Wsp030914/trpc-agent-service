@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -48,15 +50,19 @@ const (
 	envOTELTracesEndpoint  = "TRPC_AGENT_SERVICE_OTEL_TRACES_ENDPOINT"
 	envOTELMetricsEndpoint = "TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT"
 	envModelPricing        = "TRPC_AGENT_SERVICE_MODEL_PRICING"
+	envModelTimeout        = "TRPC_AGENT_SERVICE_MODEL_TIMEOUT"
+	envWorkerConcurrency   = "TRPC_AGENT_SERVICE_WORKER_CONCURRENCY"
 
-	defaultHTTPAddr        = ":8080"
-	defaultRedisStream     = "trpc-agent-service:dispatch"
-	defaultRedisGroup      = "workers"
-	dispatchLeaseDuration  = 30 * time.Second
-	sessionLeaseDuration   = 30 * time.Second
-	defaultShutdownTimeout = 30 * time.Second
-	dataMigrationLease     = 30 * time.Second
-	dataMigrationPoll      = time.Second
+	defaultHTTPAddr          = ":8080"
+	defaultRedisStream       = "trpc-agent-service:dispatch"
+	defaultRedisGroup        = "workers"
+	dispatchLeaseDuration    = 30 * time.Second
+	sessionLeaseDuration     = 30 * time.Second
+	defaultShutdownTimeout   = 30 * time.Second
+	defaultModelTimeout      = time.Minute
+	defaultWorkerConcurrency = 4
+	dataMigrationLease       = 30 * time.Second
+	dataMigrationPoll        = time.Second
 )
 
 var errWorkerShutdownTimeout = errors.New("worker did not stop before shutdown deadline")
@@ -70,18 +76,20 @@ const (
 )
 
 type serviceConfig struct {
-	Role            serviceRole
-	PostgresDSN     string
-	RedisURL        string
-	RedisStream     string
-	RedisGroup      string
-	DispatcherID    string
-	HTTPAddr        string
-	WorkerID        string
-	AdminToken      string
-	ShutdownTimeout time.Duration
-	Telemetry       platformtelemetry.Config
-	Pricing         platformmetrics.PricingCatalog
+	Role              serviceRole
+	PostgresDSN       string
+	RedisURL          string
+	RedisStream       string
+	RedisGroup        string
+	DispatcherID      string
+	HTTPAddr          string
+	WorkerID          string
+	AdminToken        string
+	ShutdownTimeout   time.Duration
+	ModelTimeout      time.Duration
+	WorkerConcurrency int
+	Telemetry         platformtelemetry.Config
+	Pricing           platformmetrics.PricingCatalog
 }
 
 func main() {
@@ -110,16 +118,18 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 		return serviceConfig{}, errors.New("environment reader is required")
 	}
 	config := serviceConfig{
-		Role:            serviceRole(getenv(envRole)),
-		PostgresDSN:     getenv(envPostgresDSN),
-		RedisURL:        getenv(envRedisURL),
-		RedisStream:     getenv(envRedisStream),
-		RedisGroup:      getenv(envRedisGroup),
-		DispatcherID:    getenv(envDispatcherID),
-		HTTPAddr:        getenv(envHTTPAddr),
-		WorkerID:        getenv(envWorkerID),
-		AdminToken:      getenv(envAdminToken),
-		ShutdownTimeout: defaultShutdownTimeout,
+		Role:              serviceRole(getenv(envRole)),
+		PostgresDSN:       getenv(envPostgresDSN),
+		RedisURL:          getenv(envRedisURL),
+		RedisStream:       getenv(envRedisStream),
+		RedisGroup:        getenv(envRedisGroup),
+		DispatcherID:      getenv(envDispatcherID),
+		HTTPAddr:          getenv(envHTTPAddr),
+		WorkerID:          getenv(envWorkerID),
+		AdminToken:        getenv(envAdminToken),
+		ShutdownTimeout:   defaultShutdownTimeout,
+		ModelTimeout:      defaultModelTimeout,
+		WorkerConcurrency: defaultWorkerConcurrency,
 		Telemetry: platformtelemetry.Config{
 			Protocol:       getenv(envOTELProtocol),
 			TraceEndpoint:  getenv(envOTELTracesEndpoint),
@@ -159,6 +169,20 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 			return serviceConfig{}, fmt.Errorf("%s must be a positive duration", envShutdownTimeout)
 		}
 		config.ShutdownTimeout = duration
+	}
+	if value := getenv(envModelTimeout); value != "" {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a positive duration", envModelTimeout)
+		}
+		config.ModelTimeout = duration
+	}
+	if value := getenv(envWorkerConcurrency); value != "" {
+		concurrency, err := strconv.Atoi(value)
+		if err != nil || concurrency <= 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a positive integer", envWorkerConcurrency)
+		}
+		config.WorkerConcurrency = concurrency
 	}
 	pricing, err := platformmetrics.ParsePricingJSON(getenv(envModelPricing))
 	if err != nil {
@@ -247,8 +271,10 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		return err
 	}
 	var ingressHandler, adminHandler http.Handler
+	var wecomAdapter *wecom.Adapter
+	var feishuAdapter *feishu.Adapter
 	if config.Role.runsGateway() {
-		ingressHandler, err = newGatewayHandler(store, artifacts)
+		ingressHandler, wecomAdapter, feishuAdapter, err = newGatewayHandler(store, artifacts)
 		if err != nil {
 			return err
 		}
@@ -258,7 +284,12 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		}
 	}
 
-	server, err := startServiceServer(config.HTTPAddr, ingressHandler, adminHandler)
+	server, err := startServiceServer(config.HTTPAddr, ingressHandler, adminHandler, func(checkCtx context.Context) error {
+		if err := pool.Ping(checkCtx); err != nil {
+			return fmt.Errorf("ping postgres: %w", err)
+		}
+		return redisClient.Ping(checkCtx)
+	})
 	if err != nil {
 		return err
 	}
@@ -287,6 +318,8 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 			defaultSessionDSN: config.PostgresDSN,
 			defaultRedisURL:   config.RedisURL,
 			metrics:           metricsRecorder,
+			modelTimeout:      config.ModelTimeout,
+			concurrency:       config.WorkerConcurrency,
 		})
 		if err != nil {
 			return err
@@ -306,20 +339,34 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		go func() { done <- dispatchRelay.Run(componentCtx) }()
 		relayDone = done
 	}
+	var providerDone <-chan error
+	if wecomAdapter != nil || feishuAdapter != nil {
+		done := make(chan error, 1)
+		go func() {
+			defer close(done)
+			done <- runChannelAdapters(componentCtx, wecomAdapter, feishuAdapter)
+		}()
+		providerDone = done
+	}
 	log.Printf("trpc-agent-service %s role=%s http=%s", trpcservice.Version, config.Role, config.HTTPAddr)
 	if runtime == nil {
-		return waitForGatewayShutdown(componentCtx, server, config.ShutdownTimeout, relayDone)
+		server.MarkReady()
+		result := waitForGatewayShutdown(componentCtx, server, config.ShutdownTimeout, relayDone, providerDone)
+		cancelComponents()
+		return errors.Join(result, awaitProviderExit(providerDone, config.ShutdownTimeout))
 	}
-	return runWorkerUntilShutdown(componentCtx, runtime, server, config.ShutdownTimeout, relayDone)
+	result := runWorkerUntilShutdown(componentCtx, runtime, server, config.ShutdownTimeout, relayDone, providerDone)
+	cancelComponents()
+	return errors.Join(result, awaitProviderExit(providerDone, config.ShutdownTimeout))
 }
 
-func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (http.Handler, error) {
+func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (http.Handler, *wecom.Adapter, *feishu.Adapter, error) {
 	if store == nil || artifacts == nil {
-		return nil, errors.New("gateway dependencies are required")
+		return nil, nil, nil, errors.New("gateway dependencies are required")
 	}
 	events, err := postgres.NewExecutionEventJournal(store)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	admitter := gateway.New(store)
 	admitter.Metrics = store.Metrics()
@@ -328,14 +375,14 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 		events,
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	openAIHandler, err := ingress.NewOpenAIHandler(auth.HTTPAPIKeyResolver{
 		Credentials: store,
 		Directory:   store,
 	}, queued)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	secrets := environmentSecretProvider{getenv: os.Getenv}
 	attachmentIngestor, err := channelsattachments.NewIngestor(
@@ -344,7 +391,7 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 		artifacts,
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	wecomAdapter, err := wecom.NewAdapter(
 		store,
@@ -354,7 +401,7 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 		wecom.WithMetrics(store.Metrics()),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	feishuAdapter, err := feishu.NewAdapter(
 		store,
@@ -365,13 +412,58 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 		feishu.WithMetrics(store.Metrics()),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/im/wecom/", wecomAdapter)
-	mux.Handle("/im/feishu/", feishuAdapter)
 	mux.Handle("/", openAIHandler)
-	return mux, nil
+	return mux, wecomAdapter, feishuAdapter, nil
+}
+
+func runChannelAdapters(
+	ctx context.Context,
+	wecomAdapter *wecom.Adapter,
+	feishuAdapter *feishu.Adapter,
+) error {
+	if ctx == nil {
+		return errors.New("context is required")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type runner func(context.Context) error
+	runners := make([]runner, 0, 2)
+	if wecomAdapter != nil {
+		runners = append(runners, wecomAdapter.Run)
+	}
+	if feishuAdapter != nil {
+		runners = append(runners, feishuAdapter.Run)
+	}
+	if len(runners) == 0 {
+		return nil
+	}
+	done := make(chan error, len(runners))
+	var wg sync.WaitGroup
+	for _, run := range runners {
+		wg.Add(1)
+		go func(run runner) {
+			defer wg.Done()
+			done <- run(runCtx)
+		}(run)
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	var firstErr error
+	for err := range done {
+		if err != nil && !errors.Is(err, context.Canceled) && firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return firstErr
 }
 
 func newAdminHandler(store *postgres.Store, token string) (http.Handler, error) {
@@ -384,16 +476,43 @@ func newAdminHandler(store *postgres.Store, token string) (http.Handler, error) 
 	}, token)
 }
 
+func awaitProviderExit(done <-chan error, timeout time.Duration) error {
+	if done == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	select {
+	case err, ok := <-done:
+		if !ok {
+			return nil
+		}
+		return nonCancellationError(err)
+	case <-ctx.Done():
+		return fmt.Errorf("channel adapters did not stop: %w", ctx.Err())
+	}
+}
+
 func waitForGatewayShutdown(
 	ctx context.Context,
 	server *serviceServer,
 	shutdownTimeout time.Duration,
 	relayDone <-chan error,
+	providerDone <-chan error,
 ) error {
+	defer server.MarkNotReady()
 	select {
 	case err := <-relayDone:
+		server.MarkNotReady()
+		return err
+	case err := <-providerDone:
+		server.MarkNotReady()
 		return err
 	case <-ctx.Done():
+		server.MarkNotReady()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		return server.shutdown(shutdownCtx)
@@ -408,30 +527,44 @@ func runWorkerUntilShutdown(
 	server *serviceServer,
 	shutdownTimeout time.Duration,
 	relayDone <-chan error,
+	providerDone <-chan error,
 ) error {
+	defer server.MarkNotReady()
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
+	// Auxiliary loops must stop as soon as shutdown begins. The consumer keeps
+	// its run context until the grace deadline so a claimed execution can drain.
+	auxCtx, cancelAux := context.WithCancel(runCtx)
+	defer cancelAux()
 	done := make(chan error, 1)
 	go func() {
 		done <- runtime.consumer.Run(runCtx)
 	}()
 	migrationDone := make(chan error, 1)
 	go func() {
-		migrationDone <- runtime.runDataMigrations(runCtx)
+		migrationDone <- runtime.runDataMigrations(auxCtx)
 	}()
 	var replyDone <-chan error
 	if runtime.replySender != nil {
 		done := make(chan error, 1)
-		go func() { done <- runtime.replySender.Run(runCtx) }()
+		go func() { done <- runtime.replySender.Run(auxCtx) }()
 		replyDone = done
 	}
+	server.MarkReady()
 
 	select {
 	case err := <-relayDone:
+		server.MarkNotReady()
+		runtime.consumer.StopClaiming()
+		cancelRun()
+		return err
+	case err := <-providerDone:
+		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
 		cancelRun()
 		return err
 	case err := <-done:
+		server.MarkNotReady()
 		cancelRun()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancelShutdown()
@@ -439,6 +572,7 @@ func runWorkerUntilShutdown(
 		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
 		return dataMigrationShutdownResult(errors.Join(err, replyShutdownError(replyErr, replyStopped)), migrationErr, stopped)
 	case err := <-replyDone:
+		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
 		cancelRun()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -451,6 +585,7 @@ func runWorkerUntilShutdown(
 			migrationStopped,
 		)
 	case err := <-migrationDone:
+		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
 		cancelRun()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -463,6 +598,7 @@ func runWorkerUntilShutdown(
 			true,
 		)
 	case <-server.done:
+		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
 		cancelRun()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -472,7 +608,9 @@ func runWorkerUntilShutdown(
 		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
 		return dataMigrationShutdownResult(workerShutdownResult(errors.Join(server.wait(), replyShutdownError(replyErr, replyStopped)), workerErr, stopped), migrationErr, migrationStopped)
 	case <-ctx.Done():
+		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
+		cancelAux()
 	}
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)

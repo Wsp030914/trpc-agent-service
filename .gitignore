@@ -2,9 +2,19 @@
 .vscode
 .DS_Store
 .env
+.env.hardening
+full-test.local.env
 .workbuddy/
 *.log
 *.swp
+*.tmp
+*.temp
+*.bak
+
+# Local end-to-end verification artifacts.
+.e2e-*/
+.verify-*/
+.e2e-restart.ps1
 
 bin/
 dist/

@@ -26,14 +26,14 @@ IM / HTTP
 → Feishu / WeCom send
 ```
 
-Callback、Gateway、Worker、Runner、Tool、Session/Memory 和 Reply 边界使用安全
+Provider event、Gateway、Worker、Runner、Tool、Session/Memory 和 Reply 边界使用安全
 metadata span；W3C trace context 随 Execution 持久化并跨 Redis Stream 传播。审计
 事件只保存身份、决策、耗时、错误类型、token/cost 和关联 ID，不保存消息、Prompt、
 Tool arguments、Provider target 或 Secret。
 
 Gateway 在一个事务中复核 tenant/app/binding、读取 active config version、处理
 Inbox 幂等、分配 Session `turn_seq`，并同时写 Execution 与 Dispatch Outbox。
-提交后才确认外部 IM；重复 callback 命中 Inbox 时返回原 request。
+重复 provider event 命中 Inbox 时返回原 request。
 
 Worker 从 Execution 中读取并固定的 `config_version` 装配运行时。每次执行创建
 一个 fresh Runner；长期 Session service、Memory、Qdrant、Artifact 和客户端缓存
@@ -43,7 +43,7 @@ Worker 从 Execution 中读取并固定的 `config_version` 装配运行时。�
 
 - tenant 是最高隔离边界；所有 SQL 查询、Redis key、向量过滤、对象 metadata 都
   带 tenant/app scope。
-- Binding 验签/解密后才能导出 tenant/app 和外部身份；payload 不可信。
+- 长连接认证和 event 校验后才能导出 tenant/app 和外部身份；payload 不可信。
 - AppConfig version immutable；Execution 固定版本，配置发布只影响后续准入。
 - 模型、IM 和存储凭据只以 SecretRef 进入配置，运行时由 scoped SecretProvider
   解析；secret 原文不进入队列、Session 或日志。
@@ -66,8 +66,8 @@ ArtifactRef/version 读取；媒体 bytes 在模型调用边界恢复。
 
 ## IM
 
-Feishu 和 WeCom Adapter 各自负责协议验签、解密、身份映射和入站标准化。出站
-Reply 是普通文本：Runner event → Reply Outbox → 当前 Binding Revision 的 target
+Feishu Adapter 使用官方 Go SDK 长连接；WeCom Adapter 使用官方 AI Bot WebSocket
+协议。二者负责连接认证、身份映射和入站标准化。出站 Reply 是普通文本：Runner event → Reply Outbox → 当前 Binding Revision 的 target
 resolve/decrypt → provider send。当前选择普通异步文本；stream/card 只作为后续
 扩展能力，不进入当前主链。provider transient failure 按 Reply Outbox 的重试策略
 处理，其他 channel 细节不进入 Gateway 或 Worker。

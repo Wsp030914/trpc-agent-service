@@ -264,13 +264,8 @@ func testBinding(tenantID, appID, bindingID string) channels.Binding {
 		BindingID:       bindingID,
 		Channel:         channels.ChannelWeCom,
 		ExternalAccount: "corp-agent-1",
-		WebhookURL:      "https://example.com/im/wecom/binding-1",
-		TokenRef: tenant.SecretRef{
-			Name:    "wecom-token",
-			Version: "v1",
-		},
-		SigningSecretRef: tenant.SecretRef{
-			Name:    "wecom-signing-secret",
+		Secret: tenant.SecretRef{
+			Name:    "wecom-bot-secret",
 			Version: "v1",
 		},
 		PublicRouteID:   "route-" + bindingID,

@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"math/rand/v2"
 	"sync"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
@@ -17,6 +20,8 @@ const (
 	defaultConsumerPollInterval  = time.Second
 	defaultConsumerConcurrency   = 4
 	consumerCompletionTimeout    = 5 * time.Second
+	consumerRetryInitial         = 250 * time.Millisecond
+	consumerRetryMax             = 30 * time.Second
 )
 
 // JobExecutor executes one durable execution claimed by a Consumer.
@@ -30,6 +35,8 @@ type ExecutionStore interface {
 	Claim(context.Context, queue.Dispatch, queue.ClaimRequest) (queue.Claim, bool, error)
 	Renew(context.Context, queue.Claim, time.Duration) (queue.Lease, error)
 	Complete(context.Context, queue.Claim, queue.CompletionStatus) error
+	CompleteUncertain(context.Context, queue.Claim, error) error
+	WaitForApproval(context.Context, queue.Claim, string) error
 	Retry(context.Context, queue.Claim, error) error
 }
 
@@ -43,13 +50,36 @@ type Consumer struct {
 	leaseDuration time.Duration
 	pollInterval  time.Duration
 	concurrency   int
+	retryDelay    func(int) time.Duration
 	mu            sync.Mutex
 	stopClaims    chan struct{}
 	claimCancel   context.CancelFunc
 }
 
+// ConsumerOptions controls the bounded worker loop without introducing a
+// second concurrency manager. Zero values use production defaults.
+type ConsumerOptions struct {
+	LeaseDuration time.Duration
+	PollInterval  time.Duration
+	Concurrency   int
+	RetryDelay    func(int) time.Duration
+}
+
 // NewConsumer creates a consumer for one stable worker identity.
 func NewConsumer(executor JobExecutor, stream queue.Stream, jobs ExecutionStore, owner string) (*Consumer, error) {
+	return NewConsumerWithOptions(executor, stream, jobs, owner, ConsumerOptions{})
+}
+
+// NewConsumerWithOptions creates a consumer with explicit lease, polling, and
+// concurrency settings. Concurrency is process-local; PostgreSQL/Redis remain
+// authoritative for cross-node ownership.
+func NewConsumerWithOptions(
+	executor JobExecutor,
+	stream queue.Stream,
+	jobs ExecutionStore,
+	owner string,
+	options ConsumerOptions,
+) (*Consumer, error) {
 	if executor == nil {
 		return nil, errors.New("job executor is required")
 	}
@@ -62,14 +92,24 @@ func NewConsumer(executor JobExecutor, stream queue.Stream, jobs ExecutionStore,
 	if owner == "" {
 		return nil, errors.New("worker owner is required")
 	}
+	if options.LeaseDuration <= 0 {
+		options.LeaseDuration = defaultConsumerLeaseDuration
+	}
+	if options.PollInterval <= 0 {
+		options.PollInterval = defaultConsumerPollInterval
+	}
+	if options.Concurrency <= 0 {
+		options.Concurrency = defaultConsumerConcurrency
+	}
 	return &Consumer{
 		executor:      executor,
 		stream:        stream,
 		jobs:          jobs,
 		owner:         owner,
-		leaseDuration: defaultConsumerLeaseDuration,
-		pollInterval:  defaultConsumerPollInterval,
-		concurrency:   defaultConsumerConcurrency,
+		leaseDuration: options.LeaseDuration,
+		pollInterval:  options.PollInterval,
+		concurrency:   options.Concurrency,
+		retryDelay:    options.RetryDelay,
 		stopClaims:    make(chan struct{}),
 	}, nil
 }
@@ -94,10 +134,11 @@ func (c *Consumer) StopClaiming() {
 	}
 }
 
-// Run consumes deliveries until cancellation, an unrecoverable stream error,
-// or StopClaiming. Claimed jobs execute with bounded concurrency; the
-// execution store preserves session-lane order across concurrent runs. Pending
-// Redis deliveries are reclaimed after an owner dies.
+// Run consumes deliveries until cancellation or StopClaiming. Redis and
+// PostgreSQL outages stay local to this worker and use bounded backoff instead
+// of terminating the consumer. Claimed jobs execute with bounded concurrency;
+// the execution store preserves session-lane order across concurrent runs.
+// Pending Redis deliveries are reclaimed after an owner dies.
 func (c *Consumer) Run(ctx context.Context) error {
 	if c == nil || c.executor == nil || c.stream == nil || c.jobs == nil {
 		return errors.New("consumer is not initialized")
@@ -117,78 +158,198 @@ func (c *Consumer) Run(ctx context.Context) error {
 	// and PostgreSQL transitions are not abandoned mid-flight.
 	defer wg.Wait()
 
-	var failOnce sync.Once
-	var runErr error
-	fail := func(err error) {
-		failOnce.Do(func() {
-			runErr = err
-			c.StopClaiming()
-		})
-	}
-
 	for {
 		if c.claimingStopped() {
-			return runErr
+			return nil
 		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		delivery, err := c.stream.Receive(claimCtx, c.owner, c.pollInterval)
+		delivery, err := c.receive(claimCtx)
 		if errors.Is(err, context.DeadlineExceeded) {
 			continue
 		}
 		if err != nil {
-			if c.claimingStopped() && errors.Is(err, context.Canceled) {
-				return runErr
+			if delivery.ID != "" {
+				// A delivery id with a decode/validation error identifies a
+				// permanently malformed stream entry. Dead-letter it once so
+				// one poison message cannot block the consumer forever.
+				if deadErr := c.deadDelivery(claimCtx, delivery, err); deadErr != nil {
+					if c.claimingStopped() && errors.Is(deadErr, context.Canceled) {
+						return nil
+					}
+					return fmt.Errorf("dead-letter invalid dispatch: %w", deadErr)
+				}
+				continue
 			}
-			return fmt.Errorf("receive dispatch: %w", err)
+			if c.claimingStopped() && errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
 		}
 		if err := delivery.Validate(); err != nil {
-			if deadErr := c.stream.Dead(context.WithoutCancel(ctx), delivery, err); deadErr != nil {
+			if deadErr := c.deadDelivery(claimCtx, delivery, err); deadErr != nil {
+				if c.claimingStopped() && errors.Is(deadErr, context.Canceled) {
+					return nil
+				}
 				return fmt.Errorf("dead-letter invalid dispatch: %w", deadErr)
 			}
 			continue
 		}
-		deliveryCtx := platformtelemetry.Extract(claimCtx, map[string]string{
+		// Reserve a slot before claiming the PostgreSQL execution. The receive
+		// loop itself is not an execution and must not reduce the configured
+		// worker concurrency by one.
+		select {
+		case sem <- struct{}{}:
+		case <-claimCtx.Done():
+			if c.claimingStopped() {
+				return nil
+			}
+			return claimCtx.Err()
+		}
+		claimCtxWithTrace := platformtelemetry.Extract(claimCtx, map[string]string{
 			"traceparent": delivery.Dispatch.TraceParent,
 			"tracestate":  delivery.Dispatch.TraceState,
 		})
-		claim, found, err := c.jobs.Claim(deliveryCtx, delivery.Dispatch, queue.ClaimRequest{Owner: c.owner, LeaseDuration: c.leaseDuration})
+		claim, found, err := c.claimExecution(claimCtxWithTrace, delivery.Dispatch)
 		if err != nil {
+			<-sem
 			if c.claimingStopped() && errors.Is(err, context.Canceled) {
-				return runErr
+				return nil
 			}
-			return fmt.Errorf("claim execution: %w", err)
+			return err
 		}
 		if !found {
-			if err := c.stream.Ack(context.WithoutCancel(ctx), delivery); err != nil {
+			if err := c.ackDelivery(claimCtxWithTrace, delivery); err != nil {
+				<-sem
+				if c.claimingStopped() && errors.Is(err, context.Canceled) {
+					return nil
+				}
 				return fmt.Errorf("ack unavailable execution: %w", err)
 			}
+			<-sem
 			continue
 		}
 		if err := claim.Validate(); err != nil {
+			<-sem
 			return fmt.Errorf("claimed execution: %w", err)
 		}
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		deliveryCtx := platformtelemetry.Extract(ctx, map[string]string{
+			"traceparent": delivery.Dispatch.TraceParent,
+			"tracestate":  delivery.Dispatch.TraceState,
+		})
 		wg.Add(1)
 		go func(runContext context.Context, claim queue.Claim, delivery queue.Delivery) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			ack, err := c.executeClaim(runContext, claim)
 			if err != nil {
-				fail(err)
-				return
+				log.Printf("worker execution %s failed: %s", claim.Job.RequestID(), platformlog.SafeError(err))
 			}
 			if ack {
-				if err := c.stream.Ack(context.WithoutCancel(ctx), delivery); err != nil {
-					fail(fmt.Errorf("ack execution: %w", err))
+				if ackErr := c.ackDelivery(runContext, delivery); ackErr != nil && runContext.Err() == nil {
+					log.Printf("ack execution %s failed: %s", claim.Job.RequestID(), platformlog.SafeError(ackErr))
 				}
 			}
 		}(deliveryCtx, claim, delivery)
+	}
+}
+
+func (c *Consumer) receive(ctx context.Context) (queue.Delivery, error) {
+	for attempt := 0; ; attempt++ {
+		delivery, err := c.stream.Receive(ctx, c.owner, c.pollInterval)
+		if err == nil || errors.Is(err, context.DeadlineExceeded) || delivery.ID != "" {
+			return delivery, err
+		}
+		if ctx.Err() != nil {
+			return queue.Delivery{}, ctx.Err()
+		}
+		log.Printf("receive dispatch failed: %s", platformlog.SafeError(err))
+		if err := waitForConsumerRetry(ctx, c.backoff(attempt)); err != nil {
+			return queue.Delivery{}, err
+		}
+	}
+}
+
+func (c *Consumer) claimExecution(ctx context.Context, dispatch queue.Dispatch) (queue.Claim, bool, error) {
+	for attempt := 0; ; attempt++ {
+		claim, found, err := c.jobs.Claim(ctx, dispatch, queue.ClaimRequest{Owner: c.owner, LeaseDuration: c.leaseDuration})
+		if err == nil {
+			return claim, found, nil
+		}
+		if ctx.Err() != nil {
+			return queue.Claim{}, false, ctx.Err()
+		}
+		log.Printf("claim execution %s failed: %s", dispatch.RequestID, platformlog.SafeError(err))
+		if err := waitForConsumerRetry(ctx, c.backoff(attempt)); err != nil {
+			return queue.Claim{}, false, err
+		}
+	}
+}
+
+func (c *Consumer) ackDelivery(ctx context.Context, delivery queue.Delivery) error {
+	for attempt := 0; ; attempt++ {
+		if err := c.stream.Ack(ctx, delivery); err == nil {
+			return nil
+		} else if ctx.Err() != nil {
+			return ctx.Err()
+		} else {
+			log.Printf("ack dispatch %s failed: %s", delivery.ID, platformlog.SafeError(err))
+		}
+		if err := waitForConsumerRetry(ctx, c.backoff(attempt)); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Consumer) deadDelivery(ctx context.Context, delivery queue.Delivery, cause error) error {
+	for attempt := 0; ; attempt++ {
+		if err := c.stream.Dead(ctx, delivery, cause); err == nil {
+			return nil
+		} else if ctx.Err() != nil {
+			return ctx.Err()
+		} else {
+			log.Printf("dead-letter dispatch %s failed: %s", delivery.ID, platformlog.SafeError(err))
+		}
+		if err := waitForConsumerRetry(ctx, c.backoff(attempt)); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Consumer) backoff(attempt int) time.Duration {
+	if c != nil && c.retryDelay != nil {
+		if delay := c.retryDelay(attempt); delay > 0 {
+			return delay
+		}
+	}
+	return consumerRetryDelay(attempt)
+}
+
+func consumerRetryDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := consumerRetryInitial
+	for attempt > 0 && delay < consumerRetryMax {
+		delay *= 2
+		attempt--
+	}
+	if delay > consumerRetryMax {
+		delay = consumerRetryMax
+	}
+	half := delay / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+
+func waitForConsumerRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		delay = consumerRetryInitial
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 func (c *Consumer) claimContext(parent context.Context) (context.Context, context.CancelFunc, bool) {
@@ -240,12 +401,45 @@ func (c *Consumer) executeClaim(ctx context.Context, claim queue.Claim) (bool, e
 	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), consumerCompletionTimeout)
 	defer cancel()
 	if ctx.Err() != nil {
+		// The execution has not reached a durable terminal transition. Leave the
+		// Redis delivery pending so lease recovery can finish it after shutdown.
+		return false, ctx.Err()
+	}
+	if result.ApprovalPending {
+		if result.ApprovalID == "" {
+			return false, errors.New("approval continuation is not durable")
+		}
+		if err := c.jobs.WaitForApproval(completeCtx, claim, result.ApprovalID); errors.Is(err, queue.ErrLeaseLost) {
+			return true, nil
+		} else if err != nil {
+			return false, fmt.Errorf("park execution for approval: %w", err)
+		}
 		return true, nil
 	}
 	if runErr != nil || !result.RunnerCompleted {
 		failure := runErr
 		if failure == nil {
 			failure = errors.New("runner completed without completion event")
+		}
+		// A Runner may already have called a Tool with an external side effect.
+		// Do not automatically re-run it merely because the terminal event was
+		// an error. Crash recovery remains at-least-once via lease expiry.
+		if IsSideEffectUncertainError(failure) {
+			if err := c.jobs.CompleteUncertain(completeCtx, claim, failure); errors.Is(err, queue.ErrLeaseLost) {
+				return true, nil
+			} else if err != nil {
+				return false, fmt.Errorf("mark uncertain execution: %w", err)
+			}
+			return true, nil
+		}
+		if IsPermanentExecutionError(failure) ||
+			(!IsRetryableExecutionError(failure) && result.RunnerStarted) {
+			if err := c.jobs.Complete(completeCtx, claim, queue.CompletionFailed); errors.Is(err, queue.ErrLeaseLost) {
+				return true, nil
+			} else if err != nil {
+				return false, fmt.Errorf("fail execution: %w", err)
+			}
+			return true, nil
 		}
 		if err := c.jobs.Retry(completeCtx, claim, failure); errors.Is(err, queue.ErrLeaseLost) {
 			return true, nil
@@ -274,7 +468,13 @@ func (c *Consumer) renewLease(ctx context.Context, cancel context.CancelFunc, cl
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			lease, err := c.jobs.Renew(ctx, claim, c.leaseDuration)
+			renewTimeout := c.leaseDuration / 3
+			if renewTimeout <= 0 {
+				renewTimeout = time.Nanosecond
+			}
+			renewCtx, cancelRenew := context.WithTimeout(ctx, renewTimeout)
+			lease, err := c.jobs.Renew(renewCtx, claim, c.leaseDuration)
+			cancelRenew()
 			if err != nil {
 				if ctx.Err() == nil {
 					done <- err

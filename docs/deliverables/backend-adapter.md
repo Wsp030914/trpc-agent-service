@@ -48,7 +48,7 @@ AppConfig Knowledge BackendRef
 ## Artifact
 
 对象存储保存媒体 bytes，SQL 保存带 tenant/app/session scope 的 metadata。对象 key
-由平台生成；读取必须先通过 metadata authorization 和 version 校验。IM 回调中的
+由平台生成；读取必须先通过 metadata authorization 和 version 校验。IM event 中的
 媒体先写 object，再写 metadata，后续只传 ArtifactRef；Worker 在模型调用前恢复
 内容。
 

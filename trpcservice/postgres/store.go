@@ -106,6 +106,9 @@ func (s *Store) CreateTenant(ctx context.Context, value tenant.Tenant) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
+	if err := value.Validate(); err != nil {
+		return err
+	}
 	auditPolicy, err := marshalAuditPolicy(value.Audit)
 	if err != nil {
 		return err
@@ -164,6 +167,16 @@ func (s *Store) CreateAgentApp(
 	if err := s.validate(); err != nil {
 		return err
 	}
+	if err := app.Validate(); err != nil {
+		return err
+	}
+	if err := initial.Validate(); err != nil {
+		return err
+	}
+	if app.TenantID != initial.TenantID || app.AppID != initial.AppID ||
+		app.ActiveConfigVersion != initial.Version {
+		return errors.New("agent app and initial config scope does not match")
+	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -172,6 +185,13 @@ func (s *Store) CreateAgentApp(
 	defer func() {
 		rollback(tx)
 	}()
+	tnt, err := lockTenant(ctx, tx, app.TenantID)
+	if err != nil {
+		return fmt.Errorf("lock tenant for app config: %w", err)
+	}
+	if err := tnt.Audit.ValidateAppConfig(initial.Audit); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(
 		ctx,
 		`INSERT INTO platform.agent_app
@@ -376,9 +396,38 @@ func (s *Store) CreateChannelBinding(ctx context.Context, binding channels.Bindi
 	if err := s.validate(); err != nil {
 		return err
 	}
-	tokenRef, signingSecretRef, secret, err := marshalBindingSecretRefs(binding)
+	if err := binding.Validate(); err != nil {
+		return fmt.Errorf("channel binding: %w", err)
+	}
+	secret, err := marshalBindingSecretRef(binding)
 	if err != nil {
 		return err
+	}
+	if binding.PublicRouteID == "" {
+		if _, err := s.pool.Exec(
+			ctx,
+			`INSERT INTO platform.channel_binding (
+    tenant_id,
+    app_id,
+    binding_id,
+    channel,
+    external_account,
+    secret_ref,
+    binding_revision,
+    status
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			binding.TenantID,
+			binding.AppID,
+			binding.BindingID,
+			binding.Channel,
+			binding.ExternalAccount,
+			secret,
+			binding.BindingRevision,
+			binding.Status,
+		); err != nil {
+			return fmt.Errorf("create channel binding: %w", err)
+		}
+		return nil
 	}
 	if _, err := s.pool.Exec(
 		ctx,
@@ -388,24 +437,16 @@ func (s *Store) CreateChannelBinding(ctx context.Context, binding channels.Bindi
     binding_id,
     channel,
     external_account,
-    external_account_scope,
-    webhook_url,
-    token_ref,
-    signing_secret_ref,
     secret_ref,
     public_route_id,
     binding_revision,
     status
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		binding.TenantID,
 		binding.AppID,
 		binding.BindingID,
 		binding.Channel,
 		binding.ExternalAccount,
-		binding.ExternalAccountScope,
-		binding.WebhookURL,
-		tokenRef,
-		signingSecretRef,
 		secret,
 		binding.PublicRouteID,
 		binding.BindingRevision,
@@ -450,37 +491,23 @@ WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`,
 	return binding, nil
 }
 
-func marshalBindingSecretRefs(binding channels.Binding) ([]byte, []byte, []byte, error) {
-	tokenRef, err := json.Marshal(binding.TokenRef)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("marshal channel token ref: %w", err)
-	}
-	signingSecretRef, err := json.Marshal(binding.SigningSecretRef)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("marshal channel signing secret ref: %w", err)
-	}
+func marshalBindingSecretRef(binding channels.Binding) ([]byte, error) {
 	secret, err := json.Marshal(binding.Secret)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("marshal channel secret ref: %w", err)
+		return nil, fmt.Errorf("marshal channel provider secret ref: %w", err)
 	}
-	return tokenRef, signingSecretRef, secret, nil
+	return secret, nil
 }
 
-func unmarshalBindingSecretRefs(
+func unmarshalBindingSecretRef(
 	binding *channels.Binding,
-	tokenRef, signingSecretRef, secret []byte,
+	secret []byte,
 ) error {
 	if binding == nil {
 		return errors.New("channel binding is required")
 	}
-	if err := json.Unmarshal(tokenRef, &binding.TokenRef); err != nil {
-		return fmt.Errorf("unmarshal channel token ref: %w", err)
-	}
-	if err := json.Unmarshal(signingSecretRef, &binding.SigningSecretRef); err != nil {
-		return fmt.Errorf("unmarshal channel signing secret ref: %w", err)
-	}
 	if err := json.Unmarshal(secret, &binding.Secret); err != nil {
-		return fmt.Errorf("unmarshal channel secret ref: %w", err)
+		return fmt.Errorf("unmarshal channel provider secret ref: %w", err)
 	}
 	return nil
 }

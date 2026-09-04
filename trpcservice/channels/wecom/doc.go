@@ -1,3 +1,3 @@
-// Package wecom will contain Enterprise WeChat channel verification and
-// message delivery adapters.
+// Package wecom contains the Enterprise WeChat AI Bot WebSocket event adapter
+// and reply client.
 package wecom

@@ -123,6 +123,23 @@ func NewChannelBindingInputIdentityResolver(
 	return newChannelBindingIdentityResolver(route, runtimeContext, true)
 }
 
+// NewChannelBindingInputIdentityResolverFromBinding creates the same trusted
+// channel identity for an event delivered by an authenticated provider
+// long-connection client. The binding must come from the authoritative
+// BindingSource; no public HTTP route is used by this path.
+func NewChannelBindingInputIdentityResolverFromBinding(
+	binding channels.BindingSnapshot,
+	runtimeContext tenant.RuntimeContext,
+) (*ChannelBindingIdentityResolver, error) {
+	return NewChannelBindingInputIdentityResolver(
+		LocatedChannelBinding{
+			snapshot:   binding,
+			provenance: &locatedChannelBindingProvenance{},
+		},
+		runtimeContext,
+	)
+}
+
 func newChannelBindingIdentityResolver(
 	route LocatedChannelBinding,
 	runtimeContext tenant.RuntimeContext,

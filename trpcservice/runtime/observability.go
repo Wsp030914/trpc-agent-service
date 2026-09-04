@@ -233,7 +233,8 @@ func (s *tracedSessionService) Close() (err error) {
 
 type tracedSessionIngestor struct {
 	frameworksession.Ingestor
-	exec worker.Execution
+	exec    worker.Execution
+	metrics *platformmetrics.Recorder
 }
 
 func (i *tracedSessionIngestor) IngestSession(
@@ -248,11 +249,22 @@ func (i *tracedSessionIngestor) IngestSession(
 		attribute.String("request_id", i.exec.RequestID),
 		attribute.String("backend.provider", i.exec.Config.BackendConfig.Memory.Provider),
 	)
+	started := time.Now()
 	defer func() {
+		errorType := ""
 		if err != nil {
+			errorType = "memory"
 			platformtelemetry.MarkError(span, "memory", err)
 		}
 		span.End()
+		if i.metrics != nil {
+			i.metrics.RecordMemory(opCtx, platformmetrics.Labels{
+				TenantID: i.exec.Tenant.TenantID,
+				AppID:    i.exec.Tenant.AppID,
+				Channel:  i.exec.Tenant.Channel,
+				Provider: i.exec.Config.BackendConfig.Memory.Provider,
+			}, time.Since(started), errorType)
+		}
 	}()
 	return i.Ingestor.IngestSession(opCtx, sess, opts...)
 }

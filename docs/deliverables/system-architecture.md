@@ -31,7 +31,7 @@ flowchart LR
 
 | 组件 | 责任 |
 | --- | --- |
-| Channel Adapter | Feishu/WeCom 验签、解密、Binding/Identity 映射和文本收发 |
+| Channel Adapter | Feishu/WeCom 长连接认证、事件标准化、Binding/Identity 映射和文本收发 |
 | Gateway | 可信 scope、配置版本、Inbox 幂等、turn_seq、Execution 和 Dispatch Outbox |
 | Relay / Redis Stream | 将已提交 Dispatch Outbox 投递给任意 Worker |
 | Worker | Claim Execution、持有 Lease、获取 Session Lock、运行 fresh Runner、排空 events 并关闭 Runner |
@@ -46,7 +46,7 @@ flowchart LR
 
 ## 执行约束
 
-1. Adapter 只有在 Gateway 事务提交 Inbox、Execution 和 Dispatch Outbox 后确认 callback。
+1. Adapter 只有在 Gateway 事务提交 Inbox、Execution 和 Dispatch Outbox 后完成事件处理。
 2. Worker 只能使用 Execution 中固定的 `config_version`，不能读取新的 active version 替换它。
 3. 同一 Session 的 `turn_seq`、Execution Lease 和 Redis Session Lock 分别保护顺序、状态所有权和串行执行。
 4. Runner event channel 必须消费到关闭，再调用 `Runner.Close`；Context 取消不会跳过排空。

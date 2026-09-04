@@ -1,6 +1,7 @@
 package audit_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -54,5 +55,22 @@ func TestEventValidateRejectsInvalidMeasurements(t *testing.T) {
 	base.Cost = &cost
 	if err := base.Validate(); err == nil {
 		t.Fatal("negative audit cost was accepted")
+	}
+}
+
+func TestRedactEventRemovesPIIAndCredentials(t *testing.T) {
+	event := audit.Event{
+		UserID:    "alice@example.com",
+		SessionID: "13800138000",
+		AgentName: "Bearer token123",
+		ToolName:  "password=secret123",
+	}
+	redacted := audit.RedactEvent(event)
+	for _, value := range []string{redacted.UserID, redacted.SessionID, redacted.AgentName, redacted.ToolName} {
+		for _, secret := range []string{"alice@example.com", "13800138000", "Bearer token123", "secret123"} {
+			if strings.Contains(value, secret) {
+				t.Fatalf("redacted value %q still contains %q", value, secret)
+			}
+		}
 	}
 }

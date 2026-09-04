@@ -1,640 +1,391 @@
 package wecom
 
 import (
-	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
-const (
-	testToken       = "wecom-token"
-	testRoute       = "r_test-route"
-	testBindingID   = "binding-wecom"
-	testExternalBot = "aibot-test"
-)
-
-var testNow = time.Unix(1_735_689_600, 0).UTC()
-
-func TestAdapterURLVerification(t *testing.T) {
-	adapter, codec, _, _ := newTestAdapter(t)
-	encrypted, err := codec.encrypt([]byte("challenge"))
+func TestHandleMessageUsesBotIDBindingAndSendsChannelInputToGateway(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "bot-secret-a")
+	source, err := config.NewStaticBindingResolver(binding)
 	if err != nil {
-		t.Fatalf("encrypt challenge: %v", err)
+		t.Fatal(err)
 	}
-	request := signedRequest(t, http.MethodGet, "/im/wecom/"+testRoute, encrypted, "echostr")
-	query, err := signedQuery(request, encrypted)
+	admitter := newWeComRecordingAdmitter()
+	adapter := newWeComTestAdapter(t, source, admitter, testWeComSecrets{
+		key:   binding,
+		value: "bot-secret-a",
+	})
+
+	if err := adapter.HandleMessage(context.Background(), binding.Snapshot(), Message{
+		MessageID:   "msg-1",
+		AIBotID:     "bot-a",
+		ChatType:    "single",
+		From:        MessageFrom{UserID: "user-a"},
+		MessageType: "text",
+		Text:        MessageText{Content: "hello"},
+	}); err != nil {
+		t.Fatalf("handle WeCom WS event: %v", err)
+	}
+
+	request := admitter.lastRequest(t)
+	if request.Identity.Tenant.TenantID != "tenant-a" || request.Identity.Tenant.AppID != "support" || request.Identity.Tenant.BindingID != "binding-a" {
+		t.Fatalf("admission scope = %#v, want tenant-a/support/binding-a", request.Identity.Tenant)
+	}
+	if request.ChannelInput == nil || request.ChannelInput.ExternalMessageID != "msg-1" || request.ChannelInput.Text != "hello" {
+		t.Fatalf("channel input = %#v", request.ChannelInput)
+	}
+}
+
+func TestHandleMessageDuplicateEventUsesGatewayIdempotency(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "bot-secret")
+	source, err := config.NewStaticBindingResolver(binding)
 	if err != nil {
-		t.Fatalf("parse verification query: %v", err)
+		t.Fatal(err)
 	}
-	if err := codec.verifySignature(query.timestamp, query.nonce, query.encrypted, query.signature); err != nil {
-		t.Fatalf("verify challenge signature: %v, query=%#v", err, query)
+	admitter := newWeComRecordingAdmitter()
+	adapter := newWeComTestAdapter(t, source, admitter, testWeComSecrets{key: binding, value: "bot-secret"})
+	event := Message{
+		MessageID:   "msg-duplicate",
+		AIBotID:     "bot-a",
+		ChatType:    "single",
+		From:        MessageFrom{UserID: "user-a"},
+		MessageType: "text",
+		Text:        MessageText{Content: "same"},
 	}
-	if _, err := codec.decrypt(encrypted); err != nil {
-		t.Fatalf("decrypt challenge: %v", err)
-	}
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("verification status = %d, want %d, body=%q", response.Code, http.StatusOK, response.Body.String())
-	}
-	if response.Body.String() != "challenge" {
-		t.Fatalf("verification body = %q", response.Body.String())
-	}
-	if strings.HasSuffix(response.Body.String(), "\n") {
-		t.Fatal("verification response contains a trailing newline")
-	}
-}
-
-func TestAdapterRejectsInvalidSignatureBeforeGateway(t *testing.T) {
-	adapter, codec, admitter, _ := newTestAdapter(t)
-	body := validCallbackJSON(t, "msg-1", "text", "hello")
-	encrypted, err := codec.encrypt(body)
-	if err != nil {
-		t.Fatalf("encrypt callback: %v", err)
-	}
-	request := signedRequest(t, http.MethodPost, "/im/wecom/"+testRoute, encrypted, "body")
-	request.URL.RawQuery = strings.Replace(request.URL.RawQuery, "msg_signature=", "msg_signature=invalid", 1)
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("invalid signature status = %d, want %d", response.Code, http.StatusBadRequest)
-	}
-	if len(admitter.requests()) != 0 {
-		t.Fatal("invalid signature reached Gateway")
-	}
-}
-
-func TestAdapterSubmitsDirectMessageWithBindingScope(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t)
-	body := validCallbackJSON(t, "msg-direct", "text", "hello")
-	request := callbackRequest(t, body)
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("callback status = %d, want %d", response.Code, http.StatusOK)
-	}
-	requests := admitter.requests()
-	if len(requests) != 1 {
-		t.Fatalf("Gateway request count = %d, want 1", len(requests))
-	}
-	requestValue := requests[0]
-	if requestValue.Identity.Tenant.TenantID != "tenant-a" || requestValue.Identity.Tenant.AppID != "app-a" {
-		t.Fatalf("trusted scope = %#v", requestValue.Identity.Tenant)
-	}
-	if requestValue.Identity.Source != gateway.TenantSourceVerifiedChannelBinding ||
-		requestValue.Identity.SourceID != testBindingID {
-		t.Fatalf("trusted source = %#v", requestValue.Identity)
-	}
-	if requestValue.IdempotencyKey != "msg-direct" || requestValue.ChannelInput == nil {
-		t.Fatalf("Gateway request = %#v", requestValue)
-	}
-	input := requestValue.ChannelInput
-	if input.TenantID != "tenant-a" || input.AppID != "app-a" || input.BindingID != testBindingID {
-		t.Fatalf("channel input scope = %#v", *input)
-	}
-	if input.Conversation.Kind != channels.ConversationDirect || input.Text != "hello" {
-		t.Fatalf("channel input = %#v", *input)
-	}
-	mapping, ok := input.MappingInput()
-	if !ok || mapping.ExternalSenderID != "user-1" || mapping.ProviderSenderTarget != "user-1" {
-		t.Fatalf("direct mapping = %#v, present=%v", mapping, ok)
-	}
-	if strings.Contains(requestValue.Message.Text, "response_url") || strings.Contains(requestValue.Message.Text, "aibotid") {
-		t.Fatal("provider fields leaked into Gateway message")
-	}
-}
-
-func TestAdapterSubmitsGroupMessageWithGroupMapping(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t)
-	body := []byte(`{"msgid":"msg-group","aibotid":"aibot-test","chatid":"chat-1","chattype":"group","from":{"userid":"user-2"},"response_url":"https://qyapi.weixin.qq.com/cgi-bin/bot/get?msgid=msg-group","msgtype":"text","text":{"content":"group hello"}}`)
-	request := callbackRequest(t, body)
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("callback status = %d, want %d", response.Code, http.StatusOK)
-	}
-	requests := admitter.requests()
-	if len(requests) != 1 || requests[0].ChannelInput == nil {
-		t.Fatalf("Gateway requests = %#v", requests)
-	}
-	input := requests[0].ChannelInput
-	if input.Conversation.Kind != channels.ConversationGroup {
-		t.Fatalf("conversation kind = %q", input.Conversation.Kind)
-	}
-	mapping, ok := input.MappingInput()
-	if !ok || mapping.ExternalChatID != "chat-1" || mapping.ProviderConversationTarget != "chat-1" {
-		t.Fatalf("group mapping = %#v, present=%v", mapping, ok)
-	}
-	if mapping.ExternalSenderID != "user-2" {
-		t.Fatalf("group sender = %q", mapping.ExternalSenderID)
-	}
-}
-
-func TestAdapterRejectsBindingAccountMismatch(t *testing.T) {
-	adapter, codec, admitter, _ := newTestAdapter(t)
-	body := []byte(`{"msgid":"msg-1","aibotid":"another-bot","chattype":"single","from":{"userid":"user-1"},"msgtype":"text","text":{"content":"hello"}}`)
-	encrypted, err := codec.encrypt(body)
-	if err != nil {
-		t.Fatalf("encrypt callback: %v", err)
-	}
-	request := signedRequest(t, http.MethodPost, "/im/wecom/"+testRoute, encrypted, "body")
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest || len(admitter.requests()) != 0 {
-		t.Fatalf("account mismatch status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-}
-
-func TestAdapterRequiresAttachmentIngestorForMedia(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t)
-	body := []byte(`{"msgid":"msg-image","aibotid":"aibot-test","chattype":"single","from":{"userid":"user-1"},"msgtype":"image","image":{"url":"https://example.test/image"}}`)
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, callbackRequest(t, body))
-	if response.Code != http.StatusServiceUnavailable || len(admitter.requests()) != 0 {
-		t.Fatalf("media without ingestor status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-}
-
-func TestAdapterPassesMediaThroughAttachmentBoundary(t *testing.T) {
-	ingestor := &testAttachmentIngestor{}
-	adapter, _, admitter, _ := newTestAdapter(t, WithAttachmentIngestor(ingestor))
-	body := []byte(`{"msgid":"msg-image","aibotid":"aibot-test","chattype":"single","from":{"userid":"user-1"},"msgtype":"image","image":{"url":"https://example.test/image"}}`)
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, callbackRequest(t, body))
-	if response.Code != http.StatusOK {
-		t.Fatalf("media callback status = %d, want %d", response.Code, http.StatusOK)
-	}
-	if len(ingestor.media) != 1 || ingestor.media[0].Kind != channels.MessageTypeImage {
-		t.Fatalf("ingestor media = %#v", ingestor.media)
-	}
-	requests := admitter.requests()
-	if len(requests) != 1 || requests[0].ChannelInput == nil || len(requests[0].ChannelInput.ArtifactRefs) != 1 {
-		t.Fatalf("media Gateway request = %#v", requests)
-	}
-}
-
-func TestAdapterDoesNotAckGatewayFailure(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t)
-	admitter.err = errors.New("database unavailable")
-	body := validCallbackJSON(t, "msg-1", "text", "hello")
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, callbackRequest(t, body))
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("Gateway failure status = %d, want %d", response.Code, http.StatusServiceUnavailable)
-	}
-}
-
-func TestAdapterRejectsValidSignatureWithDecryptionFailure(t *testing.T) {
-	adapter, _, admitter, _ := newTestAdapter(t)
-	request := signedRequest(t, http.MethodPost, "/im/wecom/"+testRoute, "not-valid-ciphertext", "encrypt")
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest || len(admitter.requests()) != 0 {
-		t.Fatalf("decryption failure status=%d requests=%d", response.Code, len(admitter.requests()))
-	}
-}
-
-func TestAdapterRejectsStaleAndFutureCallbacks(t *testing.T) {
-	adapter, codec, admitter, _ := newTestAdapter(t)
-	body := validCallbackJSON(t, "msg-1", "text", "hello")
-	encrypted, err := codec.encrypt(body)
-	if err != nil {
-		t.Fatalf("encrypt callback: %v", err)
-	}
-	for _, timestamp := range []int64{testNow.Unix() - int64(defaultClockSkew/time.Second) - 1, testNow.Unix() + int64(defaultClockSkew/time.Second) + 1} {
-		request := signedRequestWithTimestamp(t, http.MethodPost, "/im/wecom/"+testRoute, encrypted, timestamp)
-		response := httptest.NewRecorder()
-		adapter.ServeHTTP(response, request)
-		if response.Code != http.StatusBadRequest {
-			t.Fatalf("timestamp %d status=%d, want %d", timestamp, response.Code, http.StatusBadRequest)
+	for range 2 {
+		if err := adapter.HandleMessage(context.Background(), binding.Snapshot(), event); err != nil {
+			t.Fatalf("handle duplicate event: %v", err)
 		}
 	}
-	if len(admitter.requests()) != 0 {
-		t.Fatal("stale or future callback reached Gateway")
+	if admitter.admittedCount() != 1 {
+		t.Fatalf("admitted count = %d, want 1", admitter.admittedCount())
 	}
 }
 
-func TestNormalizeCallbackSupportsDirectMediaAndGroupMixed(t *testing.T) {
-	binding := testBindingSnapshot()
-	tests := []struct {
-		name           string
-		callback       callbackMessage
-		wantType       channels.MessageType
-		wantText       string
-		wantMediaCount int
-	}{
-		{
-			name: "direct file",
-			callback: callbackMessage{
-				MessageID: "file-1", AIBotID: testExternalBot, ChatType: "single",
-				From: callbackFrom{UserID: "user-1"}, MessageType: "file",
-				File: callbackMedia{URL: "https://example.test/file"},
-			},
-			wantType: channels.MessageTypeFile, wantMediaCount: 1,
-		},
-		{
-			name: "direct voice is unsupported",
-			callback: callbackMessage{
-				MessageID: "voice-1", AIBotID: testExternalBot, ChatType: "single",
-				From: callbackFrom{UserID: "user-1"}, MessageType: "voice",
-			},
-			wantType: channels.MessageTypeUnsupported,
-		},
-		{
-			name: "group mixed",
-			callback: callbackMessage{
-				MessageID: "mixed-1", AIBotID: testExternalBot, ChatType: "group", ChatID: "chat-1",
-				From: callbackFrom{UserID: "user-1"}, MessageType: "mixed",
-				Mixed: callbackMixed{Items: []callbackMixedItem{
-					{MessageType: "text", Text: callbackText{Content: "hello"}},
-					{MessageType: "image", Image: callbackMedia{URL: "https://example.test/image"}},
-				}},
-			},
-			wantType: channels.MessageTypeMixed, wantText: "hello", wantMediaCount: 1,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			envelope, err := normalizeCallback(binding, test.callback)
+func TestWebSocketClientAuthMessageReplyReconnectAndCancellation(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var connections atomic.Int32
+	reconnected := make(chan struct{})
+	var reconnectOnce sync.Once
+	serverErrors := make(chan error, 4)
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := upgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		defer conn.Close()
+		connectionNumber := connections.Add(1)
+		auth, err := readWeComFrame(conn)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		if auth.Cmd != "aibot_subscribe" {
+			serverErrors <- errors.New("first client frame was not aibot_subscribe")
+			return
+		}
+		var credentials struct {
+			BotID  string `json:"bot_id"`
+			Secret string `json:"secret"`
+		}
+		if err := json.Unmarshal(auth.Body, &credentials); err != nil {
+			serverErrors <- err
+			return
+		}
+		if credentials.BotID != "bot-id" || credentials.Secret != "bot-secret" {
+			serverErrors <- errors.New("wrong WeCom credentials")
+			return
+		}
+		if err := writeWeComAck(conn, auth.Headers.ReqID); err != nil {
+			serverErrors <- err
+			return
+		}
+		if connectionNumber == 1 {
+			message := Message{
+				MessageID:   "msg-ws-1",
+				AIBotID:     "bot-id",
+				ChatType:    "single",
+				From:        MessageFrom{UserID: "user-1"},
+				MessageType: "text",
+				Text:        MessageText{Content: "from websocket"},
+			}
+			if err := writeWeComFrame(conn, protocolFrame{
+				Cmd:     "aibot_msg_callback",
+				Headers: frameHeaders{ReqID: "incoming-1"},
+				Body:    bodyBytes(message),
+			}); err != nil {
+				serverErrors <- err
+				return
+			}
+			send, err := readWeComFrame(conn)
 			if err != nil {
-				t.Fatalf("normalize callback: %v", err)
+				serverErrors <- err
+				return
 			}
-			if envelope.MessageType != test.wantType || envelope.Text != test.wantText || len(envelope.Media) != test.wantMediaCount {
-				t.Fatalf("envelope = %#v", envelope)
+			if send.Cmd != "aibot_send_msg" {
+				serverErrors <- errors.New("reply frame was not aibot_send_msg")
+				return
 			}
-		})
-	}
-}
-
-func TestOutboundClientUsesOneActiveResponseCall(t *testing.T) {
-	var received []byte
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("request = %s %s", r.Method, r.Header.Get("Content-Type"))
+			var body struct {
+				ChatID   string `json:"chatid"`
+				MsgType  string `json:"msgtype"`
+				Markdown struct {
+					Content string `json:"content"`
+				} `json:"markdown"`
+			}
+			if err := json.Unmarshal(send.Body, &body); err != nil {
+				serverErrors <- err
+				return
+			}
+			if body.ChatID != "user-1" || body.MsgType != "markdown" || body.Markdown.Content != "reply" {
+				serverErrors <- errors.New("wrong aibot_send_msg body")
+				return
+			}
+			if err := writeWeComAck(conn, send.Headers.ReqID); err != nil {
+				serverErrors <- err
+				return
+			}
+			return
 		}
-		received, _ = io.ReadAll(r.Body)
-		_, _ = w.Write([]byte(`{"errcode":0}`))
+		reconnectOnce.Do(func() { close(reconnected) })
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
 	}))
 	defer server.Close()
-	reply := testReply()
-	client := NewOutboundClient(server.Client())
-	client.targetValidator = func(string) error { return nil }
-	receipt, err := client.SendOnce(context.Background(), reply, server.URL)
+
+	received := make(chan Message, 1)
+	client, err := NewClient(
+		"bot-id",
+		"bot-secret",
+		WithWebSocketURL("ws"+strings.TrimPrefix(server.URL, "http")),
+		WithWebSocketReconnectDelay(time.Millisecond, 5*time.Millisecond),
+		WithMessageHandler(func(_ context.Context, message Message) error {
+			received <- message
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(runCtx) }()
+
+	select {
+	case message := <-received:
+		if message.MessageID != "msg-ws-1" || message.Text.Content != "from websocket" {
+			t.Fatalf("received message = %#v", message)
+		}
+	case err := <-serverErrors:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for WeCom message")
+	}
+	if _, err := client.SendMessage(context.Background(), "user-1", "reply"); err != nil {
+		t.Fatalf("send WeCom reply: %v", err)
+	}
+	select {
+	case <-reconnected:
+	case err := <-serverErrors:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for WeCom reconnect")
+	}
+	closeErr := client.Close(context.Background())
+	if closeErr != nil {
+		t.Fatalf("close WeCom client: %v", closeErr)
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for WeCom shutdown")
+	}
+	select {
+	case err := <-serverErrors:
+		t.Fatal(err)
+	default:
+	}
+}
+
+func TestOutboundClientSendsThroughBindingScopedSender(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "bot-secret")
+	sender := &recordingWeComSender{messageID: "provider-msg-1"}
+	client, err := NewOutboundClient(
+		context.Background(),
+		testWeComSecrets{key: binding, value: "bot-secret"},
+		binding.Snapshot(),
+		WithMessageSender(sender),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := client.SendOnce(context.Background(), channels.Reply{
+		TenantID:        binding.TenantID,
+		AppID:           binding.AppID,
+		RequestID:       "request-1",
+		SourceEventID:   "msg-1",
+		Channel:         channels.ChannelWeCom,
+		BindingID:       binding.BindingID,
+		BindingRevision: binding.BindingRevision,
+		ReplyID:         "reply-1",
+		Revision:        1,
+		Target:          channels.ReplyTarget{Kind: channels.TargetKindUser, InternalEntityID: "entity-1"},
+		Text:            "answer",
+	}, "user-1")
 	if err != nil {
 		t.Fatalf("send reply: %v", err)
 	}
-	if receipt.ProviderMessageID != reply.ReplyID {
-		t.Fatalf("receipt id=%q, want local reply id %q", receipt.ProviderMessageID, reply.ReplyID)
-	}
-	var payload struct {
-		MessageType string `json:"msgtype"`
-		Markdown    struct {
-			Content string `json:"content"`
-		} `json:"markdown"`
-	}
-	if err := json.Unmarshal(received, &payload); err != nil {
-		t.Fatalf("decode outbound payload: %v", err)
-	}
-	if payload.MessageType != "markdown" || payload.Markdown.Content != reply.Text {
-		t.Fatalf("outbound payload = %#v", payload)
+	if receipt.ProviderMessageID != "provider-msg-1" || sender.target != "user-1" || sender.text != "answer" {
+		t.Fatalf("receipt=%#v sender=%#v", receipt, sender)
 	}
 }
 
-func TestCallbackCodecDecryptsIndependentProtocolVector(t *testing.T) {
-	key := []byte("01234567890123456789012345678901")
-	codec, err := newCallbackCodec(testToken, base64Raw(string(key)))
-	if err != nil {
-		t.Fatalf("new codec: %v", err)
-	}
-	message := []byte(`{"msgid":"fixed-vector"}`)
-	encrypted := independentEncryptedMessage(t, key, bytes.Repeat([]byte{0x42}, aes.BlockSize), message, "")
-	decrypted, err := codec.decrypt(encrypted)
-	if err != nil {
-		t.Fatalf("decrypt independent vector: %v", err)
-	}
-	if !bytes.Equal(decrypted, message) {
-		t.Fatalf("decrypted vector = %q, want %q", decrypted, message)
-	}
-	withReceiveID := independentEncryptedMessage(t, key, bytes.Repeat([]byte{0x42}, aes.BlockSize), message, "unexpected")
-	if _, err := codec.decrypt(withReceiveID); err == nil {
-		t.Fatal("non-empty receive_id passed internal AI Bot decryption")
-	}
+type recordingWeComSender struct {
+	target    string
+	text      string
+	messageID string
 }
 
-func TestAdapterRejectsUnknownAndInactiveRoutes(t *testing.T) {
-	adapter, _, _, resolver := newTestAdapter(t)
-	unknown := httptest.NewRequest(http.MethodPost, "/im/wecom/r_missing", strings.NewReader(`{}`))
-	response := httptest.NewRecorder()
-	adapter.ServeHTTP(response, unknown)
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("unknown route status = %d, want %d", response.Code, http.StatusNotFound)
-	}
-	resolver.snapshot.Status = channels.BindingSuspended
-	response = httptest.NewRecorder()
-	adapter.ServeHTTP(response, callbackRequest(t, validCallbackJSON(t, "msg-1", "text", "hello")))
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("inactive route status = %d, want %d", response.Code, http.StatusForbidden)
-	}
+func (s *recordingWeComSender) SendMessage(_ context.Context, target, text string) (string, error) {
+	s.target = target
+	s.text = text
+	return s.messageID, nil
 }
 
-func TestCallbackCodecRejectsTamperedCiphertext(t *testing.T) {
-	_, codec, _, _ := newTestAdapter(t)
-	encrypted, err := codec.encrypt([]byte("payload"))
-	if err != nil {
-		t.Fatalf("encrypt payload: %v", err)
-	}
-	last := encrypted[len(encrypted)-1]
-	replacement := byte('A')
-	if last == replacement {
-		replacement = 'B'
-	}
-	tampered := encrypted[:len(encrypted)-1] + string(replacement)
-	if _, err := codec.decrypt(tampered); err == nil {
-		t.Fatal("tampered ciphertext decrypted successfully")
-	}
-}
-
-type testRouteResolver struct {
-	snapshot channels.BindingSnapshot
-}
-
-func (r *testRouteResolver) ResolveBindingByPublicRoute(
-	_ context.Context,
-	channel channels.Channel,
-	publicRouteID string,
-) (channels.BindingSnapshot, error) {
-	if publicRouteID != r.snapshot.PublicRouteID {
-		return channels.BindingSnapshot{}, channels.ErrBindingNotFound
-	}
-	if channel != r.snapshot.Channel {
-		return channels.BindingSnapshot{}, channels.ErrBindingChannelMismatch
-	}
-	return r.snapshot, nil
-}
-
-type testSecretProvider struct {
-	values map[string]string
-}
-
-func (p testSecretProvider) ResolveSecret(_ context.Context, _ tenant.Scope, ref tenant.SecretRef) (string, error) {
-	value, ok := p.values[ref.Name]
-	if !ok {
-		return "", fmt.Errorf("secret %q not found", ref.Name)
-	}
-	return value, nil
-}
-
-type testAdmitter struct {
+type wecomRecordingAdmitter struct {
 	mu       sync.Mutex
-	recorded []gateway.AdmissionRequest
-	err      error
+	requests []gateway.AdmissionRequest
+	results  map[string]gateway.AdmissionResult
 }
 
-func (a *testAdmitter) Admit(_ context.Context, request gateway.AdmissionRequest) (gateway.AdmissionResult, error) {
-	a.mu.Lock()
-	a.recorded = append(a.recorded, request)
-	err := a.err
-	a.mu.Unlock()
-	if err != nil {
-		return gateway.AdmissionResult{}, err
-	}
-	return gateway.AdmissionResult{RequestID: request.RequestID, ConfigVersion: "v1", TurnSeq: 1}, nil
+func newWeComRecordingAdmitter() *wecomRecordingAdmitter {
+	return &wecomRecordingAdmitter{results: make(map[string]gateway.AdmissionResult)}
 }
 
-func (a *testAdmitter) requests() []gateway.AdmissionRequest {
+func (a *wecomRecordingAdmitter) Admit(_ context.Context, request gateway.AdmissionRequest) (gateway.AdmissionResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return append([]gateway.AdmissionRequest(nil), a.recorded...)
-}
-
-type testAttachmentIngestor struct {
-	media []channels.ProviderMediaRef
-}
-
-type fakeOutboundClient struct {
-	receipt channels.ProviderReceipt
-	err     error
-	calls   int
-}
-
-func (c *fakeOutboundClient) SendOnce(
-	_ context.Context,
-	_ channels.Reply,
-	_ string,
-) (channels.ProviderReceipt, error) {
-	c.calls++
-	if c.err != nil {
-		return channels.ProviderReceipt{}, c.err
+	a.requests = append(a.requests, request)
+	if result, ok := a.results[request.IdempotencyKey]; ok {
+		result.Replayed = true
+		return result, nil
 	}
-	return c.receipt, nil
-}
-
-func TestFakeOutboundClientPropagatesProviderError(t *testing.T) {
-	want := &ProviderSendError{StatusCode: http.StatusTooManyRequests, Code: 45009, Retryable: true}
-	fake := &fakeOutboundClient{err: want}
-	var client channels.ProviderOutboundClient = fake
-	_, err := client.SendOnce(context.Background(), testReply(), "https://example.test/reply")
-	var got *ProviderSendError
-	if !errors.As(err, &got) || got != want || !got.Retryable || got.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("provider error=%v, want %#v", err, want)
+	result := gateway.AdmissionResult{
+		RequestID:     request.RequestID,
+		ConfigVersion: "v1",
+		TurnSeq:       int64(len(a.results) + 1),
+		Status:        gateway.AdmissionStatusAdmitted,
 	}
-	if fake.calls != 1 {
-		t.Fatalf("fake calls=%d, want 1", fake.calls)
-	}
+	a.results[request.IdempotencyKey] = result
+	return result, nil
 }
 
-func (i *testAttachmentIngestor) Prepare(_ context.Context, input channels.ChannelInput, media []channels.ProviderMediaRef) (channels.ChannelInput, error) {
-	i.media = append([]channels.ProviderMediaRef(nil), media...)
-	input.ArtifactRefs = []string{"artifact://test/image"}
-	return input, nil
-}
-
-func newTestAdapter(t *testing.T, opts ...AdapterOption) (*Adapter, callbackCodec, *testAdmitter, *testRouteResolver) {
+func (a *wecomRecordingAdmitter) lastRequest(t *testing.T) gateway.AdmissionRequest {
 	t.Helper()
-	key := "01234567890123456789012345678901"
-	resolver := &testRouteResolver{snapshot: channels.BindingSnapshot{Binding: channels.Binding{
-		TenantID:         "tenant-a",
-		AppID:            "app-a",
-		BindingID:        testBindingID,
-		Channel:          channels.ChannelWeCom,
-		ExternalAccount:  testExternalBot,
-		WebhookURL:       "https://example.test/im",
-		TokenRef:         tenant.SecretRef{Name: "token"},
-		SigningSecretRef: tenant.SecretRef{Name: "encoding-aes-key"},
-		Secret:           tenant.SecretRef{Name: "unrelated-provider-secret"},
-		PublicRouteID:    testRoute,
-		BindingRevision:  3,
-		Status:           channels.BindingActive,
-	}}}
-	secrets := testSecretProvider{values: map[string]string{
-		"token":            testToken,
-		"encoding-aes-key": base64Raw(key),
-	}}
-	admitter := &testAdmitter{}
-	admissionGateway := gateway.New(admitter)
-	adapter, err := NewAdapter(resolver, admissionGateway, platformsecret.SecretProvider(secrets), append(opts, WithClock(func() time.Time { return testNow }))...)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.requests) == 0 {
+		t.Fatal("gateway received no request")
+	}
+	return a.requests[len(a.requests)-1]
+}
+
+func (a *wecomRecordingAdmitter) admittedCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.results)
+}
+
+type testWeComSecrets struct {
+	key   channels.Binding
+	value string
+}
+
+func (p testWeComSecrets) ResolveSecret(_ context.Context, scope tenant.Scope, ref tenant.SecretRef) (string, error) {
+	if scope.TenantID == p.key.TenantID && scope.AppID == p.key.AppID && ref.Name == p.key.Secret.Name {
+		return p.value, nil
+	}
+	return "", errors.New("test WeCom secret not found")
+}
+
+func newWeComTestAdapter(
+	t *testing.T,
+	source channels.BindingSource,
+	admitter *wecomRecordingAdmitter,
+	secrets platformsecret.SecretProvider,
+) *Adapter {
+	t.Helper()
+	adapter, err := NewAdapter(source, gateway.New(admitter), secrets)
 	if err != nil {
-		t.Fatalf("new adapter: %v", err)
+		t.Fatal(err)
 	}
-	codec, err := newCallbackCodec(testToken, base64Raw(key))
-	if err != nil {
-		t.Fatalf("new callback codec: %v", err)
-	}
-	return adapter, codec, admitter, resolver
+	return adapter
 }
 
-func validCallbackJSON(t *testing.T, messageID, messageType, text string) []byte {
-	t.Helper()
-	value := callbackMessage{
-		MessageID:   messageID,
-		AIBotID:     testExternalBot,
-		ChatType:    "single",
-		From:        callbackFrom{UserID: "user-1"},
-		MessageType: messageType,
-		Text:        callbackText{Content: text},
-	}
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		t.Fatalf("marshal callback: %v", err)
-	}
-	return encoded
-}
-
-func callbackRequest(t *testing.T, body []byte) *http.Request {
-	t.Helper()
-	_, codec, _, _ := newTestAdapter(t)
-	encrypted, err := codec.encrypt(body)
-	if err != nil {
-		t.Fatalf("encrypt callback: %v", err)
-	}
-	return signedRequest(t, http.MethodPost, "/im/wecom/"+testRoute, encrypted, "body")
-}
-
-func signedRequest(t *testing.T, method, path, encrypted, encryptedParameter string) *http.Request {
-	t.Helper()
-	return signedRequestWithTimestampAndParameter(t, method, path, encrypted, encryptedParameter, testNow.Unix())
-}
-
-func signedRequestWithTimestamp(t *testing.T, method, path, encrypted string, timestamp int64) *http.Request {
-	t.Helper()
-	return signedRequestWithTimestampAndParameter(t, method, path, encrypted, "encrypt", timestamp)
-}
-
-func signedRequestWithTimestampAndParameter(t *testing.T, method, path, encrypted, encryptedParameter string, timestamp int64) *http.Request {
-	t.Helper()
-	nonce := "nonce-1"
-	timestampValue := strconv.FormatInt(timestamp, 10)
-	signature := signForTest(testToken, timestampValue, nonce, encrypted)
-	query := url.Values{
-		"msg_signature": []string{signature},
-		"timestamp":     []string{timestampValue},
-		"nonce":         []string{nonce},
-	}
-	query.Set(encryptedParameter, encrypted)
-	request := httptest.NewRequest(method, path+"?"+query.Encode(), strings.NewReader(`{"encrypt":"placeholder"}`))
-	if method == http.MethodPost {
-		request.Header.Set("Content-Type", "application/json")
-		payload := []byte(fmt.Sprintf(`{"encrypt":%q}`, encrypted))
-		request.Body = io.NopCloser(bytes.NewReader(payload))
-	}
-	return request
-}
-
-func signedQueryForTest(value string) string {
-	return "msg_signature=invalid&timestamp=" + strconv.FormatInt(testNow.Unix(), 10) + "&nonce=nonce-1&encrypt=" + url.QueryEscape(value)
-}
-
-func signForTest(token, timestamp, nonce, encrypted string) string {
-	values := []string{token, timestamp, nonce, encrypted}
-	slicesSort(values)
-	digest := sha1.Sum([]byte(strings.Join(values, "")))
-	return hex.EncodeToString(digest[:])
-}
-
-func slicesSort(values []string) {
-	for index := 1; index < len(values); index++ {
-		for current := index; current > 0 && values[current] < values[current-1]; current-- {
-			values[current], values[current-1] = values[current-1], values[current]
-		}
-	}
-}
-
-func base64Raw(value string) string {
-	return base64.RawStdEncoding.EncodeToString([]byte(value))
-}
-
-func testBindingSnapshot() channels.BindingSnapshot {
-	return channels.BindingSnapshot{Binding: channels.Binding{
-		TenantID:         "tenant-a",
-		AppID:            "app-a",
-		BindingID:        testBindingID,
-		Channel:          channels.ChannelWeCom,
-		ExternalAccount:  testExternalBot,
-		WebhookURL:       "https://example.test/im",
-		TokenRef:         tenant.SecretRef{Name: "token"},
-		SigningSecretRef: tenant.SecretRef{Name: "encoding-aes-key"},
-		Secret:           tenant.SecretRef{Name: "unrelated-provider-secret"},
-		PublicRouteID:    testRoute,
-		BindingRevision:  3,
-		Status:           channels.BindingActive,
-	}}
-}
-
-func testReply() channels.Reply {
-	return channels.Reply{
-		TenantID:        "tenant-a",
-		AppID:           "app-a",
-		RequestID:       "request-1",
-		SourceEventID:   "event-1",
+func testWeComBinding(tenantID, appID, bindingID, botID, secret string) channels.Binding {
+	return channels.Binding{
+		TenantID:        tenantID,
+		AppID:           appID,
+		BindingID:       bindingID,
 		Channel:         channels.ChannelWeCom,
-		BindingID:       testBindingID,
-		BindingRevision: 3,
-		ReplyID:         "reply-1",
-		Revision:        1,
-		Target: channels.ReplyTarget{
-			Kind:             channels.TargetKindMessage,
-			InternalEntityID: "request-1",
-		},
-		Text: "hello",
+		ExternalAccount: botID,
+		Secret:          tenant.SecretRef{Name: secret, Version: "v1"},
+		BindingRevision: 1,
+		Status:          channels.BindingActive,
 	}
 }
 
-func independentEncryptedMessage(t *testing.T, key, prefix, message []byte, receiveID string) string {
-	t.Helper()
-	plaintext := make([]byte, aes.BlockSize+4+len(message)+len(receiveID))
-	copy(plaintext, prefix)
-	binary.BigEndian.PutUint32(plaintext[aes.BlockSize:aes.BlockSize+4], uint32(len(message)))
-	copy(plaintext[aes.BlockSize+4:], message)
-	copy(plaintext[aes.BlockSize+4+len(message):], receiveID)
-	padding := 32 - len(plaintext)%32
-	plaintext = append(plaintext, bytes.Repeat([]byte{byte(padding)}, padding)...)
-	block, err := aes.NewCipher(key)
+func readWeComFrame(conn *websocket.Conn) (protocolFrame, error) {
+	_, payload, err := conn.ReadMessage()
 	if err != nil {
-		t.Fatalf("new vector cipher: %v", err)
+		return protocolFrame{}, err
 	}
-	ciphertext := make([]byte, len(plaintext))
-	cipher.NewCBCEncrypter(block, key[:aes.BlockSize]).CryptBlocks(ciphertext, plaintext)
-	return base64.StdEncoding.EncodeToString(ciphertext)
+	var frame protocolFrame
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		return protocolFrame{}, err
+	}
+	return frame, nil
 }
+
+func writeWeComFrame(conn *websocket.Conn, frame protocolFrame) error {
+	payload, err := json.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+func writeWeComAck(conn *websocket.Conn, requestID string) error {
+	return writeWeComFrame(conn, protocolFrame{
+		Headers: frameHeaders{ReqID: requestID},
+		ErrCode: 0,
+		ErrMsg:  "ok",
+	})
+}
+
+var _ platformsecret.SecretProvider = testWeComSecrets{}

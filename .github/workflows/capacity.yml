@@ -1,0 +1,62 @@
+name: Capacity Evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      concurrency:
+        description: Concurrent requests
+        required: true
+        default: "4"
+        type: string
+      requests:
+        description: Total requests; use 0 with duration
+        required: true
+        default: "100"
+        type: string
+      duration:
+        description: Optional duration such as 5m
+        required: false
+        default: ""
+        type: string
+      environment:
+        description: GitHub Environment containing the capacity endpoint/key
+        required: true
+        default: capacity
+        type: environment
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: run measured evaluator
+        env:
+          CAPACITY_ENDPOINT: ${{ secrets.TRPC_AGENT_SERVICE_CAPACITY_ENDPOINT }}
+          CAPACITY_API_KEY: ${{ secrets.TRPC_AGENT_SERVICE_CAPACITY_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CAPACITY_ENDPOINT"
+          mkdir -p data/capacity
+          duration_args=()
+          if [ -n "${{ inputs.duration }}" ]; then
+            duration_args=(-duration "${{ inputs.duration }}")
+          fi
+          go run ./cmd/capacity-evaluate \
+            -endpoint "$CAPACITY_ENDPOINT" \
+            -api-key "$CAPACITY_API_KEY" \
+            -concurrency "${{ inputs.concurrency }}" \
+            -requests "${{ inputs.requests }}" \
+            "${duration_args[@]}" \
+            > data/capacity/capacity-${{ github.run_id }}.json
+          test -s data/capacity/capacity-${{ github.run_id }}.json
+      - name: upload measured report
+        uses: actions/upload-artifact@v4
+        with:
+          name: capacity-${{ github.run_id }}
+          path: data/capacity/capacity-${{ github.run_id }}.json

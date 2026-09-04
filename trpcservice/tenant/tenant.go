@@ -430,12 +430,54 @@ type AuditPolicy struct {
 	RedactPII           bool `json:"redact_pii"`
 }
 
-// Validate checks audit retention values. The zero value disables audit.
+// Validate checks audit retention values. RetentionDays zero means no local
+// limit; application policy resolution may inherit the tenant limit.
 func (p AuditPolicy) Validate() error {
 	if p.RetentionDays < 0 {
 		return errors.New("retention_days must be non-negative")
 	}
+	if !p.Enabled && (p.RecordToolDecisions || p.RecordExecutions) {
+		return errors.New("disabled audit policy cannot record events")
+	}
 	return nil
+}
+
+// ValidateAppConfig checks that an application audit policy is no broader than
+// the tenant policy. An application retention of zero inherits a finite tenant
+// retention; a zero tenant retention leaves a finite application limit intact.
+func (p AuditPolicy) ValidateAppConfig(app AuditPolicy) error {
+	if err := p.Validate(); err != nil {
+		return fmt.Errorf("tenant audit policy: %w", err)
+	}
+	if err := app.Validate(); err != nil {
+		return fmt.Errorf("app audit policy: %w", err)
+	}
+	if app.Enabled && !p.Enabled {
+		return errors.New("app audit cannot be enabled when tenant audit is disabled")
+	}
+	if app.RecordToolDecisions && !p.RecordToolDecisions {
+		return errors.New("app tool audit is broader than tenant audit policy")
+	}
+	if app.RecordExecutions && !p.RecordExecutions {
+		return errors.New("app execution audit is broader than tenant audit policy")
+	}
+	if p.RetentionDays > 0 && app.RetentionDays > p.RetentionDays {
+		return errors.New("app audit retention is broader than tenant audit policy")
+	}
+	if p.RedactPII && !app.RedactPII {
+		return errors.New("app audit redaction cannot be weaker than tenant policy")
+	}
+	return nil
+}
+
+// EffectiveRetentionDays returns the cleanup limit for one application. Zero
+// at application scope inherits the tenant limit, while zero at tenant scope
+// means no limit.
+func (p AuditPolicy) EffectiveRetentionDays(app AuditPolicy) int {
+	if app.RetentionDays == 0 {
+		return p.RetentionDays
+	}
+	return app.RetentionDays
 }
 
 // SecretRef points to a secret managed outside the database.

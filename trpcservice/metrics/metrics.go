@@ -104,6 +104,18 @@ func (l Labels) attributes() []attribute.KeyValue {
 	return attrs
 }
 
+func setResultForError(labels *Labels, success, errType string) {
+	if errType != "" {
+		if labels.Result == "" || labels.Result == "success" || labels.Result == "accepted" {
+			labels.Result = "failure"
+		}
+		return
+	}
+	if labels.Result == "" {
+		labels.Result = success
+	}
+}
+
 // Recorder owns the service's fixed metric instruments. It is safe for
 // concurrent use and a nil recorder is a no-op.
 type Recorder struct {
@@ -121,9 +133,12 @@ type Recorder struct {
 	replyLatency        metric.Float64Histogram
 	sessionLatency      metric.Float64Histogram
 	sessionErrors       metric.Int64Counter
+	memoryLatency       metric.Float64Histogram
+	memoryErrors        metric.Int64Counter
 	tenantTokenUsage    metric.Int64Counter
 	tenantEstimatedCost metric.Float64Counter
 	auditWriteFailures  metric.Int64Counter
+	auditPurgeEvents    metric.Int64Counter
 	governanceRejected  metric.Int64Counter
 	pricing             PricingCatalog
 }
@@ -197,6 +212,12 @@ func New(provider metric.MeterProvider, pricing PricingCatalog) (*Recorder, erro
 	if r.sessionErrors, err = newCounter("trpc_agent_service.session.error.count"); err != nil {
 		return nil, err
 	}
+	if r.memoryLatency, err = newHistogram("trpc_agent_service.memory.operation.latency"); err != nil {
+		return nil, err
+	}
+	if r.memoryErrors, err = newCounter("trpc_agent_service.memory.error.count"); err != nil {
+		return nil, err
+	}
 	if r.tenantTokenUsage, err = newCounter("trpc_agent_service.tenant.model.token_usage"); err != nil {
 		return nil, err
 	}
@@ -204,6 +225,9 @@ func New(provider metric.MeterProvider, pricing PricingCatalog) (*Recorder, erro
 		return nil, err
 	}
 	if r.auditWriteFailures, err = newCounter("trpc_agent_service.audit.write.failure"); err != nil {
+		return nil, err
+	}
+	if r.auditPurgeEvents, err = newCounter("trpc_agent_service.audit.purge.events"); err != nil {
 		return nil, err
 	}
 	if r.governanceRejected, err = newCounter("trpc_agent_service.governance.rejected"); err != nil {
@@ -219,9 +243,7 @@ func (r *Recorder) RecordRequest(ctx context.Context, labels Labels, errType str
 	}
 	labels.Operation = "request"
 	labels.ErrorType = errType
-	if labels.Result == "" {
-		labels.Result = "accepted"
-	}
+	setResultForError(&labels, "accepted", errType)
 	attrs := labels.attributes()
 	r.requestCount.Add(ctx, 1, metric.WithAttributes(attrs...))
 	if errType != "" {
@@ -264,9 +286,7 @@ func (r *Recorder) RecordTool(ctx context.Context, labels Labels, latency time.D
 	}
 	labels.Operation = "tool"
 	labels.ErrorType = errType
-	if labels.Result == "" {
-		labels.Result = "success"
-	}
+	setResultForError(&labels, "success", errType)
 	attrs := labels.attributes()
 	r.toolCalls.Add(ctx, 1, metric.WithAttributes(attrs...))
 	r.toolLatency.Record(ctx, latency.Seconds(), metric.WithAttributes(attrs...))
@@ -282,12 +302,7 @@ func (r *Recorder) RecordIMCallback(ctx context.Context, labels Labels, errType 
 	}
 	labels.Operation = "im.callback"
 	labels.ErrorType = errType
-	if labels.Result == "" {
-		labels.Result = "success"
-		if errType != "" {
-			labels.Result = "failure"
-		}
-	}
+	setResultForError(&labels, "success", errType)
 	attrs := labels.attributes()
 	r.imCallbacks.Add(ctx, 1, metric.WithAttributes(attrs...))
 	if errType != "" {
@@ -323,13 +338,26 @@ func (r *Recorder) RecordSession(ctx context.Context, labels Labels, latency tim
 	}
 	labels.Operation = "session"
 	labels.ErrorType = errType
-	if labels.Result == "" {
-		labels.Result = "success"
-	}
+	setResultForError(&labels, "success", errType)
 	attrs := labels.attributes()
 	r.sessionLatency.Record(ctx, latency.Seconds(), metric.WithAttributes(attrs...))
 	if errType != "" {
 		r.sessionErrors.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+// RecordMemory records an immutable-config-selected memory backend call.
+func (r *Recorder) RecordMemory(ctx context.Context, labels Labels, latency time.Duration, errType string) {
+	if r == nil {
+		return
+	}
+	labels.Operation = "memory"
+	labels.ErrorType = errType
+	setResultForError(&labels, "success", errType)
+	attrs := labels.attributes()
+	r.memoryLatency.Record(ctx, latency.Seconds(), metric.WithAttributes(attrs...))
+	if errType != "" {
+		r.memoryErrors.Add(ctx, 1, metric.WithAttributes(attrs...))
 	}
 }
 
@@ -341,6 +369,16 @@ func (r *Recorder) RecordAuditFailure(ctx context.Context, labels Labels) {
 	labels.Operation = "audit"
 	labels.Result = "failure"
 	r.auditWriteFailures.Add(ctx, 1, metric.WithAttributes(labels.attributes()...))
+}
+
+// RecordAuditPurge records the number of rows removed by retention cleanup.
+func (r *Recorder) RecordAuditPurge(ctx context.Context, labels Labels, count int64) {
+	if r == nil || count <= 0 {
+		return
+	}
+	labels.Operation = "audit_purge"
+	labels.Result = "success"
+	r.auditPurgeEvents.Add(ctx, count, metric.WithAttributes(labels.attributes()...))
 }
 
 // RecordGovernanceRejected records an admission or execution governance

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"time"
 
 	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
@@ -31,6 +32,7 @@ type workerRuntime struct {
 	postgresSessions *sessionpostgres.SessionResolver
 	memories         *memorytencentdb.Resolver
 	knowledge        *knowledgeqdrant.Resolver
+	replyProviders   *channeloutbound.Resolver
 	replySender      *worker.ReplySender
 	store            *postgres.Store
 	owner            string
@@ -46,11 +48,15 @@ type workerRuntimeDependencies struct {
 	defaultSessionDSN string
 	defaultRedisURL   string
 	metrics           *platformmetrics.Recorder
+	modelTimeout      time.Duration
+	concurrency       int
 }
 
 const (
 	defaultReplyRateLimit       = 5
 	defaultReplyRateLimitWindow = time.Second
+	dataMigrationRetryInitial   = 250 * time.Millisecond
+	dataMigrationRetryMax       = 30 * time.Second
 )
 
 func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
@@ -131,7 +137,7 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	}
 	events, err := postgres.NewExecutionEventJournal(deps.store, postgres.WithReplyEventBuilder(worker.BuildReplyEvent))
 	if err != nil {
-		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
+		return nil, joinCloseError(err, replyProviders.Close, knowledge.Close, memories.Close, sessionRouter.Close)
 	}
 	replySender, err := worker.NewReplySender(
 		deps.store,
@@ -140,7 +146,7 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		worker.ReplySenderOptions{Owner: deps.owner, Metrics: metricsRecorder},
 	)
 	if err != nil {
-		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
+		return nil, joinCloseError(err, replyProviders.Close, knowledge.Close, memories.Close, sessionRouter.Close)
 	}
 	executor := worker.New(
 		deps.store,
@@ -149,11 +155,15 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		events,
 		deps.store.IsExecutionCanceled,
 	)
+	executor.ModelTimeout = deps.modelTimeout
 	executor.Audit = deps.store
 	executor.Metrics = metricsRecorder
-	consumer, err := worker.NewConsumer(executor, deps.stream, deps.store, deps.owner)
+	executor.Approvals = deps.store
+	consumer, err := worker.NewConsumerWithOptions(executor, deps.stream, deps.store, deps.owner, worker.ConsumerOptions{
+		Concurrency: deps.concurrency,
+	})
 	if err != nil {
-		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
+		return nil, joinCloseError(err, replyProviders.Close, knowledge.Close, memories.Close, sessionRouter.Close)
 	}
 	return &workerRuntime{
 		consumer:         consumer,
@@ -161,6 +171,7 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		postgresSessions: sessions,
 		memories:         memories,
 		knowledge:        knowledge,
+		replyProviders:   replyProviders,
 		replySender:      replySender,
 		store:            deps.store,
 		owner:            deps.owner,
@@ -181,7 +192,7 @@ func (r *workerRuntime) close() error {
 	if r == nil {
 		return nil
 	}
-	return errors.Join(r.sessions.Close(), r.memories.Close(), r.knowledge.Close())
+	return errors.Join(r.replyProviders.Close(), r.sessions.Close(), r.memories.Close(), r.knowledge.Close())
 }
 
 func (r *workerRuntime) runDataMigrations(ctx context.Context) error {
@@ -191,17 +202,51 @@ func (r *workerRuntime) runDataMigrations(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ticker := time.NewTicker(dataMigrationPoll)
-	defer ticker.Stop()
-	for {
-		if err := r.runDataMigrationPass(ctx); err != nil && ctx.Err() == nil {
+	for attempt := 0; ; {
+		delay := dataMigrationPoll
+		if err := r.runDataMigrationPass(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			log.Printf("data migration worker pass failed: %s", platformlog.SafeError(err))
+			delay = dataMigrationRetryDelay(attempt)
+			attempt++
+		} else {
+			attempt = 0
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
+		if err := waitForDataMigration(ctx, delay); err != nil {
+			return err
 		}
+	}
+}
+
+func dataMigrationRetryDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := dataMigrationRetryInitial
+	for attempt > 0 && delay < dataMigrationRetryMax {
+		delay *= 2
+		attempt--
+	}
+	if delay > dataMigrationRetryMax {
+		delay = dataMigrationRetryMax
+	}
+	half := delay / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+
+func waitForDataMigration(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		delay = dataMigrationPoll
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        shell: bash
+        run: test -z "$(gofmt -l .)"
+      - name: build
+        run: go build ./...
+      - name: test
+        run: go test ./...
+      - name: vet
+        run: go vet ./...
+      - name: diff check
+        run: git diff --check
+      - name: compose config
+        run: docker compose --env-file .env.example config --quiet

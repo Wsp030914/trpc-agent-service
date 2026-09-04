@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
@@ -33,10 +35,12 @@ var (
 // ProviderSendError is the stable, body-redacted error returned by one
 // Feishu provider call. Reply Outbox retry policy remains owned by IM-06.
 type ProviderSendError struct {
-	StatusCode int
-	Code       int
-	Retryable  bool
-	cause      error
+	StatusCode      int
+	Code            int
+	Retryable       bool
+	Uncertain       bool
+	RetryAfterDelay time.Duration
+	cause           error
 }
 
 // Error returns a provider-safe description without response bodies, targets,
@@ -66,6 +70,22 @@ func (e *ProviderSendError) Unwrap() error {
 // failure. ReplySender owns the actual retry decision and attempt limit.
 func (e *ProviderSendError) IsRetryable() bool {
 	return e != nil && e.Retryable
+}
+
+// IsSideEffectUncertain reports that a provider call may have reached Feishu
+// before its result was lost. The request UUID remains available to the
+// provider, but the local outbox still records the conservative state.
+func (e *ProviderSendError) IsSideEffectUncertain() bool {
+	return e != nil && e.Uncertain
+}
+
+// RetryAfter returns a provider-supplied minimum delay when the Feishu API
+// included an HTTP Retry-After header. ReplySender owns the bounded retry.
+func (e *ProviderSendError) RetryAfter() time.Duration {
+	if e == nil || e.RetryAfterDelay < 0 {
+		return 0
+	}
+	return e.RetryAfterDelay
 }
 
 // OutboundOption configures a Feishu one-call provider client.
@@ -126,9 +146,6 @@ func NewOutboundClient(
 	}
 	if binding.Channel != channels.ChannelFeishu {
 		return nil, errors.New("feishu outbound client received another channel")
-	}
-	if binding.ExternalAccountScope == "" {
-		return nil, errors.New("feishu external account scope is required")
 	}
 	if binding.Secret.Name == "" {
 		return nil, errors.New("feishu app secret reference is required")
@@ -219,7 +236,7 @@ func (c *OutboundClient) DownloadMediaForMessage(
 	}
 	return channels.DownloadedMedia{
 		Filename: filename,
-		MIMEType: http.DetectContentType(data),
+		MIMEType: channels.DetectMediaMIMEType(filename, data),
 		Data:     data,
 	}, nil
 }
@@ -291,7 +308,7 @@ func (c *OutboundClient) createMessage(
 		return channels.ProviderReceipt{}, transportError(err)
 	}
 	if resp == nil {
-		return channels.ProviderReceipt{}, &ProviderSendError{Retryable: true, cause: errors.New("empty feishu response")}
+		return channels.ProviderReceipt{}, &ProviderSendError{Retryable: true, Uncertain: true, cause: errors.New("empty feishu response")}
 	}
 	if !resp.Success() {
 		return channels.ProviderReceipt{}, responseError(resp.ApiResp, resp.Code)
@@ -321,7 +338,7 @@ func (c *OutboundClient) replyMessage(
 		return channels.ProviderReceipt{}, transportError(err)
 	}
 	if resp == nil {
-		return channels.ProviderReceipt{}, &ProviderSendError{Retryable: true, cause: errors.New("empty feishu response")}
+		return channels.ProviderReceipt{}, &ProviderSendError{Retryable: true, Uncertain: true, cause: errors.New("empty feishu response")}
 	}
 	if !resp.Success() {
 		return channels.ProviderReceipt{}, responseError(resp.ApiResp, resp.Code)
@@ -336,31 +353,54 @@ func receiptFromID(providerMessageID *string) (channels.ProviderReceipt, error) 
 	if providerMessageID != nil && *providerMessageID != "" {
 		return channels.ProviderReceipt{ProviderMessageID: *providerMessageID}, nil
 	}
-	return channels.ProviderReceipt{}, &ProviderSendError{cause: errFeishuProviderMessageID}
+	return channels.ProviderReceipt{}, &ProviderSendError{Uncertain: true, cause: errFeishuProviderMessageID}
 }
 
 func transportError(err error) error {
 	return &ProviderSendError{
 		Retryable: !errors.Is(err, context.Canceled),
+		Uncertain: true,
 		cause:     err,
 	}
 }
 
 func responseError(response *larkcore.ApiResp, code int) error {
 	statusCode := 0
+	retryAfter := time.Duration(0)
 	if response != nil {
 		statusCode = response.StatusCode
+		retryAfter = parseRetryAfter(response.Header.Get("Retry-After"), time.Now())
 	}
 	return &ProviderSendError{
-		StatusCode: statusCode,
-		Code:       code,
-		Retryable:  retryableFeishuStatus(statusCode),
+		StatusCode:      statusCode,
+		Code:            code,
+		Retryable:       retryableFeishuStatus(statusCode),
+		Uncertain:       statusCode >= http.StatusInternalServerError,
+		RetryAfterDelay: retryAfter,
 	}
 }
 
 func retryableFeishuStatus(statusCode int) bool {
 	return statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooEarly ||
 		statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+		return 0
+	}
+	deadline, err := http.ParseTime(value)
+	if err != nil || !deadline.After(now) {
+		return 0
+	}
+	return deadline.Sub(now)
 }
 
 var _ channels.ProviderOutboundClient = (*OutboundClient)(nil)

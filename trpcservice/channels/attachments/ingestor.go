@@ -3,10 +3,14 @@ package attachments
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -24,6 +28,17 @@ import (
 )
 
 const productionInboundMediaLimit int64 = 32 << 20
+
+const (
+	wecomMediaRequestTimeout = 30 * time.Second
+	wecomMediaPort           = "443"
+)
+
+var allowedWeComMediaHosts = map[string]struct{}{
+	"qyapi.weixin.qq.com": {},
+	"wework.qpic.cn":      {},
+	"p.qpic.cn":           {},
+}
 
 // NewIngestor creates the production media ingestor. Media is downloaded only
 // after binding authorization, stored in COS, and represented downstream by an
@@ -48,7 +63,6 @@ func NewIngestor(
 type mediaDownloader struct {
 	store   *postgres.Store
 	secrets platformsecret.SecretProvider
-	http    *http.Client
 }
 
 func (d mediaDownloader) Download(
@@ -89,18 +103,10 @@ func (d mediaDownloader) downloadWeCom(
 		return channels.DownloadedMedia{}, err
 	}
 	parsed, err := url.ParseRequestURI(media.Reference)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Port() != "" || !isAllowedWeComMediaHost(parsed.Hostname()) {
 		return channels.DownloadedMedia{}, errors.New("wecom media url is invalid")
 	}
-	client := d.http
-	if client == nil {
-		client = &http.Client{
-			Timeout: 30 * time.Second,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
-	}
+	client := newWeComMediaClient()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return channels.DownloadedMedia{}, errors.New("create wecom media request")
@@ -123,18 +129,136 @@ func (d mediaDownloader) downloadWeCom(
 	if int64(len(data)) > productionInboundMediaLimit {
 		return channels.DownloadedMedia{}, errors.New("wecom media exceeds size limit")
 	}
-	filename := path.Base(parsed.Path)
+	if media.DecryptionKey != "" {
+		data, err = decryptWeComMedia(data, media.DecryptionKey)
+		if err != nil {
+			return channels.DownloadedMedia{}, fmt.Errorf("decrypt wecom media: %w", err)
+		}
+	}
+	filename := filenameFromContentDisposition(response.Header.Get("Content-Disposition"))
+	if filename == "" {
+		filename = path.Base(parsed.Path)
+	}
 	if filename == "." || filename == "/" || filename == "" {
 		filename = "attachment"
 	}
 	mimeType := strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])
-	if mimeType == "" || mimeType == "application/octet-stream" {
-		mimeType = http.DetectContentType(data)
+	if mimeType == "" || mimeType == "application/octet-stream" || mimeType == "application/zip" {
+		mimeType = channels.DetectMediaMIMEType(filename, data)
 	}
 	if _, _, err := mime.ParseMediaType(mimeType); err != nil {
 		mimeType = "application/octet-stream"
 	}
 	return channels.DownloadedMedia{Filename: filename, MIMEType: mimeType, Data: data}, nil
+}
+
+func filenameFromContentDisposition(value string) string {
+	_, params, err := mime.ParseMediaType(value)
+	if err != nil {
+		return ""
+	}
+	filename := strings.TrimSpace(params["filename"])
+	if filename == "" {
+		return ""
+	}
+	filename = path.Base(strings.ReplaceAll(filename, "\\", "/"))
+	if filename == "." || filename == "/" {
+		return ""
+	}
+	return filename
+}
+
+// decryptWeComMedia follows the official AI Bot SDK: the aeskey is Base64
+// encoded, its first 16 decoded bytes are the CBC IV, and the payload uses
+// PKCS#7 padding with a 32-byte padding block.
+func decryptWeComMedia(encrypted []byte, encodedKey string) ([]byte, error) {
+	key, err := base64.StdEncoding.DecodeString(encodedKey)
+	if err != nil {
+		key, err = base64.RawStdEncoding.DecodeString(encodedKey)
+	}
+	if err != nil || len(key) != 32 {
+		return nil, errors.New("wecom media aeskey is invalid")
+	}
+	if len(encrypted) == 0 || len(encrypted)%aes.BlockSize != 0 {
+		return nil, errors.New("wecom encrypted media length is invalid")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, errors.New("create wecom media cipher")
+	}
+	decrypted := make([]byte, len(encrypted))
+	cipher.NewCBCDecrypter(block, key[:aes.BlockSize]).CryptBlocks(decrypted, encrypted)
+	padding := int(decrypted[len(decrypted)-1])
+	if padding < 1 || padding > 32 || padding > len(decrypted) {
+		return nil, errors.New("wecom media padding is invalid")
+	}
+	for _, value := range decrypted[len(decrypted)-padding:] {
+		if int(value) != padding {
+			return nil, errors.New("wecom media padding is invalid")
+		}
+	}
+	return decrypted[:len(decrypted)-padding], nil
+}
+
+func isAllowedWeComMediaHost(host string) bool {
+	_, ok := allowedWeComMediaHosts[strings.ToLower(host)]
+	return ok
+}
+
+func newWeComMediaClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialTLSContext = nil
+	transport.DialContext = dialPublicWeComHost
+	return &http.Client{
+		Transport: transport,
+		Timeout:   wecomMediaRequestTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func dialPublicWeComHost(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || !isAllowedWeComMediaHost(host) || port != wecomMediaPort {
+		return nil, errors.New("wecom media address is not allowed")
+	}
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, errors.New("resolve wecom media host")
+	}
+	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	for _, resolved := range addresses {
+		ip := resolved.IP
+		if !isPublicInternetIP(ip) {
+			continue
+		}
+		if network == "tcp4" && ip.To4() == nil {
+			continue
+		}
+		if network == "tcp6" && ip.To4() != nil {
+			continue
+		}
+		connection, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return connection, nil
+		}
+	}
+	return nil, errors.New("wecom media host has no public address")
+}
+
+func isPublicInternetIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return false
+		}
+	}
+	return ip.IsGlobalUnicast() && !ip.IsPrivate()
 }
 
 type inboundArtifactWriter struct {

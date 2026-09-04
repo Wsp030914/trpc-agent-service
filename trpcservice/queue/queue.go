@@ -133,12 +133,15 @@ const (
 	CompletionSucceeded CompletionStatus = "SUCCEEDED"
 	// CompletionFailed means the worker exhausted retry attempts.
 	CompletionFailed CompletionStatus = "FAILED"
+	// CompletionUncertain means an external side effect may have happened and
+	// the execution must not be retried automatically.
+	CompletionUncertain CompletionStatus = "UNCERTAIN"
 )
 
 // Validate checks whether a status is valid for completing a claimed execution.
 func (s CompletionStatus) Validate() error {
 	switch s {
-	case CompletionSucceeded, CompletionFailed:
+	case CompletionSucceeded, CompletionFailed, CompletionUncertain:
 		return nil
 	default:
 		return errors.New("completion status is invalid")

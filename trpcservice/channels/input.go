@@ -348,8 +348,9 @@ type AttachmentIngestor interface {
 // ProviderMediaRef is an adapter-owned opaque media handle. Its value must not
 // be copied into Gateway, Worker, Session, or persistence.
 type ProviderMediaRef struct {
-	Kind      MessageType
-	Reference string
+	Kind          MessageType
+	Reference     string
+	DecryptionKey string
 }
 
 // Validate checks the small provider-neutral media handle contract.
@@ -362,6 +363,9 @@ func (r ProviderMediaRef) Validate() error {
 	}
 	if strings.TrimSpace(r.Reference) == "" || !utf8String(r.Reference) {
 		return errors.New("provider media ref reference is required")
+	}
+	if r.DecryptionKey != "" && !utf8String(r.DecryptionKey) {
+		return errors.New("provider media ref decryption key is invalid")
 	}
 	return nil
 }

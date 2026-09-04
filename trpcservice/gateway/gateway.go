@@ -199,8 +199,10 @@ func (i AdmissionIdentity) validate(allowPendingMapping bool) error {
 		if i.SourceID != i.Tenant.BindingID {
 			return errors.New("source_id must equal binding_id for channel binding source")
 		}
-		if err := channels.ValidatePublicRouteID(i.PublicRouteID); err != nil {
-			return fmt.Errorf("channel binding route: %w", err)
+		if i.PublicRouteID != "" {
+			if err := channels.ValidatePublicRouteID(i.PublicRouteID); err != nil {
+				return fmt.Errorf("channel binding route: %w", err)
+			}
 		}
 		if i.BindingRevision <= 0 {
 			return errors.New("binding_revision must be positive for channel binding source")
@@ -426,6 +428,13 @@ func (g Gateway) Handle(ctx context.Context, req Request) (result AdmissionResul
 	}
 	identity.Tenant.TraceParent = platformtelemetry.TraceParent(admitCtx)
 	identity.Tenant.TraceState = platformtelemetry.TraceState(admitCtx)
+	// Trace propagation enriches the trusted runtime context after the
+	// resolver has constructed its binding provenance. Keep the provenance in
+	// lockstep so the enrichment cannot look like a scope mutation during the
+	// channel-input validation below.
+	if identity.channelBindingProvenance != nil {
+		identity.channelBindingProvenance.runtimeContext = identity.Tenant
+	}
 	var channelInput *channels.ChannelInput
 	message := Message{
 		Text:         req.Message.Text,

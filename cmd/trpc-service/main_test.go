@@ -19,12 +19,14 @@ func TestConfigFromEnvironmentRequiresExplicitWorkerIdentity(t *testing.T) {
 		envWorkerID:        "worker-a",
 		envHTTPAddr:        "127.0.0.1:8081",
 		envShutdownTimeout: "45s",
+		envModelTimeout:    "12s",
 	}))
 	if err != nil {
 		t.Fatalf("config from environment: %v", err)
 	}
 	if config.Role != roleWorker || config.WorkerID != "worker-a" ||
-		config.HTTPAddr != "127.0.0.1:8081" || config.ShutdownTimeout != 45*time.Second {
+		config.HTTPAddr != "127.0.0.1:8081" || config.ShutdownTimeout != 45*time.Second ||
+		config.ModelTimeout != 12*time.Second || config.WorkerConcurrency != defaultWorkerConcurrency {
 		t.Fatalf("config = %#v", config)
 	}
 
@@ -35,6 +37,42 @@ func TestConfigFromEnvironmentRequiresExplicitWorkerIdentity(t *testing.T) {
 	}))
 	if err == nil {
 		t.Fatal("config without worker ID succeeded")
+	}
+}
+
+func TestConfigFromEnvironmentParsesWorkerConcurrency(t *testing.T) {
+	config, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:              string(roleWorker),
+		envPostgresDSN:       "postgres://example",
+		envRedisURL:          "redis://example:6379/0",
+		envWorkerID:          "worker-a",
+		envWorkerConcurrency: "16",
+	}))
+	if err != nil || config.WorkerConcurrency != 16 {
+		t.Fatalf("worker concurrency = %d, err=%v", config.WorkerConcurrency, err)
+	}
+	_, err = configFromEnvironment(environmentReader(map[string]string{
+		envRole:              string(roleWorker),
+		envPostgresDSN:       "postgres://example",
+		envRedisURL:          "redis://example:6379/0",
+		envWorkerID:          "worker-a",
+		envWorkerConcurrency: "0",
+	}))
+	if err == nil {
+		t.Fatal("zero worker concurrency was accepted")
+	}
+}
+
+func TestConfigFromEnvironmentRejectsInvalidModelTimeout(t *testing.T) {
+	_, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:         string(roleWorker),
+		envPostgresDSN:  "postgres://example",
+		envRedisURL:     "redis://example:6379/0",
+		envWorkerID:     "worker-a",
+		envModelTimeout: "0s",
+	}))
+	if err == nil {
+		t.Fatal("config accepted a non-positive model timeout")
 	}
 }
 
@@ -83,6 +121,22 @@ func TestRenewLeaseBoundsRenewalCall(t *testing.T) {
 	}
 }
 
+func TestDataMigrationRetryDelayIsBounded(t *testing.T) {
+	for attempt, base := range map[int]time.Duration{
+		0: dataMigrationRetryInitial,
+		1: 2 * dataMigrationRetryInitial,
+		2: 4 * dataMigrationRetryInitial,
+		7: dataMigrationRetryMax,
+	} {
+		for range 10 {
+			delay := dataMigrationRetryDelay(attempt)
+			if delay < base/2 || delay > base {
+				t.Fatalf("attempt=%d delay=%s, want [%s,%s]", attempt, delay, base/2, base)
+			}
+		}
+	}
+}
+
 func TestConfigFromEnvironmentRequiresAdminTokenForGateway(t *testing.T) {
 	_, err := configFromEnvironment(environmentReader(map[string]string{
 		envRole:        string(roleGateway),
@@ -120,6 +174,40 @@ func TestServiceHandlerRoutesGatewayIngress(t *testing.T) {
 
 	assertHTTPStatus(t, handler, "/v1/chat/completions", http.StatusNoContent)
 	assertHTTPStatus(t, handler, "/admin/v1/tenants", http.StatusNoContent)
+}
+
+func TestServiceHandlerReadinessGatesGatewayIngress(t *testing.T) {
+	state := &readinessState{}
+	ingressCalls := 0
+	handler := serviceHandlerWithReadiness(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ingressCalls++
+		w.WriteHeader(http.StatusNoContent)
+	}), nil, state)
+
+	assertHTTPStatus(t, handler, "/v1/chat/completions", http.StatusServiceUnavailable)
+	if ingressCalls != 0 {
+		t.Fatal("unready ingress reached Gateway")
+	}
+	state.setReady(true)
+	assertHTTPStatus(t, handler, "/v1/chat/completions", http.StatusNoContent)
+	if ingressCalls != 1 {
+		t.Fatalf("ready ingress calls = %d, want 1", ingressCalls)
+	}
+}
+
+func TestServiceHealthAndReadiness(t *testing.T) {
+	checkErr := errors.New("backend unavailable")
+	state := &readinessState{check: func(context.Context) error { return checkErr }}
+	handler := serviceHandlerWithReadiness(nil, nil, state)
+
+	assertHTTPStatus(t, handler, "/healthz", http.StatusOK)
+	assertHTTPStatus(t, handler, "/readyz", http.StatusServiceUnavailable)
+	state.setReady(true)
+	assertHTTPStatus(t, handler, "/readyz", http.StatusServiceUnavailable)
+	checkErr = nil
+	assertHTTPStatus(t, handler, "/readyz", http.StatusOK)
+	state.setReady(false)
+	assertHTTPStatus(t, handler, "/readyz", http.StatusServiceUnavailable)
 }
 
 func TestAwaitWorkerExitReturnsAtShutdownDeadline(t *testing.T) {

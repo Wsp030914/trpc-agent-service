@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -26,8 +25,11 @@ var (
 	// ErrBindingChannelMismatch means a public route belongs to another
 	// channel than the URL requested.
 	ErrBindingChannelMismatch = errors.New("channel binding channel mismatch")
-	// ErrBindingInactive means a binding is not allowed to receive callbacks.
+	// ErrBindingInactive means a binding is not allowed to receive provider events.
 	ErrBindingInactive = errors.New("channel binding is not active")
+	// ErrIdentityInactive means a provider identity is not allowed to enter
+	// admission. Suspended identities must not be reused by provider retries.
+	ErrIdentityInactive = errors.New("channel identity is not active")
 )
 
 // Channel identifies an external IM platform.
@@ -54,32 +56,32 @@ func (c Channel) Validate() error {
 type BindingStatus string
 
 const (
-	// BindingActive accepts inbound callbacks and outbound replies.
+	// BindingActive accepts inbound events and outbound replies.
 	BindingActive BindingStatus = "ACTIVE"
-	// BindingSuspended rejects new inbound callbacks.
+	// BindingSuspended rejects new inbound provider events.
 	BindingSuspended BindingStatus = "SUSPENDED"
 )
 
 // Binding maps one tenant-owned external IM account to an application.
 type Binding struct {
-	TenantID             string           `json:"tenant_id"`
-	AppID                string           `json:"app_id"`
-	BindingID            string           `json:"binding_id"`
-	Channel              Channel          `json:"channel"`
-	ExternalAccount      string           `json:"external_account"`
-	ExternalAccountScope string           `json:"external_account_scope"`
-	WebhookURL           string           `json:"webhook_url"`
-	TokenRef             tenant.SecretRef `json:"token_ref"`
-	SigningSecretRef     tenant.SecretRef `json:"signing_secret_ref"`
-	Secret               tenant.SecretRef `json:"secret_ref"`
-	PublicRouteID        string           `json:"public_route_id"`
-	BindingRevision      int64            `json:"binding_revision"`
-	Status               BindingStatus    `json:"status"`
+	TenantID        string  `json:"tenant_id"`
+	AppID           string  `json:"app_id"`
+	BindingID       string  `json:"binding_id"`
+	Channel         Channel `json:"channel"`
+	ExternalAccount string  `json:"external_account"`
+	// Secret is the provider credential reference: WeCom Bot Secret or
+	// Feishu App Secret. It is resolved only inside the binding scope.
+	Secret tenant.SecretRef `json:"secret_ref"`
+	// PublicRouteID is retained for the legacy route locator. Long-connection
+	// adapters do not require or use it.
+	PublicRouteID   string        `json:"public_route_id,omitempty"`
+	BindingRevision int64         `json:"binding_revision"`
+	Status          BindingStatus `json:"status"`
 }
 
-// BindingSnapshot is a value copy of a binding captured for one ingress
-// request. Its public route and revision identify the binding version observed
-// before provider verification and admission.
+// BindingSnapshot is a value copy of one provider event. Its revision
+// identifies the binding version observed before provider authentication and
+// admission. HTTP channels may also carry a public route.
 type BindingSnapshot struct {
 	Binding
 }
@@ -154,25 +156,19 @@ func (b Binding) Validate() error {
 	if b.ExternalAccount == "" {
 		return errors.New("external_account is required")
 	}
-	if b.Channel == ChannelFeishu && strings.TrimSpace(b.ExternalAccountScope) == "" {
-		return errors.New("external_account_scope is required for feishu")
-	}
-	if b.WebhookURL == "" {
-		return errors.New("webhook_url is required")
-	}
-	if err := b.TokenRef.Validate(); err != nil {
-		return fmt.Errorf("token_ref: %w", err)
-	}
-	if err := b.SigningSecretRef.Validate(); err != nil {
-		return fmt.Errorf("signing_secret_ref: %w", err)
-	}
-	if b.Channel == ChannelFeishu || !secretRefZero(b.Secret) {
+	if b.Channel == ChannelWeCom || b.Channel == ChannelFeishu {
 		if err := b.Secret.Validate(); err != nil {
-			return fmt.Errorf("outbound secret_ref: %w", err)
+			return fmt.Errorf("provider secret_ref: %w", err)
+		}
+	} else if b.Secret.Name != "" || b.Secret.Version != "" {
+		if err := b.Secret.Validate(); err != nil {
+			return fmt.Errorf("provider secret_ref: %w", err)
 		}
 	}
-	if err := ValidatePublicRouteID(b.PublicRouteID); err != nil {
-		return err
+	if b.PublicRouteID != "" {
+		if err := ValidatePublicRouteID(b.PublicRouteID); err != nil {
+			return err
+		}
 	}
 	if b.BindingRevision <= 0 {
 		return errors.New("binding_revision must be positive")
@@ -226,8 +222,4 @@ func validChannel(channel Channel) bool {
 
 func validBindingStatus(status BindingStatus) bool {
 	return status == BindingActive || status == BindingSuspended
-}
-
-func secretRefZero(ref tenant.SecretRef) bool {
-	return ref.Name == "" && ref.Version == ""
 }

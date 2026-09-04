@@ -199,11 +199,25 @@ func getCompleteSession(
 	summaries summarySource,
 ) (*session.Session, error) {
 	value, err := service.GetSession(ctx, key, session.WithEventNum(math.MaxInt))
-	if err != nil || value == nil || len(value.Summaries) > 0 || len(value.Events) > 0 {
+	if err != nil || value == nil || len(value.Summaries) > 0 {
 		return value, err
 	}
 	if summaries == nil {
+		if len(value.Events) > 0 {
+			return value, nil
+		}
 		return nil, ErrSummaryImportRequired
+	}
+	if len(value.Events) > 0 {
+		loaded, err := summaries.GetSessionSummaries(ctx, key)
+		if err != nil {
+			if errors.Is(err, ErrSummaryImportRequired) {
+				return value, nil
+			}
+			return nil, fmt.Errorf("read session summaries: %w", err)
+		}
+		value.Summaries = loaded
+		return value, nil
 	}
 	loaded, err := summaries.GetSessionSummaries(ctx, key)
 	if err != nil {

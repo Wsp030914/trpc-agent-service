@@ -404,10 +404,7 @@ func seedIdentityMappingBinding(
 		BindingID:            bindingID,
 		Channel:              channel,
 		ExternalAccount:      bindingID + "-account",
-		ExternalAccountScope: bindingID + "-scope",
-		WebhookURL:           "https://example.com/" + bindingID,
-		TokenRef:             tenant.SecretRef{Name: bindingID + "-token", Version: "1"},
-		SigningSecretRef:     tenant.SecretRef{Name: bindingID + "-signing", Version: "1"},
+		Secret:               tenant.SecretRef{Name: bindingID + "-secret", Version: "1"},
 		Status:               channels.BindingActive,
 	}
 	publicRouteID, err := channels.NewPublicRouteID()

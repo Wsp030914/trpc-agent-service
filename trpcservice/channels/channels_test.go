@@ -7,45 +7,40 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
-func TestBindingValidateRequiresTrustedChannelConfig(t *testing.T) {
-	binding := validBinding()
-	if err := binding.Validate(); err != nil {
-		t.Fatalf("validate binding: %v", err)
-	}
-	if scope := binding.Scope(); scope.TenantID != "tenant-a" || scope.AppID != "support" {
-		t.Fatalf("scope = %#v, want tenant-a/support", scope)
-	}
-}
-
-func TestBindingValidateAcceptsFeishu(t *testing.T) {
-	binding := validBinding()
-	binding.Channel = channels.ChannelFeishu
-	binding.ExternalAccount = "feishu-app-1"
-	binding.ExternalAccountScope = "feishu-tenant-1"
-	binding.WebhookURL = "https://example.com/im/feishu/binding-1"
-	binding.TokenRef = tenant.SecretRef{Name: "feishu-token", Version: "v1"}
-	binding.SigningSecretRef = tenant.SecretRef{Name: "feishu-signing-secret", Version: "v1"}
-	binding.Secret = tenant.SecretRef{Name: "feishu-app-secret", Version: "v1"}
-
-	if err := binding.Validate(); err != nil {
-		t.Fatalf("validate Feishu binding: %v", err)
-	}
-}
-
-func TestBindingValidateRequiresFeishuOutboundSecret(t *testing.T) {
-	binding := validBinding()
-	binding.Channel = channels.ChannelFeishu
-	binding.ExternalAccountScope = "feishu-tenant-1"
-	if err := binding.Validate(); err == nil {
-		t.Fatal("validate Feishu binding succeeded without outbound app secret")
+func TestBindingValidateAcceptsLongConnectionCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		channel channels.Channel
+		account string
+		secret  string
+	}{
+		{name: "wecom", channel: channels.ChannelWeCom, account: "bot-id", secret: "bot-secret"},
+		{name: "feishu", channel: channels.ChannelFeishu, account: "app-id", secret: "app-secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			binding := validBinding()
+			binding.Channel = tc.channel
+			binding.ExternalAccount = tc.account
+			binding.Secret = tenant.SecretRef{Name: tc.secret, Version: "v1"}
+			binding.PublicRouteID = ""
+			if err := binding.Validate(); err != nil {
+				t.Fatalf("validate binding: %v", err)
+			}
+			if scope := binding.Scope(); scope.TenantID != "tenant-a" || scope.AppID != "support" {
+				t.Fatalf("scope = %#v, want tenant-a/support", scope)
+			}
+		})
 	}
 }
 
-func TestBindingValidateRequiresFeishuExternalAccountScope(t *testing.T) {
-	binding := validBinding()
-	binding.Channel = channels.ChannelFeishu
-	if err := binding.Validate(); err == nil {
-		t.Fatal("validate Feishu binding succeeded without external account scope")
+func TestBindingValidateRequiresProviderSecret(t *testing.T) {
+	for _, channel := range []channels.Channel{channels.ChannelWeCom, channels.ChannelFeishu} {
+		binding := validBinding()
+		binding.Channel = channel
+		binding.Secret = tenant.SecretRef{}
+		if err := binding.Validate(); err == nil {
+			t.Fatalf("validate %s binding succeeded without provider secret", channel)
+		}
 	}
 }
 
@@ -59,10 +54,9 @@ func TestBindingValidateRejectsIncompleteConfig(t *testing.T) {
 		{name: "binding", mutate: func(b *channels.Binding) { b.BindingID = "" }},
 		{name: "channel", mutate: func(b *channels.Binding) { b.Channel = channels.Channel("slack") }},
 		{name: "external account", mutate: func(b *channels.Binding) { b.ExternalAccount = "" }},
-		{name: "webhook", mutate: func(b *channels.Binding) { b.WebhookURL = "" }},
-		{name: "token", mutate: func(b *channels.Binding) { b.TokenRef = tenant.SecretRef{} }},
-		{name: "signing secret", mutate: func(b *channels.Binding) { b.SigningSecretRef = tenant.SecretRef{} }},
+		{name: "secret", mutate: func(b *channels.Binding) { b.Secret = tenant.SecretRef{} }},
 		{name: "status", mutate: func(b *channels.Binding) { b.Status = channels.BindingStatus("DELETED") }},
+		{name: "invalid route", mutate: func(b *channels.Binding) { b.PublicRouteID = "bad route" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -75,22 +69,11 @@ func TestBindingValidateRejectsIncompleteConfig(t *testing.T) {
 	}
 }
 
-func TestBindingValidateRequiresPublicRouteSnapshot(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*channels.Binding)
-	}{
-		{name: "route", mutate: func(b *channels.Binding) { b.PublicRouteID = "" }},
-		{name: "revision", mutate: func(b *channels.Binding) { b.BindingRevision = 0 }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			binding := validBinding()
-			tt.mutate(&binding)
-			if err := binding.Validate(); err == nil {
-				t.Fatal("validate binding succeeded without route snapshot")
-			}
-		})
+func TestBindingValidateAllowsLongConnectionWithoutPublicRoute(t *testing.T) {
+	binding := validBinding()
+	binding.PublicRouteID = ""
+	if err := binding.Validate(); err != nil {
+		t.Fatalf("validate long connection binding: %v", err)
 	}
 }
 
@@ -119,16 +102,8 @@ func validBinding() channels.Binding {
 		AppID:           "support",
 		BindingID:       "binding-1",
 		Channel:         channels.ChannelWeCom,
-		ExternalAccount: "corp-agent-1",
-		WebhookURL:      "https://example.com/im/wecom/binding-1",
-		TokenRef: tenant.SecretRef{
-			Name:    "wecom-token",
-			Version: "v1",
-		},
-		SigningSecretRef: tenant.SecretRef{
-			Name:    "wecom-signing-secret",
-			Version: "v1",
-		},
+		ExternalAccount: "bot-id",
+		Secret:          tenant.SecretRef{Name: "bot-secret", Version: "v1"},
 		PublicRouteID:   "route-binding-1",
 		BindingRevision: 1,
 		Status:          channels.BindingActive,

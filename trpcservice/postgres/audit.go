@@ -2,11 +2,13 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
@@ -21,14 +23,24 @@ func (s *Store) Record(ctx context.Context, event platformaudit.Event) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
+	// This is the final persistence boundary. Callers may have different
+	// policy paths, but stored audit metadata is always redacted before it is
+	// written.
+	event = platformaudit.RedactEvent(event)
 	if err := event.Validate(); err != nil {
 		return err
 	}
+	return insertAuditEvent(ctx, s.pool, event)
+}
+
+func insertAuditEvent(ctx context.Context, executor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, event platformaudit.Event) error {
 	createdAt := event.CreatedAt
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
-	if _, err := s.pool.Exec(ctx, `
+	if _, err := executor.Exec(ctx, `
 INSERT INTO platform.audit_event (
     tenant_id, app_id, channel, user_id, session_id, agent_name, tool_name,
     decision, latency, error_type, input_tokens, output_tokens, total_tokens,
@@ -59,6 +71,14 @@ INSERT INTO platform.audit_event (
 	return nil
 }
 
+func insertAuditEventTx(ctx context.Context, tx pgx.Tx, event platformaudit.Event) error {
+	event = platformaudit.RedactEvent(event)
+	if err := event.Validate(); err != nil {
+		return err
+	}
+	return insertAuditEvent(ctx, tx, event)
+}
+
 func (s *Store) recordAuditBestEffort(ctx context.Context, event platformaudit.Event) {
 	if s == nil {
 		return
@@ -82,23 +102,49 @@ func (s *Store) recordAuditBestEffort(ctx context.Context, event platformaudit.E
 
 // ListAuditEvents reads only the requested tenant/application partition.
 func (s *Store) ListAuditEvents(ctx context.Context, tenantID, appID string, limit int) ([]platformaudit.Event, error) {
+	return s.ListAuditEventsQuery(ctx, platformaudit.Query{TenantID: tenantID, AppID: appID, Limit: limit})
+}
+
+// ListAuditEventsQuery reads metadata-only events with optional filters from
+// one exact tenant/application partition.
+func (s *Store) ListAuditEventsQuery(ctx context.Context, query platformaudit.Query) ([]platformaudit.Event, error) {
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
-	if tenantID == "" || appID == "" {
-		return nil, errors.New("tenant_id and app_id are required")
+	if err := query.Validate(); err != nil {
+		return nil, err
 	}
-	if limit <= 0 || limit > 1000 {
-		limit = 1000
+	limit := query.Limit
+	if limit == 0 {
+		limit = 100
 	}
-	rows, err := s.pool.Query(ctx, `
+	clauses := []string{"tenant_id = $1", "app_id = $2"}
+	args := []any{query.TenantID, query.AppID}
+	if query.EventType != "" {
+		args = append(args, query.EventType)
+		clauses = append(clauses, fmt.Sprintf("event_type = $%d", len(args)))
+	}
+	if query.TraceID != "" {
+		args = append(args, query.TraceID)
+		clauses = append(clauses, fmt.Sprintf("trace_id = $%d", len(args)))
+	}
+	if query.CreatedAfter != nil {
+		args = append(args, query.CreatedAfter.UTC())
+		clauses = append(clauses, fmt.Sprintf("created_at >= $%d", len(args)))
+	}
+	if query.CreatedBefore != nil {
+		args = append(args, query.CreatedBefore.UTC())
+		clauses = append(clauses, fmt.Sprintf("created_at <= $%d", len(args)))
+	}
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
 SELECT tenant_id, app_id, channel, user_id, session_id, agent_name, tool_name,
        decision, latency, error_type, input_tokens, output_tokens, total_tokens,
        cost, trace_id, request_id, config_version, event_type, created_at
 FROM platform.audit_event
-WHERE tenant_id = $1 AND app_id = $2
+WHERE %s
 ORDER BY created_at DESC, audit_event_id DESC
-LIMIT $3`, tenantID, appID, limit)
+LIMIT $%d`, strings.Join(clauses, " AND "), len(args)), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query audit events: %w", err)
 	}

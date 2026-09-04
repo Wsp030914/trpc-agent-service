@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -120,11 +122,13 @@ func NewStaticBindingResolver(bindings ...channels.Binding) (*StaticBindingResol
 				key.bindingID,
 			)
 		}
-		if _, exists := resolver.routes[binding.PublicRouteID]; exists {
-			return nil, fmt.Errorf("channel binding public route is duplicated")
+		if binding.PublicRouteID != "" {
+			if _, exists := resolver.routes[binding.PublicRouteID]; exists {
+				return nil, fmt.Errorf("channel binding public route is duplicated")
+			}
+			resolver.routes[binding.PublicRouteID] = binding.Snapshot()
 		}
 		resolver.bindings[key] = binding
-		resolver.routes[binding.PublicRouteID] = binding.Snapshot()
 	}
 	return resolver, nil
 }
@@ -187,6 +191,33 @@ func (r *StaticBindingResolver) ResolveBinding(
 		)
 	}
 	return binding, nil
+}
+
+// ListActiveChannelBindings returns copies of all active bindings for one
+// provider. Long-connection clients are created per returned binding.
+func (r *StaticBindingResolver) ListActiveChannelBindings(
+	_ context.Context,
+	channel channels.Channel,
+) ([]channels.Binding, error) {
+	if err := channel.Validate(); err != nil {
+		return nil, err
+	}
+	bindings := make([]channels.Binding, 0)
+	for _, binding := range r.bindings {
+		if binding.Channel == channel && binding.Status == channels.BindingActive {
+			bindings = append(bindings, binding)
+		}
+	}
+	slices.SortFunc(bindings, func(left, right channels.Binding) int {
+		if left.TenantID != right.TenantID {
+			return strings.Compare(left.TenantID, right.TenantID)
+		}
+		if left.AppID != right.AppID {
+			return strings.Compare(left.AppID, right.AppID)
+		}
+		return strings.Compare(left.BindingID, right.BindingID)
+	})
+	return bindings, nil
 }
 
 // ResolveBindingByPublicRoute returns a binding snapshot located by its

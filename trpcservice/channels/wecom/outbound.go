@@ -1,44 +1,34 @@
 package wecom
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
+	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 )
 
-const (
-	maxWeComReplyBytes            = 20480
-	maxWeComProviderResponseBytes = 64 << 10
-)
+const maxWeComReplyBytes = 20480
 
-var (
-	errWeComReplyTooLarge = errors.New("wecom reply is too large")
-)
+var errWeComReplyTooLarge = errors.New("wecom reply is too large")
 
 // ProviderSendError is the stable, body-redacted error returned by one
-// WeCom provider call. Retry policy and Reply Outbox state transitions remain
-// owned by IM-06.
+// WeCom protocol send. Reply Outbox owns retry and attempt state.
 type ProviderSendError struct {
-	StatusCode int
-	Code       int
-	Retryable  bool
-	cause      error
+	Code            int
+	Retryable       bool
+	Uncertain       bool
+	RetryAfterDelay time.Duration
+	cause           error
 }
 
-// Error returns a provider-safe description without response bodies, targets,
-// credentials, or other provider payload data.
 func (e *ProviderSendError) Error() string {
 	if e == nil {
 		return "wecom provider send failed"
-	}
-	if e.StatusCode != 0 {
-		return fmt.Sprintf("wecom provider returned status %d", e.StatusCode)
 	}
 	if e.Code != 0 {
 		return fmt.Sprintf("wecom provider returned code %d", e.Code)
@@ -46,7 +36,6 @@ func (e *ProviderSendError) Error() string {
 	return "wecom provider send failed"
 }
 
-// Unwrap returns the non-sensitive transport or decoding cause, if present.
 func (e *ProviderSendError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -54,47 +43,115 @@ func (e *ProviderSendError) Unwrap() error {
 	return e.cause
 }
 
-// IsRetryable reports whether the provider or transport indicated a temporary
-// failure. ReplySender owns the actual retry decision and attempt limit.
 func (e *ProviderSendError) IsRetryable() bool {
 	return e != nil && e.Retryable
 }
 
-// OutboundClient performs exactly one WeCom AI Bot active response_url call.
-// It does not claim, persist, retry, or otherwise manage Reply Outbox state.
+func (e *ProviderSendError) IsSideEffectUncertain() bool {
+	return e != nil && e.Uncertain
+}
+
+func (e *ProviderSendError) RetryAfter() time.Duration {
+	if e == nil || e.RetryAfterDelay < 0 {
+		return 0
+	}
+	return e.RetryAfterDelay
+}
+
+// MessageSender is the provider operation used by Reply Outbox.
+type MessageSender interface {
+	SendMessage(context.Context, string, string) (string, error)
+}
+
+// OutboundOption configures one binding-scoped sender.
+type OutboundOption func(*outboundConfig) error
+
+type outboundConfig struct {
+	sender        MessageSender
+	clientOptions []ClientOption
+}
+
+// WithMessageSender injects a protocol sender for focused provider tests.
+func WithMessageSender(sender MessageSender) OutboundOption {
+	return func(config *outboundConfig) error {
+		if sender == nil {
+			return errors.New("wecom message sender is required")
+		}
+		config.sender = sender
+		return nil
+	}
+}
+
+// WithClientOptions passes protocol options to the binding-scoped client.
+func WithClientOptions(options ...ClientOption) OutboundOption {
+	return func(config *outboundConfig) error {
+		config.clientOptions = append(config.clientOptions, options...)
+		return nil
+	}
+}
+
+// OutboundClient performs exactly one official aibot_send_msg operation. It
+// does not claim, persist, retry, or otherwise manage Reply Outbox state.
 type OutboundClient struct {
-	httpClient      *http.Client
-	targetValidator func(string) error
+	sender MessageSender
 }
 
-// NewOutboundClient creates a one-call WeCom provider client. A nil HTTP
-// client uses http.DefaultClient; callers control deadlines with context.
-func NewOutboundClient(httpClient *http.Client) *OutboundClient {
-	if httpClient == nil {
-		httpClient = http.DefaultClient
+// NewOutboundClient resolves the binding's WeCom Bot Secret and creates a
+// binding-scoped long-connection sender. The sender reconnects independently
+// and is closed by the outbound resolver lifecycle.
+func NewOutboundClient(
+	ctx context.Context,
+	secrets platformsecret.SecretProvider,
+	binding channels.BindingSnapshot,
+	opts ...OutboundOption,
+) (*OutboundClient, error) {
+	if ctx == nil {
+		return nil, errors.New("context is required")
 	}
-	client := *httpClient
-	// A response_url is an external capability, not a redirect permission.
-	// Refuse redirects even when a caller supplied a client with a permissive
-	// redirect policy.
-	client.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
+	if secrets == nil {
+		return nil, errors.New("secret provider is required")
 	}
-	return &OutboundClient{
-		httpClient:      &client,
-		targetValidator: validateResponseURL,
+	if err := binding.Validate(); err != nil {
+		return nil, fmt.Errorf("wecom binding: %w", err)
 	}
+	if binding.Channel != channels.ChannelWeCom {
+		return nil, errors.New("wecom outbound client received another channel")
+	}
+	if binding.Secret.Name == "" {
+		return nil, errors.New("wecom bot secret reference is required")
+	}
+	botSecret, err := secrets.ResolveSecret(ctx, binding.Scope(), binding.Secret)
+	if err != nil {
+		return nil, fmt.Errorf("resolve wecom bot secret: %w", err)
+	}
+	if botSecret == "" {
+		return nil, errors.New("wecom bot secret is required")
+	}
+	config := outboundConfig{}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		if err := opt(&config); err != nil {
+			return nil, err
+		}
+	}
+	if config.sender == nil {
+		config.sender, err = NewClient(binding.ExternalAccount, botSecret, config.clientOptions...)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &OutboundClient{sender: config.sender}, nil
 }
 
-// SendOnce encodes and sends one platform Reply to a resolved WeCom target.
-// WeCom response_url calls do not return a provider message ID, so the local
-// reply ID is used as the shared receipt fallback.
+// SendOnce sends one Reply to the resolved WeCom user ID or group chat ID.
 func (c *OutboundClient) SendOnce(
 	ctx context.Context,
 	reply channels.Reply,
 	providerTarget string,
 ) (channels.ProviderReceipt, error) {
-	if c == nil || c.httpClient == nil {
+	if c == nil || c.sender == nil {
 		return channels.ProviderReceipt{}, &ProviderSendError{cause: errors.New("wecom outbound client is not initialized")}
 	}
 	if err := reply.Validate(); err != nil {
@@ -103,116 +160,55 @@ func (c *OutboundClient) SendOnce(
 	if reply.Channel != channels.ChannelWeCom {
 		return channels.ProviderReceipt{}, errors.New("wecom outbound client received another channel")
 	}
-	validator := c.targetValidator
-	if validator == nil {
-		validator = validateResponseURL
+	target, err := channels.NormalizeExternalID(providerTarget)
+	if err != nil || target != providerTarget {
+		return channels.ProviderReceipt{}, &ProviderSendError{cause: errors.New("wecom provider target is invalid")}
 	}
-	if err := validator(providerTarget); err != nil {
-		return channels.ProviderReceipt{}, &ProviderSendError{cause: err}
+	if !utf8.ValidString(reply.Text) || len([]byte(reply.Text)) > maxWeComReplyBytes {
+		return channels.ProviderReceipt{}, errWeComReplyTooLarge
 	}
-	payload, err := encodeReply(reply)
+	providerMessageID, err := c.sender.SendMessage(ctx, target, reply.Text)
 	if err != nil {
-		return channels.ProviderReceipt{}, err
+		return channels.ProviderReceipt{}, providerError(err)
 	}
-	result, err := sendProviderPayload(ctx, c.httpClient, providerTarget, payload)
-	if err != nil {
-		return channels.ProviderReceipt{}, err
-	}
-	return providerReceipt(reply, result), nil
-}
-
-func sendProviderPayload(
-	ctx context.Context,
-	httpClient *http.Client,
-	target string,
-	payload []byte,
-) (providerResponse, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
-	if err != nil {
-		return providerResponse{}, &ProviderSendError{cause: errors.New("create wecom provider request")}
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := httpClient.Do(request)
-	if err != nil {
-		return providerResponse{}, &ProviderSendError{Retryable: true, cause: err}
-	}
-	defer func() {
-		_ = response.Body.Close()
-	}()
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxWeComProviderResponseBytes+1))
-	if err != nil {
-		return providerResponse{}, &ProviderSendError{
-			StatusCode: response.StatusCode,
-			Retryable:  retryableHTTPStatus(response.StatusCode),
-			cause:      err,
-		}
-	}
-	if len(body) > maxWeComProviderResponseBytes {
-		return providerResponse{}, &ProviderSendError{
-			StatusCode: response.StatusCode,
-			Retryable:  retryableHTTPStatus(response.StatusCode),
-			cause:      errWeComReplyTooLarge,
-		}
-	}
-	var result providerResponse
-	if len(bytes.TrimSpace(body)) > 0 {
-		if err := json.Unmarshal(body, &result); err != nil {
-			return providerResponse{}, &ProviderSendError{
-				StatusCode: response.StatusCode,
-				Retryable:  retryableHTTPStatus(response.StatusCode),
-				cause:      errors.New("decode wecom provider response"),
-			}
-		}
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return providerResponse{}, &ProviderSendError{
-			StatusCode: response.StatusCode,
-			Code:       result.Code,
-			Retryable:  retryableHTTPStatus(response.StatusCode),
-		}
-	}
-	if result.Code != 0 {
-		return providerResponse{}, &ProviderSendError{Code: result.Code}
-	}
-	return result, nil
-}
-
-func providerReceipt(
-	reply channels.Reply,
-	result providerResponse,
-) channels.ProviderReceipt {
-	providerMessageID := result.MessageID
-	if providerMessageID == "" {
+	if strings.TrimSpace(providerMessageID) == "" {
 		providerMessageID = reply.ReplyID
 	}
-	return channels.ProviderReceipt{ProviderMessageID: providerMessageID}
+	return channels.ProviderReceipt{ProviderMessageID: providerMessageID}, nil
 }
 
-type providerResponse struct {
-	Code      int    `json:"errcode"`
-	MessageID string `json:"msgid"`
-}
-
-func encodeReply(reply channels.Reply) ([]byte, error) {
-	if len([]byte(reply.Text)) > maxWeComReplyBytes {
-		return nil, errWeComReplyTooLarge
+// Close releases a sender-owned long connection.
+func (c *OutboundClient) Close(ctx context.Context) error {
+	if c == nil || c.sender == nil {
+		return nil
 	}
-	return json.Marshal(struct {
-		MessageType string `json:"msgtype"`
-		Markdown    struct {
-			Content string `json:"content"`
-		} `json:"markdown"`
-	}{
-		MessageType: "markdown",
-		Markdown: struct {
-			Content string `json:"content"`
-		}{Content: reply.Text},
-	})
+	if client, ok := c.sender.(*WebSocketClient); ok {
+		return client.Close(ctx)
+	}
+	return nil
 }
 
-func retryableHTTPStatus(status int) bool {
-	return status == http.StatusRequestTimeout || status == http.StatusTooEarly ||
-		status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+func providerError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var protocolErr *protocolError
+	if errors.As(err, &protocolErr) {
+		return &ProviderSendError{
+			Code:      protocolErr.code,
+			Retryable: retryableWeComCode(protocolErr.code),
+			cause:     err,
+		}
+	}
+	return &ProviderSendError{
+		Retryable: !errors.Is(err, context.Canceled),
+		Uncertain: !errors.Is(err, context.Canceled),
+		cause:     err,
+	}
+}
+
+func retryableWeComCode(code int) bool {
+	return code == 45009 || code >= 50000
 }
 
 var _ channels.ProviderOutboundClient = (*OutboundClient)(nil)

@@ -3,6 +3,7 @@ package worker_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -52,6 +53,175 @@ func TestConsumerRetriesAndAcknowledgesFailedRun(t *testing.T) {
 	}
 }
 
+func TestConsumerHonorsExecutionFailureClassification(t *testing.T) {
+	tests := []struct {
+		name          string
+		err           error
+		wantCompleted queue.CompletionStatus
+		wantRetries   int
+	}{
+		{
+			name:          "permanent",
+			err:           worker.NewPermanentExecutionError(errors.New("invalid config")),
+			wantCompleted: queue.CompletionFailed,
+		},
+		{
+			name:          "side effect uncertain",
+			err:           worker.NewSideEffectUncertainError(errors.New("remote write may have happened")),
+			wantCompleted: queue.CompletionUncertain,
+			wantRetries:   0,
+		},
+		{
+			name:        "retryable",
+			err:         worker.NewRetryableExecutionError(errors.New("temporary backend failure")),
+			wantRetries: 1,
+		},
+	}
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			claim := testQueueClaim(t, fmt.Sprintf("request-class-%d", index))
+			stream := &testStream{delivery: queue.Delivery{
+				ID: fmt.Sprintf("class-%d-0", index),
+				Dispatch: queue.Dispatch{
+					OutboxID:  int64(100 + index),
+					TenantID:  "tenant-a",
+					AppID:     "support",
+					RequestID: claim.Job.RequestID(),
+				},
+			}, cancel: cancel}
+			store := &testExecutionStore{claim: claim}
+			consumer, err := worker.NewConsumer(&consumerExecutor{err: tt.err}, stream, store, "worker-1")
+			if err != nil {
+				t.Fatalf("new consumer: %v", err)
+			}
+			if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("run = %v", err)
+			}
+			if store.completed != tt.wantCompleted || store.retries != tt.wantRetries {
+				t.Fatalf("completion=%q retries=%d, want %q/%d", store.completed, store.retries, tt.wantCompleted, tt.wantRetries)
+			}
+		})
+	}
+}
+
+func TestConsumerFailsStartedRunnerWithoutAutomaticRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claim := testQueueClaim(t, "request-consumer-started-runner")
+	stream := &testStream{delivery: queue.Delivery{ID: "2-1", Dispatch: queue.Dispatch{OutboxID: 21, TenantID: "tenant-a", AppID: "support", RequestID: claim.Job.RequestID()}}, cancel: cancel}
+	store := &testExecutionStore{claim: claim}
+	consumer, err := worker.NewConsumer(&consumerExecutor{
+		result: worker.RunResult{RunnerStarted: true},
+		err:    errors.New("tool failed after execution started"),
+	}, stream, store, "worker-1")
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v", err)
+	}
+	if store.completed != queue.CompletionFailed || store.retries != 0 {
+		t.Fatalf("completion=%q retries=%d, want FAILED and 0", store.completed, store.retries)
+	}
+	if stream.acks != 1 {
+		t.Fatalf("acks = %d", stream.acks)
+	}
+}
+
+func TestConsumerHonorsRetryableClassificationAfterRunnerStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claim := testQueueClaim(t, "request-consumer-started-retryable")
+	stream := &testStream{delivery: queue.Delivery{
+		ID: "2-1-retryable",
+		Dispatch: queue.Dispatch{
+			OutboxID:  211,
+			TenantID:  "tenant-a",
+			AppID:     "support",
+			RequestID: claim.Job.RequestID(),
+		},
+	}, cancel: cancel}
+	store := &testExecutionStore{claim: claim}
+	consumer, err := worker.NewConsumer(&consumerExecutor{
+		result: worker.RunResult{RunnerStarted: true},
+		err:    worker.NewRetryableExecutionError(errors.New("model transport failed before side effect")),
+	}, stream, store, "worker-1")
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v", err)
+	}
+	if store.completed != "" || store.retries != 1 {
+		t.Fatalf("completion=%q retries=%d, want no completion and one retry", store.completed, store.retries)
+	}
+}
+
+func TestConsumerRetriesTemporaryClaimFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claim := testQueueClaim(t, "request-consumer-claim-retry")
+	stream := &testStream{delivery: queue.Delivery{ID: "2-2", Dispatch: queue.Dispatch{OutboxID: 22, TenantID: "tenant-a", AppID: "support", RequestID: claim.Job.RequestID()}}, cancel: cancel}
+	store := &testExecutionStore{claim: claim, claimFailures: 1}
+	consumer, err := worker.NewConsumer(&consumerExecutor{result: worker.RunResult{RunnerCompleted: true}}, stream, store, "worker-1")
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v", err)
+	}
+	if store.claimCalls != 2 || store.completed != queue.CompletionSucceeded || stream.acks != 1 {
+		t.Fatalf("claims=%d completion=%q acks=%d", store.claimCalls, store.completed, stream.acks)
+	}
+}
+
+func TestConsumerStopClaimingDrainsActiveExecution(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claim := testQueueClaim(t, "request-consumer-drain")
+	stream := &testStream{delivery: queue.Delivery{ID: "2-3", Dispatch: queue.Dispatch{OutboxID: 23, TenantID: "tenant-a", AppID: "support", RequestID: claim.Job.RequestID()}}, cancel: cancel}
+	store := &testExecutionStore{claim: claim}
+	executor := &blockingConsumerExecutor{started: make(chan context.Context, 1), finish: make(chan struct{})}
+	consumer, err := worker.NewConsumer(executor, stream, store, "worker-1")
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- consumer.Run(ctx) }()
+	runCtx := <-executor.started
+	consumer.StopClaiming()
+	select {
+	case <-runCtx.Done():
+		t.Fatal("StopClaiming canceled an already claimed execution")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(executor.finish)
+	if err := <-done; err != nil {
+		t.Fatalf("run = %v", err)
+	}
+	if store.completed != queue.CompletionSucceeded || stream.acks != 1 {
+		t.Fatalf("completion=%q acks=%d", store.completed, stream.acks)
+	}
+}
+
+func TestConsumerDeadLettersMalformedDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &malformedStream{cancel: cancel}
+	consumer, err := worker.NewConsumer(&consumerExecutor{}, stream, &testExecutionStore{}, "worker-1")
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v", err)
+	}
+	if stream.dead != 1 || stream.deadID != "poison-0" {
+		t.Fatalf("dead=%d id=%q, want one dead-letter for poison-0", stream.dead, stream.deadID)
+	}
+}
+
 func TestConsumerExtractsTraceContextFromDispatch(t *testing.T) {
 	runtime := platformtelemetry.NewNoop(context.Background(), "consumer-test")
 	t.Cleanup(func() { _ = runtime.Close(context.Background()) })
@@ -97,6 +267,24 @@ type consumerExecutor struct {
 	traceID string
 }
 
+type blockingConsumerExecutor struct {
+	started chan context.Context
+	finish  chan struct{}
+}
+
+func (e *blockingConsumerExecutor) Run(ctx context.Context, _ execution.Job) (worker.RunResult, error) {
+	if _, ok := worker.JobLeaseFromContext(ctx); !ok {
+		return worker.RunResult{}, errors.New("lease is missing")
+	}
+	e.started <- ctx
+	select {
+	case <-e.finish:
+		return worker.RunResult{RunnerStarted: true, RunnerCompleted: true}, nil
+	case <-ctx.Done():
+		return worker.RunResult{RunnerStarted: true}, ctx.Err()
+	}
+}
+
 func (e *consumerExecutor) Run(ctx context.Context, _ execution.Job) (worker.RunResult, error) {
 	if _, ok := worker.JobLeaseFromContext(ctx); !ok {
 		return worker.RunResult{}, errors.New("lease is missing")
@@ -111,6 +299,29 @@ type testStream struct {
 	delivered bool
 	acks      int
 	cancel    context.CancelFunc
+}
+
+type malformedStream struct {
+	dead     int
+	deadID   string
+	received bool
+	cancel   context.CancelFunc
+}
+
+func (s *malformedStream) Receive(ctx context.Context, _ string, _ time.Duration) (queue.Delivery, error) {
+	if !s.received {
+		s.received = true
+		return queue.Delivery{ID: "poison-0"}, errors.New("malformed dispatch payload")
+	}
+	<-ctx.Done()
+	return queue.Delivery{}, ctx.Err()
+}
+func (s *malformedStream) Ack(context.Context, queue.Delivery) error { return nil }
+func (s *malformedStream) Dead(_ context.Context, delivery queue.Delivery, _ error) error {
+	s.dead++
+	s.deadID = delivery.ID
+	s.cancel()
+	return nil
 }
 
 func (s *testStream) Receive(ctx context.Context, _ string, _ time.Duration) (queue.Delivery, error) {
@@ -136,13 +347,20 @@ func (s *testStream) Ack(_ context.Context, _ queue.Delivery) error {
 func (s *testStream) Dead(context.Context, queue.Delivery, error) error { return nil }
 
 type testExecutionStore struct {
-	claim     queue.Claim
-	claimed   bool
-	completed queue.CompletionStatus
-	retries   int
+	claim         queue.Claim
+	claimed       bool
+	claimFailures int
+	claimCalls    int
+	completed     queue.CompletionStatus
+	retries       int
 }
 
 func (s *testExecutionStore) Claim(_ context.Context, _ queue.Dispatch, _ queue.ClaimRequest) (queue.Claim, bool, error) {
+	s.claimCalls++
+	if s.claimFailures > 0 {
+		s.claimFailures--
+		return queue.Claim{}, false, errors.New("postgres temporarily unavailable")
+	}
 	if s.claimed {
 		return queue.Claim{}, false, nil
 	}
@@ -154,6 +372,14 @@ func (s *testExecutionStore) Renew(_ context.Context, c queue.Claim, _ time.Dura
 }
 func (s *testExecutionStore) Complete(_ context.Context, _ queue.Claim, status queue.CompletionStatus) error {
 	s.completed = status
+	return nil
+}
+func (s *testExecutionStore) CompleteUncertain(_ context.Context, _ queue.Claim, _ error) error {
+	s.completed = queue.CompletionUncertain
+	return nil
+}
+func (s *testExecutionStore) WaitForApproval(_ context.Context, _ queue.Claim, _ string) error {
+	s.completed = "WAITING_APPROVAL"
 	return nil
 }
 func (s *testExecutionStore) Retry(_ context.Context, _ queue.Claim, _ error) error {

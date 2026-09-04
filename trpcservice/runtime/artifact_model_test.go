@@ -19,6 +19,7 @@ func TestArtifactHydratingModelLoadsReferenceBeforeProviderCall(t *testing.T) {
 	data := []byte("attachment contents")
 	if _, err := storage.SaveArtifact(context.Background(), info, "inbound/file", &frameworkartifact.Artifact{
 		Data:     data,
+		Name:     "report.docx",
 		MimeType: "text/plain",
 	}); err != nil {
 		t.Fatalf("save artifact: %v", err)
@@ -53,7 +54,7 @@ func TestArtifactHydratingModelLoadsReferenceBeforeProviderCall(t *testing.T) {
 		t.Fatalf("provider request = %#v", model.request)
 	}
 	part := model.request.Messages[0].ContentParts[0]
-	if part.File == nil || string(part.File.Data) != string(data) || part.File.MimeType != "text/plain" {
+	if part.File == nil || string(part.File.Data) != string(data) || part.File.Name != "report.docx" || part.File.MimeType != "text/plain" {
 		t.Fatalf("hydrated file = %#v", part.File)
 	}
 	originalPart := request.Messages[0].ContentParts[0]

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,9 +18,11 @@ import (
 )
 
 const (
-	maxExecutionAttempts = 3
-	blockedDispatchDelay = time.Second
-	defaultDispatchBatch = 32
+	maxExecutionAttempts  = 3
+	blockedDispatchDelay  = time.Second
+	defaultDispatchBatch  = 32
+	executionRetryInitial = time.Second
+	executionRetryMax     = 30 * time.Second
 	// consumedOutboxRetention bounds how long consumed dispatch records are
 	// kept for observability before RecoverDispatches removes them.
 	consumedOutboxRetention = 24 * time.Hour
@@ -51,7 +54,7 @@ func (s *Store) Claim(ctx context.Context, dispatch queue.Dispatch, request queu
 			return queue.Claim{}, false, err
 		}
 	}
-	if !active || stored.status == "SUCCEEDED" || stored.status == "FAILED" || stored.status == "CANCELED" {
+	if !active || stored.status == "WAITING_APPROVAL" || stored.status == "SUCCEEDED" || stored.status == "FAILED" || stored.status == "UNCERTAIN" || stored.status == "CANCELED" {
 		if err := consumeDispatch(ctx, tx, dispatch); err != nil {
 			return queue.Claim{}, false, err
 		}
@@ -60,7 +63,7 @@ func (s *Store) Claim(ctx context.Context, dispatch queue.Dispatch, request queu
 		}
 		return queue.Claim{}, false, nil
 	}
-	if stored.status == "RUNNING" && stored.leaseUntil.After(time.Now()) {
+	if stored.status == "RUNNING" && stored.leaseActive {
 		if err := consumeDispatch(ctx, tx, dispatch); err != nil {
 			return queue.Claim{}, false, err
 		}
@@ -69,7 +72,25 @@ func (s *Store) Claim(ctx context.Context, dispatch queue.Dispatch, request queu
 		}
 		return queue.Claim{}, false, nil
 	}
-	if stored.nextAttemptAt.After(time.Now()) || stored.hasEarlier {
+	if stored.attempt >= maxExecutionAttempts {
+		if _, err := tx.Exec(ctx, `UPDATE platform.execution
+SET status = 'UNCERTAIN',
+    last_error = 'execution reached its attempt limit without a terminal result',
+    lease_owner = NULL, run_token = NULL, lease_until = NULL,
+    finished_at = clock_timestamp(), updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3
+  AND status IN ('PENDING', 'RUNNING')`, stored.tenantID, stored.appID, stored.requestID); err != nil {
+			return queue.Claim{}, false, fmt.Errorf("mark exhausted execution uncertain: %w", err)
+		}
+		if err := consumeDispatch(ctx, tx, dispatch); err != nil {
+			return queue.Claim{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return queue.Claim{}, false, fmt.Errorf("commit exhausted execution: %w", err)
+		}
+		return queue.Claim{}, false, nil
+	}
+	if !stored.attemptReady || stored.hasEarlier {
 		if err := deferDispatch(ctx, tx, dispatch, stored.nextAttemptAt); err != nil {
 			return queue.Claim{}, false, err
 		}
@@ -85,7 +106,17 @@ SET status = 'RUNNING', attempt = attempt + 1, lease_owner = $4, run_token = $5,
     lease_until = clock_timestamp() + $6::interval, next_attempt_at = clock_timestamp(),
     started_at = COALESCE(started_at, clock_timestamp()), updated_at = clock_timestamp()
 WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3
-RETURNING lease_until, attempt`, stored.tenantID, stored.appID, stored.requestID, request.Owner, token, intervalLiteral(request.LeaseDuration)).Scan(&leaseUntil, &stored.attempt)
+  AND status IN ('PENDING', 'RUNNING')
+  AND next_attempt_at <= clock_timestamp()
+  AND (status <> 'RUNNING' OR lease_until <= clock_timestamp())
+  AND attempt < $7
+RETURNING lease_until, attempt`, stored.tenantID, stored.appID, stored.requestID, request.Owner, token, intervalLiteral(request.LeaseDuration), maxExecutionAttempts).Scan(&leaseUntil, &stored.attempt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The eligibility predicate is evaluated with the database clock. Keep
+		// the dispatch pending if the lease/attempt window changed between the
+		// locked read and this UPDATE; the caller will retry with backoff.
+		return queue.Claim{}, false, errors.New("claim execution is not eligible")
+	}
 	if err != nil {
 		return queue.Claim{}, false, fmt.Errorf("claim execution: %w", err)
 	}
@@ -155,6 +186,108 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'RUNNING'
 	return nil
 }
 
+// CompleteUncertain records that an external side effect may have happened.
+// The durable status prevents idempotent re-admission and lease recovery from
+// starting another whole-agent attempt.
+func (s *Store) CompleteUncertain(ctx context.Context, claim queue.Claim, cause error) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := claim.Validate(); err != nil {
+		return err
+	}
+	lastError := platformlog.SafeError(cause)
+	tag, err := s.pool.Exec(ctx, `UPDATE platform.execution
+SET status = 'UNCERTAIN', last_error = $6, lease_owner = NULL, run_token = NULL,
+    lease_until = NULL, finished_at = clock_timestamp(), updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'RUNNING'
+  AND lease_owner = $4 AND run_token = $5 AND lease_until > clock_timestamp()`,
+		claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(),
+		claim.Lease.Owner, claim.Lease.Token, lastError)
+	if err != nil {
+		return fmt.Errorf("complete uncertain execution: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("complete uncertain execution: %w", queue.ErrLeaseLost)
+	}
+	return nil
+}
+
+// WaitForApproval parks a running execution until the exact approval record is
+// decided. If an administrator decided concurrently, it requeues the
+// execution in the same transaction so the next attempt observes that result.
+func (s *Store) WaitForApproval(ctx context.Context, claim queue.Claim, approvalID string) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := claim.Validate(); err != nil {
+		return err
+	}
+	if approvalID == "" {
+		return errors.New("approval_id is required")
+	}
+	jobTenant := claim.Job.Tenant()
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin approval wait: %w", err)
+	}
+	defer func() { rollback(tx) }()
+
+	var requestID, sessionID, configVersion, status string
+	var expired bool
+	err = tx.QueryRow(ctx, `
+SELECT request_id, session_id, config_version, status, expires_at <= clock_timestamp()
+FROM platform.tool_approval
+WHERE tenant_id = $1 AND app_id = $2 AND approval_id = $3
+FOR UPDATE`, jobTenant.TenantID, jobTenant.AppID, approvalID).Scan(
+		&requestID, &sessionID, &configVersion, &status, &expired,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errors.New("approval was not found")
+	}
+	if err != nil {
+		return fmt.Errorf("lock approval for wait: %w", err)
+	}
+	if requestID != claim.Job.RequestID() || sessionID != jobTenant.SessionID || configVersion != jobTenant.ConfigVersion {
+		return errors.New("approval does not match execution scope")
+	}
+
+	if status == "PENDING" && expired {
+		if _, err := tx.Exec(ctx, `UPDATE platform.tool_approval
+SET status='EXPIRED', decided_at=COALESCE(decided_at, clock_timestamp())
+WHERE tenant_id=$1 AND app_id=$2 AND approval_id=$3 AND status='PENDING'`, jobTenant.TenantID, jobTenant.AppID, approvalID); err != nil {
+			return fmt.Errorf("expire approval while waiting: %w", err)
+		}
+		status = "EXPIRED"
+	}
+
+	switch status {
+	case "PENDING":
+		tag, err := tx.Exec(ctx, `UPDATE platform.execution
+SET status='WAITING_APPROVAL', last_error='', lease_owner=NULL, run_token=NULL,
+    lease_until=NULL, updated_at=clock_timestamp()
+WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3 AND status='RUNNING'
+  AND lease_owner=$4 AND run_token=$5 AND lease_until > clock_timestamp()`,
+			jobTenant.TenantID, jobTenant.AppID, claim.Job.RequestID(), claim.Lease.Owner, claim.Lease.Token)
+		if err != nil {
+			return fmt.Errorf("park execution for approval: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("park execution for approval: %w", queue.ErrLeaseLost)
+		}
+	case "APPROVED", "DENIED", "EXPIRED":
+		if err := requeueApprovalExecution(ctx, tx, jobTenant.TenantID, jobTenant.AppID, claim.Job.RequestID(), claim.Lease); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("approval status %q is invalid", status)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit approval wait: %w", err)
+	}
+	return nil
+}
+
 // Retry returns a failed run to PENDING and creates its next dispatch in the
 // same transaction. It terminally fails after a bounded retry count.
 func (s *Store) Retry(ctx context.Context, claim queue.Claim, cause error) error {
@@ -180,7 +313,7 @@ func (s *Store) Retry(ctx context.Context, claim queue.Claim, cause error) error
 	if attempt >= maxExecutionAttempts {
 		_, err = tx.Exec(ctx, `UPDATE platform.execution SET status='FAILED', last_error=$4, lease_owner=NULL, run_token=NULL, lease_until=NULL, finished_at=clock_timestamp(), updated_at=clock_timestamp() WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), platformlog.SafeError(cause))
 	} else {
-		delay := time.Duration(attempt) * time.Second
+		delay := executionRetryDelay(attempt)
 		_, err = tx.Exec(ctx, `UPDATE platform.execution SET status='PENDING', last_error=$4, lease_owner=NULL, run_token=NULL, lease_until=NULL, next_attempt_at=clock_timestamp()+$5::interval, updated_at=clock_timestamp() WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), platformlog.SafeError(cause), intervalLiteral(delay))
 		if err == nil {
 			_, err = tx.Exec(ctx, `INSERT INTO platform.dispatch_outbox (tenant_id, app_id, request_id, next_attempt_at) VALUES ($1,$2,$3,clock_timestamp()+$4::interval)`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), intervalLiteral(delay))
@@ -193,6 +326,22 @@ func (s *Store) Retry(ctx context.Context, claim queue.Claim, cause error) error
 		return fmt.Errorf("commit execution retry: %w", err)
 	}
 	return nil
+}
+
+func executionRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := executionRetryInitial
+	for attempt > 1 && delay < executionRetryMax {
+		delay *= 2
+		attempt--
+	}
+	if delay > executionRetryMax {
+		delay = executionRetryMax
+	}
+	half := delay / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
 }
 
 // ClaimDispatches leases pending outbox rows for a relay process.
@@ -212,11 +361,12 @@ func (s *Store) ClaimDispatches(ctx context.Context, owner string, leaseDuration
 	rows, err := s.pool.Query(ctx, `WITH candidates AS (
  SELECT o.outbox_id, e.trace_parent, e.trace_state
  FROM platform.dispatch_outbox o JOIN platform.execution e USING (tenant_id,app_id,request_id)
- WHERE o.status='PENDING' AND o.next_attempt_at <= clock_timestamp() AND e.status='PENDING'
+ WHERE o.status='PENDING' AND o.next_attempt_at <= clock_timestamp()
+   AND e.status='PENDING' AND e.attempt < $4
  ORDER BY o.outbox_id FOR UPDATE SKIP LOCKED LIMIT $3
 ) UPDATE platform.dispatch_outbox o SET status='PUBLISHING', lease_owner=$1, lease_until=clock_timestamp()+$2::interval, attempt=attempt+1, updated_at=clock_timestamp()
 FROM candidates c WHERE o.outbox_id=c.outbox_id
-RETURNING o.outbox_id,o.tenant_id,o.app_id,o.request_id,c.trace_parent,c.trace_state`, owner, intervalLiteral(leaseDuration), limit)
+RETURNING o.outbox_id,o.tenant_id,o.app_id,o.request_id,c.trace_parent,c.trace_state`, owner, intervalLiteral(leaseDuration), limit, maxExecutionAttempts)
 	if err != nil {
 		return nil, fmt.Errorf("claim dispatch outbox: %w", err)
 	}
@@ -262,12 +412,16 @@ WHERE outbox_id=$1 AND tenant_id=$2 AND app_id=$3 AND request_id=$4`, dispatch.O
 	return nil
 }
 
-// RetryDispatch releases a relay claim so another publisher can retry it.
+// RetryDispatch releases a relay claim so another publisher can retry it with
+// bounded exponential backoff and jitter. attempt is incremented while the
+// row is leased by ClaimDispatches, so no second retry state is required.
 func (s *Store) RetryDispatch(ctx context.Context, dispatch queue.Dispatch, owner string, cause error) error {
 	if err := dispatch.Validate(); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE platform.dispatch_outbox SET status='PENDING', lease_owner=NULL, lease_until=NULL, last_error=$6, next_attempt_at=clock_timestamp()+interval '1 second', updated_at=clock_timestamp() WHERE outbox_id=$1 AND tenant_id=$2 AND app_id=$3 AND request_id=$4 AND status='PUBLISHING' AND lease_owner=$5`, dispatch.OutboxID, dispatch.TenantID, dispatch.AppID, dispatch.RequestID, owner, platformlog.SafeError(cause))
+	tag, err := s.pool.Exec(ctx, `UPDATE platform.dispatch_outbox SET status='PENDING', lease_owner=NULL, lease_until=NULL, last_error=$6,
+next_attempt_at=clock_timestamp()+interval '1 second' * (LEAST(30::double precision, power(2::double precision, LEAST(attempt - 1, 5))) * (0.5 + random())),
+updated_at=clock_timestamp() WHERE outbox_id=$1 AND tenant_id=$2 AND app_id=$3 AND request_id=$4 AND status='PUBLISHING' AND lease_owner=$5`, dispatch.OutboxID, dispatch.TenantID, dispatch.AppID, dispatch.RequestID, owner, platformlog.SafeError(cause))
 	if err != nil {
 		return fmt.Errorf("retry dispatch: %w", err)
 	}
@@ -290,10 +444,23 @@ func (s *Store) RecoverDispatches(ctx context.Context, staleAfter time.Duration)
 		return fmt.Errorf("begin dispatch recovery: %w", err)
 	}
 	defer func() { rollback(tx) }()
-	if _, err = tx.Exec(ctx, `UPDATE platform.execution SET status='PENDING', lease_owner=NULL, run_token=NULL, lease_until=NULL, next_attempt_at=clock_timestamp(), updated_at=clock_timestamp() WHERE status='RUNNING' AND lease_until <= clock_timestamp()`); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE platform.execution
+SET status='UNCERTAIN',
+    last_error='execution lease expired before completion; external side effect status is unknown',
+    lease_owner=NULL, run_token=NULL, lease_until=NULL,
+    finished_at=clock_timestamp(), updated_at=clock_timestamp()
+WHERE status='RUNNING' AND lease_until <= clock_timestamp() AND attempt >= $1`, maxExecutionAttempts); err != nil {
 		return fmt.Errorf("recover expired executions: %w", err)
 	}
-	if _, err = tx.Exec(ctx, `UPDATE platform.dispatch_outbox SET status='PENDING', lease_owner=NULL, lease_until=NULL, next_attempt_at=clock_timestamp(), updated_at=clock_timestamp() WHERE (status='PUBLISHING' AND lease_until <= clock_timestamp()) OR (status='SENT' AND updated_at <= clock_timestamp()-$1::interval)`, intervalLiteral(staleAfter)); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE platform.execution SET status='PENDING', lease_owner=NULL, run_token=NULL, lease_until=NULL, next_attempt_at=clock_timestamp(), updated_at=clock_timestamp() WHERE status='RUNNING' AND lease_until <= clock_timestamp() AND attempt < $1`, maxExecutionAttempts); err != nil {
+		return fmt.Errorf("requeue recoverable executions: %w", err)
+	}
+	if _, err = tx.Exec(ctx, `UPDATE platform.dispatch_outbox o SET status='PENDING', lease_owner=NULL, lease_until=NULL, next_attempt_at=clock_timestamp(), updated_at=clock_timestamp()
+WHERE ((o.status='PUBLISHING' AND o.lease_until <= clock_timestamp())
+    OR (o.status='SENT' AND o.updated_at <= clock_timestamp()-$1::interval))
+  AND EXISTS (SELECT 1 FROM platform.execution e
+              WHERE e.tenant_id=o.tenant_id AND e.app_id=o.app_id
+                AND e.request_id=o.request_id AND e.status='PENDING')`, intervalLiteral(staleAfter)); err != nil {
 		return fmt.Errorf("recover dispatch outbox: %w", err)
 	}
 	if _, err = tx.Exec(ctx, `DELETE FROM platform.dispatch_outbox WHERE status='CONSUMED' AND updated_at <= clock_timestamp() - $1::interval`, intervalLiteral(consumedOutboxRetention)); err != nil {
@@ -323,12 +490,13 @@ type storedExecution struct {
 	traceID, traceParent, traceState, status                          string
 	attempt                                                           int
 	nextAttemptAt, leaseUntil                                         time.Time
+	leaseActive, attemptReady                                         bool
 	hasEarlier                                                        bool
 }
 
 func lockExecutionForClaim(ctx context.Context, tx pgx.Tx, d queue.Dispatch) (storedExecution, bool, error) {
 	var v storedExecution
-	err := tx.QueryRow(ctx, `SELECT e.tenant_id,e.app_id,e.request_id,e.session_principal_id,e.session_id,e.user_id,e.turn_seq,e.config_version,e.tenant_source,e.command,e.trace_id,e.trace_parent,e.trace_state,e.status,e.attempt,e.next_attempt_at,COALESCE(e.lease_until,'epoch'::timestamptz),EXISTS(SELECT 1 FROM platform.execution x WHERE x.tenant_id=e.tenant_id AND x.app_id=e.app_id AND x.session_principal_id=e.session_principal_id AND x.session_id=e.session_id AND x.turn_seq<e.turn_seq AND x.status IN ('PENDING','RUNNING')) FROM platform.execution e JOIN platform.tenant t ON t.tenant_id=e.tenant_id JOIN platform.agent_app a ON a.tenant_id=e.tenant_id AND a.app_id=e.app_id WHERE e.tenant_id=$1 AND e.app_id=$2 AND e.request_id=$3 FOR UPDATE OF e`, d.TenantID, d.AppID, d.RequestID).Scan(&v.tenantID, &v.appID, &v.requestID, &v.sessionPrincipalID, &v.sessionID, &v.userID, &v.turnSeq, &v.configVersion, &v.tenantSource, &v.command, &v.traceID, &v.traceParent, &v.traceState, &v.status, &v.attempt, &v.nextAttemptAt, &v.leaseUntil, &v.hasEarlier)
+	err := tx.QueryRow(ctx, `SELECT e.tenant_id,e.app_id,e.request_id,e.session_principal_id,e.session_id,e.user_id,e.turn_seq,e.config_version,e.tenant_source,e.command,e.trace_id,e.trace_parent,e.trace_state,e.status,e.attempt,e.next_attempt_at,COALESCE(e.lease_until,'epoch'::timestamptz),COALESCE(e.lease_until,'epoch'::timestamptz) > clock_timestamp(),e.next_attempt_at <= clock_timestamp(),EXISTS(SELECT 1 FROM platform.execution x WHERE x.tenant_id=e.tenant_id AND x.app_id=e.app_id AND x.session_principal_id=e.session_principal_id AND x.session_id=e.session_id AND x.turn_seq<e.turn_seq AND x.status IN ('PENDING','RUNNING','WAITING_APPROVAL')) FROM platform.execution e JOIN platform.tenant t ON t.tenant_id=e.tenant_id JOIN platform.agent_app a ON a.tenant_id=e.tenant_id AND a.app_id=e.app_id WHERE e.tenant_id=$1 AND e.app_id=$2 AND e.request_id=$3 FOR UPDATE OF e`, d.TenantID, d.AppID, d.RequestID).Scan(&v.tenantID, &v.appID, &v.requestID, &v.sessionPrincipalID, &v.sessionID, &v.userID, &v.turnSeq, &v.configVersion, &v.tenantSource, &v.command, &v.traceID, &v.traceParent, &v.traceState, &v.status, &v.attempt, &v.nextAttemptAt, &v.leaseUntil, &v.leaseActive, &v.attemptReady, &v.hasEarlier)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return v, false, nil
 	}
@@ -394,13 +562,11 @@ WHERE outbox_id=$1 AND tenant_id=$2 AND app_id=$3 AND request_id=$4`, dispatch.O
 	return nil
 }
 func deferDispatch(ctx context.Context, tx pgx.Tx, d queue.Dispatch, next time.Time) error {
-	if next.Before(time.Now()) {
-		next = time.Now().Add(blockedDispatchDelay)
-	}
 	if err := consumeDispatch(ctx, tx, d); err != nil {
 		return err
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO platform.dispatch_outbox (tenant_id,app_id,request_id,next_attempt_at) VALUES ($1,$2,$3,$4)`, d.TenantID, d.AppID, d.RequestID, next)
+	_, err := tx.Exec(ctx, `INSERT INTO platform.dispatch_outbox (tenant_id,app_id,request_id,next_attempt_at)
+VALUES ($1,$2,$3,CASE WHEN $4 > clock_timestamp() THEN $4 ELSE clock_timestamp()+$5::interval END)`, d.TenantID, d.AppID, d.RequestID, next, intervalLiteral(blockedDispatchDelay))
 	if err != nil {
 		return fmt.Errorf("defer dispatch: %w", err)
 	}
