@@ -3,7 +3,6 @@ kind: ConfigMap
 metadata:
   name: trpc-agent-service-config
 data:
-  TRPC_AGENT_SERVICE_REDIS_URL: redis://redis:6379/0
   TRPC_AGENT_SERVICE_REDIS_STREAM: trpc-agent-service:dispatch
   TRPC_AGENT_SERVICE_REDIS_GROUP: workers
   TRPC_AGENT_SERVICE_OTEL_PROTOCOL: grpc

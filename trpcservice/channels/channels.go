@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -62,6 +63,16 @@ const (
 	BindingSuspended BindingStatus = "SUSPENDED"
 )
 
+// ConnectionStatus describes the latest long-connection observation. It is
+// operational metadata, distinct from the administrative BindingStatus.
+type ConnectionStatus string
+
+const (
+	ConnectionReady    ConnectionStatus = "READY"
+	ConnectionNotReady ConnectionStatus = "NOT_READY"
+	ConnectionDegraded ConnectionStatus = "DEGRADED"
+)
+
 // Binding maps one tenant-owned external IM account to an application.
 type Binding struct {
 	TenantID        string  `json:"tenant_id"`
@@ -74,9 +85,12 @@ type Binding struct {
 	Secret tenant.SecretRef `json:"secret_ref"`
 	// PublicRouteID is retained for the legacy route locator. Long-connection
 	// adapters do not require or use it.
-	PublicRouteID   string        `json:"public_route_id,omitempty"`
-	BindingRevision int64         `json:"binding_revision"`
-	Status          BindingStatus `json:"status"`
+	PublicRouteID    string           `json:"public_route_id,omitempty"`
+	BindingRevision  int64            `json:"binding_revision"`
+	Status           BindingStatus    `json:"status"`
+	ConnectionStatus ConnectionStatus `json:"connection_status"`
+	LastConnectedAt  *time.Time       `json:"last_connected_at,omitempty"`
+	LastError        string           `json:"last_error,omitempty"`
 }
 
 // BindingSnapshot is a value copy of one provider event. Its revision
@@ -176,6 +190,9 @@ func (b Binding) Validate() error {
 	if !validBindingStatus(b.Status) {
 		return errors.New("binding status is invalid")
 	}
+	if b.ConnectionStatus != "" && !validConnectionStatus(b.ConnectionStatus) {
+		return errors.New("connection status is invalid")
+	}
 	return nil
 }
 
@@ -222,4 +239,8 @@ func validChannel(channel Channel) bool {
 
 func validBindingStatus(status BindingStatus) bool {
 	return status == BindingActive || status == BindingSuspended
+}
+
+func validConnectionStatus(status ConnectionStatus) bool {
+	return status == ConnectionReady || status == ConnectionNotReady || status == ConnectionDegraded
 }

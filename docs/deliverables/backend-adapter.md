@@ -52,9 +52,11 @@ AppConfig Knowledge BackendRef
 媒体先写 object，再写 metadata，后续只传 ArtifactRef；Worker 在模型调用前恢复
 内容。
 
-若 metadata 写入失败，立即 best-effort 删除刚写入的精确对象；删除失败记录错误，
-不创建 durable cleanup record。该失败只可能留下 orphan object，不改变 metadata
-授权、版本读取和执行主链。
+若 metadata 写入失败，立即 best-effort 删除刚写入的精确对象；删除失败由
+`platform.artifact` 的 durable cleanup lease/retry 字段接管。后台 Worker 只认领 SQL
+已授权的 tenant/app/session metadata，精确删除记录中的 object key，并在完成时条件
+清除租约；过期对象先撤销 metadata 读取授权。该维护循环不进入请求执行主链，也不
+扫描整个 COS Bucket 推断平台状态。
 
 ## Secret
 

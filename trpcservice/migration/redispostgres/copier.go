@@ -117,7 +117,13 @@ func (s verifiedRedisSource) GetSession(
 ) (*session.Session, error) {
 	value, err := s.Service.GetSession(ctx, key, options...)
 	if err != nil || value != nil {
-		return value, err
+		if err != nil || value == nil {
+			return value, err
+		}
+		if err := s.loadTrackEvents(ctx, key, value); err != nil {
+			return nil, fmt.Errorf("load redis source tracks: %w", err)
+		}
+		return value, nil
 	}
 	values, err := s.ListSessions(ctx, session.UserKey{
 		AppName: key.AppName,
@@ -132,6 +138,38 @@ func (s verifiedRedisSource) GetSession(
 		}
 	}
 	return nil, nil
+}
+
+type redisTrackReader interface {
+	GetTrackEvents(context.Context, session.Key, session.Track, ...session.Option) (*session.TrackEvents, error)
+}
+
+func (s verifiedRedisSource) loadTrackEvents(ctx context.Context, key session.Key, value *session.Session) error {
+	tracks, err := session.TracksFromState(value.State)
+	if err != nil {
+		return err
+	}
+	if len(tracks) == 0 {
+		return nil
+	}
+	reader, ok := s.Service.(redisTrackReader)
+	if !ok {
+		return errors.New("redis source track reader is required")
+	}
+	if value.Tracks == nil {
+		value.Tracks = make(map[session.Track]*session.TrackEvents, len(tracks))
+	}
+	for _, track := range tracks {
+		history, err := reader.GetTrackEvents(ctx, key, track, session.WithEventNum(1<<30))
+		if err != nil {
+			return fmt.Errorf("read track %q: %w", track, err)
+		}
+		if history == nil {
+			history = &session.TrackEvents{Track: track}
+		}
+		value.Tracks[track] = history
+	}
+	return nil
 }
 
 // GetSessionSummaries fails closed because the pinned Redis provider exposes

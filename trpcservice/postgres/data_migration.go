@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
+	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -21,6 +25,9 @@ import (
 func (s *Store) CreateDataMigration(ctx context.Context, record migration.Record) error {
 	if err := s.validate(); err != nil {
 		return err
+	}
+	if record.Domain == "" {
+		record.Domain = migration.DomainSession
 	}
 	if err := record.Validate(); err != nil {
 		return err
@@ -48,27 +55,44 @@ func (s *Store) CreateDataMigration(ctx context.Context, record migration.Record
 	if err != nil {
 		return err
 	}
-	if sameAuthoritativeBackends(source.BackendConfig, target.BackendConfig) {
-		return errors.New("data migration target does not change authoritative backends")
-	}
-	if err := validateSupportedDataMigration(source.BackendConfig, target.BackendConfig); err != nil {
-		return err
+	switch record.EffectiveDomain() {
+	case migration.DomainSession:
+		if sameAuthoritativeBackends(source.BackendConfig, target.BackendConfig) {
+			return errors.New("data migration target does not change authoritative backends")
+		}
+		if err := validateSupportedDataMigration(source.BackendConfig, target.BackendConfig); err != nil {
+			return err
+		}
+	case migration.DomainKnowledge:
+		if sameBackendRef(source.BackendConfig.Knowledge, target.BackendConfig.Knowledge) {
+			return errors.New("knowledge migration target does not change the knowledge backend")
+		}
+		if err := validateSupportedKnowledgeMigration(source.BackendConfig, target.BackendConfig); err != nil {
+			return err
+		}
 	}
 	if !sameMigrationBehavior(source, target) {
 		return errors.New("data migration target changes behavior outside backend_config")
 	}
 	if _, err := tx.Exec(ctx, `
 INSERT INTO platform.data_migration (
-    migration_id, tenant_id, app_id, source_config_version, target_config_version, status
-) VALUES ($1, $2, $3, $4, $5, $6)`,
+    migration_id, tenant_id, app_id, domain, source_config_version, target_config_version, status
+) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		record.ID,
 		record.TenantID,
 		record.AppID,
+		record.Domain,
 		record.SourceConfigVersion,
 		record.TargetConfigVersion,
 		record.Status,
 	); err != nil {
 		return fmt.Errorf("insert data migration: %w", err)
+	}
+	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
+		record.TenantID, record.AppID, record.SourceConfigVersion,
+		platformaudit.MigrationCreated, "created",
+	)); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit data migration: %w", err)
@@ -113,14 +137,17 @@ SET status = 'DRAINING', lease_owner = $4, lease_until = clock_timestamp() + $5:
     run_token = $6, drain_deadline = $7, updated_at = clock_timestamp()
 WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3 AND status = 'PENDING'
   AND source_config_version = $8
-RETURNING migration_id, tenant_id, app_id, source_config_version, target_config_version,
-          status, lease_owner, lease_until, run_token, drain_deadline,
-          failure_reason`,
+	RETURNING migration_id, tenant_id, app_id, domain, source_config_version, target_config_version,
+		  status, lease_owner, lease_until, run_token, drain_deadline,
+          failure_reason, total_sessions, copy_progress, verify_progress,
+          success_count, last_checkpoint_at, last_failure_stage,
+          created_at, updated_at`,
 		migrationID, tenantID, appID, owner, intervalLiteral(leaseDuration), token, drainDeadline.UTC(), app.ActiveConfigVersion,
 	).Scan(
 		&record.ID,
 		&record.TenantID,
 		&record.AppID,
+		&record.Domain,
 		&record.SourceConfigVersion,
 		&record.TargetConfigVersion,
 		&record.Status,
@@ -129,6 +156,14 @@ RETURNING migration_id, tenant_id, app_id, source_config_version, target_config_
 		&record.RunToken,
 		&record.DrainDeadline,
 		&record.FailureReason,
+		&record.TotalSessions,
+		&record.CopyProgress,
+		&record.VerifyProgress,
+		&record.SuccessCount,
+		&record.LastCheckpointAt,
+		&record.LastFailureStage,
+		&record.CreatedAt,
+		&record.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return migration.Record{}, fmt.Errorf("begin data migration: %w", ErrNotFound)
@@ -139,8 +174,93 @@ RETURNING migration_id, tenant_id, app_id, source_config_version, target_config_
 	if err := record.Validate(); err != nil {
 		return migration.Record{}, fmt.Errorf("started data migration: %w", err)
 	}
+	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
+		record.TenantID, record.AppID, record.SourceConfigVersion,
+		platformaudit.MigrationStarted, "started",
+	)); err != nil {
+		return migration.Record{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return migration.Record{}, fmt.Errorf("commit data migration drain: %w", err)
+	}
+	return record, nil
+}
+
+// BeginDataMigrationControlPlane enters DRAINING without assigning a worker
+// lease. The worker runtime claims the unleased active record atomically after
+// the admission gate is durable. This keeps the Admin API from inventing a
+// worker identity or holding a fencing token it cannot renew.
+func (s *Store) BeginDataMigrationControlPlane(
+	ctx context.Context,
+	tenantID, appID, migrationID string,
+	drainDeadline time.Time,
+) (migration.Record, error) {
+	if err := s.validate(); err != nil {
+		return migration.Record{}, err
+	}
+	if tenantID == "" || appID == "" || migrationID == "" {
+		return migration.Record{}, errors.New("data migration scope and id are required")
+	}
+	if !drainDeadline.After(time.Now()) {
+		return migration.Record{}, errors.New("data migration drain deadline must be in the future")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return migration.Record{}, fmt.Errorf("begin data migration control-plane drain: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	app, err := lockAgentApp(ctx, tx, tenantID, appID)
+	if err != nil {
+		return migration.Record{}, err
+	}
+	var record migration.Record
+	err = tx.QueryRow(ctx, `
+UPDATE platform.data_migration
+SET status = 'DRAINING', lease_owner = NULL, lease_until = NULL, run_token = NULL,
+    drain_deadline = $4, updated_at = clock_timestamp()
+WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3 AND status = 'PENDING'
+  AND source_config_version = $5
+	RETURNING migration_id, tenant_id, app_id, domain, source_config_version, target_config_version,
+		  status, drain_deadline, failure_reason, total_sessions, copy_progress,
+          verify_progress, success_count, last_checkpoint_at, last_failure_stage,
+          created_at, updated_at`,
+		migrationID, tenantID, appID, drainDeadline.UTC(), app.ActiveConfigVersion,
+	).Scan(
+		&record.ID,
+		&record.TenantID,
+		&record.AppID,
+		&record.Domain,
+		&record.SourceConfigVersion,
+		&record.TargetConfigVersion,
+		&record.Status,
+		&record.DrainDeadline,
+		&record.FailureReason,
+		&record.TotalSessions,
+		&record.CopyProgress,
+		&record.VerifyProgress,
+		&record.SuccessCount,
+		&record.LastCheckpointAt,
+		&record.LastFailureStage,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return migration.Record{}, fmt.Errorf("begin data migration: %w", ErrNotFound)
+	}
+	if err != nil {
+		return migration.Record{}, fmt.Errorf("begin data migration control-plane drain: %w", err)
+	}
+	if err := record.Validate(); err != nil {
+		return migration.Record{}, fmt.Errorf("started data migration: %w", err)
+	}
+	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
+		record.TenantID, record.AppID, record.SourceConfigVersion,
+		platformaudit.MigrationStarted, "started",
+	)); err != nil {
+		return migration.Record{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return migration.Record{}, fmt.Errorf("commit data migration control-plane drain: %w", err)
 	}
 	return record, nil
 }
@@ -159,9 +279,11 @@ func (s *Store) ListOwnedDataMigrations(
 		return nil, errors.New("data migration owner is required")
 	}
 	rows, err := s.pool.Query(ctx, `
-SELECT migration_id, tenant_id, app_id, source_config_version, target_config_version,
-       status, lease_owner, lease_until, run_token, drain_deadline,
-       failure_reason
+SELECT migration_id, tenant_id, app_id, domain, source_config_version, target_config_version,
+	       status, lease_owner, lease_until, run_token, drain_deadline,
+       failure_reason, total_sessions, copy_progress, verify_progress,
+       success_count, last_checkpoint_at, last_failure_stage,
+       created_at, updated_at
 FROM platform.data_migration
 WHERE lease_owner = $1
   AND status IN ('DRAINING', 'COPYING', 'VERIFYING')
@@ -216,10 +338,13 @@ SET lease_owner = $1,
     updated_at = clock_timestamp()
 FROM candidate
 WHERE migration.migration_id = candidate.migration_id
-RETURNING migration.migration_id, migration.tenant_id, migration.app_id,
-          migration.source_config_version, migration.target_config_version,
+	RETURNING migration.migration_id, migration.tenant_id, migration.app_id,
+		  migration.domain, migration.source_config_version, migration.target_config_version,
           migration.status, migration.lease_owner, migration.lease_until,
-          migration.run_token, migration.drain_deadline, migration.failure_reason`, owner, intervalLiteral(leaseDuration), token)
+          migration.run_token, migration.drain_deadline, migration.failure_reason,
+          migration.total_sessions, migration.copy_progress, migration.verify_progress,
+          migration.success_count, migration.last_checkpoint_at, migration.last_failure_stage,
+          migration.created_at, migration.updated_at`, owner, intervalLiteral(leaseDuration), token)
 	record, err = scanDataMigrationRecord(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return migration.Record{}, false, nil
@@ -263,6 +388,57 @@ RETURNING lease_until`,
 	}
 	record.LeaseUntil = until.UTC()
 	return record, nil
+}
+
+// UpdateDataMigrationCheckpoint persists resumable copy/verify progress under
+// the current lease. A stale worker cannot overwrite its successor's progress.
+func (s *Store) UpdateDataMigrationCheckpoint(ctx context.Context, record migration.Record) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	if record.IsTerminal() || record.LeaseOwner == "" {
+		return errors.New("data migration checkpoint lease is invalid")
+	}
+	failureReason := ""
+	if record.FailureReason != "" {
+		failureReason = platformlog.SafeError(errors.New(record.FailureReason))
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE platform.data_migration
+SET total_sessions = $7,
+    copy_progress = $8,
+    verify_progress = $9,
+    success_count = $10,
+    last_checkpoint_at = clock_timestamp(),
+    last_failure_stage = CASE WHEN $11 <> '' THEN $11 ELSE last_failure_stage END,
+    failure_reason = CASE WHEN $12 <> '' THEN $12 ELSE failure_reason END,
+    updated_at = clock_timestamp()
+WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3
+  AND status = $4 AND lease_owner = $5 AND run_token = $6
+  AND lease_until > clock_timestamp()`,
+		record.ID,
+		record.TenantID,
+		record.AppID,
+		record.Status,
+		record.LeaseOwner,
+		record.RunToken,
+		record.TotalSessions,
+		record.CopyProgress,
+		record.VerifyProgress,
+		record.SuccessCount,
+		record.LastFailureStage,
+		failureReason,
+	)
+	if err != nil {
+		return fmt.Errorf("update data migration checkpoint: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("update data migration checkpoint: %w", migration.ErrLeaseLost)
+	}
+	return nil
 }
 
 // AdvanceDataMigration changes the current lease owner's state. Succeeding a
@@ -327,6 +503,19 @@ WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("advance data migration: %w", migration.ErrLeaseLost)
 	}
+	if next == migration.StatusSucceeded || next == migration.StatusFailed {
+		eventType := platformaudit.MigrationSucceeded
+		decision := "succeeded"
+		if next == migration.StatusFailed {
+			eventType = platformaudit.MigrationFailed
+			decision = "failed"
+		}
+		if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
+			record.TenantID, record.AppID, record.TargetConfigVersion, eventType, decision,
+		)); err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit data migration transition: %w", err)
 	}
@@ -373,26 +562,126 @@ ORDER BY session_principal_id, session_id`, record.TenantID, record.AppID)
 	return keys, nil
 }
 
+// ListKnowledgeMigrationChunks returns the SQL-authorized source inventory for
+// a Knowledge migration. Qdrant is never scanned to discover tenant ownership;
+// every returned identity is bound to the source immutable config version.
+func (s *Store) ListKnowledgeMigrationChunks(
+	ctx context.Context,
+	record migration.Record,
+) ([]platformknowledge.ChunkRef, error) {
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	if err := record.Validate(); err != nil {
+		return nil, err
+	}
+	if record.EffectiveDomain() != migration.DomainKnowledge {
+		return nil, errors.New("knowledge migration domain is required")
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT chunk.knowledge_base_id, chunk.document_id, chunk.document_version,
+       chunk.index_generation, chunk.chunk_id
+FROM platform.knowledge_chunk AS chunk
+JOIN platform.knowledge_document AS document
+  ON document.tenant_id = chunk.tenant_id
+ AND document.app_id = chunk.app_id
+ AND document.knowledge_base_id = chunk.knowledge_base_id
+ AND document.document_id = chunk.document_id
+ AND document.version = chunk.document_version
+JOIN platform.knowledge_base AS base
+  ON base.tenant_id = chunk.tenant_id
+ AND base.app_id = chunk.app_id
+ AND base.knowledge_base_id = chunk.knowledge_base_id
+JOIN platform.app_config_version AS config
+  ON config.tenant_id = chunk.tenant_id
+ AND config.app_id = chunk.app_id
+ AND config.version = $3
+ AND config.status = 'PUBLISHED'
+ AND config.knowledge_base_ids @> jsonb_build_array(chunk.knowledge_base_id)
+WHERE chunk.tenant_id = $1
+  AND chunk.app_id = $2
+  AND chunk.status = 'AVAILABLE'
+  AND document.status = 'AVAILABLE'
+  AND base.status = 'ACTIVE'
+  AND chunk.index_generation = config.backend_config #>> '{knowledge,options,index_generation}'
+ORDER BY chunk.knowledge_base_id, chunk.document_id, chunk.document_version,
+         chunk.index_generation, chunk.chunk_id`,
+		record.TenantID, record.AppID, record.SourceConfigVersion)
+	if err != nil {
+		return nil, fmt.Errorf("list knowledge migration chunks: %w", err)
+	}
+	defer rows.Close()
+
+	refs := make([]platformknowledge.ChunkRef, 0)
+	for rows.Next() {
+		var baseID, documentID, generation, chunkID string
+		var documentVersion int64
+		if err := rows.Scan(&baseID, &documentID, &documentVersion, &generation, &chunkID); err != nil {
+			return nil, fmt.Errorf("scan knowledge migration chunk: %w", err)
+		}
+		ref := platformknowledge.ChunkRef{
+			Scope:           tenant.Scope{TenantID: record.TenantID, AppID: record.AppID},
+			ConfigVersion:   record.SourceConfigVersion,
+			KnowledgeBaseID: baseID,
+			DocumentID:      documentID,
+			DocumentVersion: strconv.FormatInt(documentVersion, 10),
+			ChunkID:         chunkID,
+			IndexGeneration: generation,
+		}
+		if err := ref.Validate(); err != nil {
+			return nil, fmt.Errorf("validate knowledge migration chunk: %w", err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate knowledge migration chunks: %w", err)
+	}
+	return refs, nil
+}
+
 type dataMigrationScanner interface {
 	Scan(...any) error
 }
 
 func scanDataMigrationRecord(scanner dataMigrationScanner) (migration.Record, error) {
 	var record migration.Record
+	var leaseOwner, runToken pgtype.Text
+	var leaseUntil, drainDeadline pgtype.Timestamptz
 	if err := scanner.Scan(
 		&record.ID,
 		&record.TenantID,
 		&record.AppID,
+		&record.Domain,
 		&record.SourceConfigVersion,
 		&record.TargetConfigVersion,
 		&record.Status,
-		&record.LeaseOwner,
-		&record.LeaseUntil,
-		&record.RunToken,
-		&record.DrainDeadline,
+		&leaseOwner,
+		&leaseUntil,
+		&runToken,
+		&drainDeadline,
 		&record.FailureReason,
+		&record.TotalSessions,
+		&record.CopyProgress,
+		&record.VerifyProgress,
+		&record.SuccessCount,
+		&record.LastCheckpointAt,
+		&record.LastFailureStage,
+		&record.CreatedAt,
+		&record.UpdatedAt,
 	); err != nil {
 		return migration.Record{}, err
+	}
+	if leaseOwner.Valid {
+		record.LeaseOwner = leaseOwner.String
+	}
+	if leaseUntil.Valid {
+		record.LeaseUntil = leaseUntil.Time.UTC()
+	}
+	if runToken.Valid {
+		record.RunToken = runToken.String
+	}
+	if drainDeadline.Valid {
+		record.DrainDeadline = drainDeadline.Time.UTC()
 	}
 	if err := record.Validate(); err != nil {
 		return migration.Record{}, fmt.Errorf("read data migration: %w", err)
@@ -470,6 +759,37 @@ func validateSupportedDataMigration(source, target tenant.BackendConfig) error {
 	}
 	if target.Session.Kind != tenant.BackendSQL || target.Session.Provider != "postgres" {
 		return errors.New("data migration target session backend must use postgres")
+	}
+	return nil
+}
+
+// validateSupportedKnowledgeMigration only transfers vectors with the same
+// dimensional and index-generation contract. Re-embedding is a separate
+// ingestion concern and must not be silently approximated by copying bytes.
+func validateSupportedKnowledgeMigration(source, target tenant.BackendConfig) error {
+	if !sameAuthoritativeBackends(source, target) {
+		return errors.New("knowledge migration only supports knowledge backend changes")
+	}
+	for label, ref := range map[string]tenant.BackendRef{
+		"source": source.Knowledge,
+		"target": target.Knowledge,
+	} {
+		if ref.Kind != tenant.BackendVector || ref.Provider != "qdrant" {
+			return fmt.Errorf("knowledge migration %s backend must use qdrant vector storage", label)
+		}
+		if ref.Options["embedding_model"] == "" || ref.Options["embedding_profile"] == "" ||
+			ref.Options["index_generation"] == "" {
+			return fmt.Errorf("knowledge migration %s backend settings are incomplete", label)
+		}
+		if dimensions, err := strconv.Atoi(ref.Options["embedding_dimensions"]); err != nil || dimensions <= 0 {
+			return fmt.Errorf("knowledge migration %s embedding dimensions are invalid", label)
+		}
+	}
+	if source.Knowledge.Options["embedding_dimensions"] != target.Knowledge.Options["embedding_dimensions"] {
+		return errors.New("knowledge migration source and target dimensions must match")
+	}
+	if source.Knowledge.Options["index_generation"] != target.Knowledge.Options["index_generation"] {
+		return errors.New("knowledge migration source and target index generations must match")
 	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 	frameworktodo "trpc.group/trpc-go/trpc-agent-go/tool/todo"
@@ -44,16 +45,29 @@ func (c *ToolCatalog) ResolveTools(ctx context.Context, exec worker.Execution) (
 }
 
 // ValidateToolPolicy checks names supported by the deployed runtime.
-func (*ToolCatalog) ValidateToolPolicy(_ context.Context, policy tenant.ToolPolicy) error {
+func (c *ToolCatalog) ValidateToolPolicy(_ context.Context, policy tenant.ToolPolicy) error {
 	if err := policy.Validate(); err != nil {
 		return err
 	}
 	for _, name := range runtimeToolNames(policy) {
-		if name != frameworktodo.DefaultToolName {
+		if _, ok := c.Safety(name); !ok {
 			return fmt.Errorf("unsupported runtime tool %q", name)
 		}
 	}
 	return nil
+}
+
+// Safety returns the immutable external-side-effect contract for a deployed
+// runtime tool. Unknown tools are never assigned a permissive default.
+func (*ToolCatalog) Safety(name string) (platformtool.Safety, bool) {
+	switch name {
+	case frameworktodo.DefaultToolName:
+		// todo_write replaces session state with the supplied list. Repeating
+		// the same call is therefore safe at the provider boundary.
+		return platformtool.SafetyIdempotent, true
+	default:
+		return "", false
+	}
 }
 
 func runtimeToolNames(policy tenant.ToolPolicy) []string {

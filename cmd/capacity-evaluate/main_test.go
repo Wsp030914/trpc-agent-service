@@ -25,6 +25,34 @@ func TestCapacityOptionsRequireFiniteRun(t *testing.T) {
 	}
 }
 
+func TestCapacityOptionsRequireAPIKeyWhenRequested(t *testing.T) {
+	values := options{
+		endpoint:      "http://localhost",
+		concurrency:   1,
+		requests:      1,
+		maxErrorRate:  0.05,
+		requireAPIKey: true,
+		payload:       defaultCapacityPayload,
+		timeout:       time.Second,
+		sessionPrefix: "session",
+	}
+	if err := validateOptions(values); err == nil {
+		t.Fatal("empty required API key was accepted")
+	}
+}
+
+func TestBuildReportRecordsCapacitySuccessCriteria(t *testing.T) {
+	result := buildReport(options{concurrency: 1, requests: 10, maxErrorRate: 0.1}, time.Second, 9, 1, nil)
+	if result.ErrorRate != 0.1 || !result.SuccessCriteria {
+		t.Fatalf("report = %#v", result)
+	}
+
+	result = buildReport(options{concurrency: 1, requests: 10, maxErrorRate: 0.1}, time.Second, 8, 2, nil)
+	if result.ErrorRate != 0.2 || result.SuccessCriteria {
+		t.Fatalf("failed report = %#v", result)
+	}
+}
+
 func TestCapacityOptionsRejectEndpointCredentials(t *testing.T) {
 	for _, endpoint := range []string{
 		"https://user:password@example.test/chat",

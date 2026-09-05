@@ -1,3 +1,5 @@
+//go:build integration
+
 package postgres_test
 
 import (
@@ -399,13 +401,13 @@ func seedIdentityMappingBinding(
 ) channels.Binding {
 	t.Helper()
 	binding := channels.Binding{
-		TenantID:             scope.TenantID,
-		AppID:                scope.AppID,
-		BindingID:            bindingID,
-		Channel:              channel,
-		ExternalAccount:      bindingID + "-account",
-		Secret:               tenant.SecretRef{Name: bindingID + "-secret", Version: "1"},
-		Status:               channels.BindingActive,
+		TenantID:        scope.TenantID,
+		AppID:           scope.AppID,
+		BindingID:       bindingID,
+		Channel:         channel,
+		ExternalAccount: bindingID + "-account",
+		Secret:          tenant.SecretRef{Name: bindingID + "-secret", Version: "1"},
+		Status:          channels.BindingActive,
 	}
 	publicRouteID, err := channels.NewPublicRouteID()
 	if err != nil {

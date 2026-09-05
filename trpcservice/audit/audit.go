@@ -30,6 +30,22 @@ const (
 	ApprovalApproved = "approval_approved"
 	ApprovalDenied   = "approval_denied"
 	ApprovalExpired  = "approval_expired"
+
+	AuditQueryRead         = "audit_query_read"
+	ConfigActivated        = "config_activated"
+	ConfigCanaryEnabled    = "config_canary_enabled"
+	ConfigCanaryPaused     = "config_canary_paused"
+	ConfigCanaryDisabled   = "config_canary_disabled"
+	ConfigCanaryPromoted   = "config_canary_promoted"
+	ConfigCanaryRolledBack = "config_canary_rolled_back"
+	ChannelEnabled         = "channel_enabled"
+	ChannelSuspended       = "channel_suspended"
+	MigrationCreated       = "migration_created"
+	MigrationStarted       = "migration_started"
+	MigrationSucceeded     = "migration_succeeded"
+	MigrationFailed        = "migration_failed"
+	CredentialIssued       = "credential_issued"
+	CredentialRevoked      = "credential_revoked"
 )
 
 // Sink is the best-effort audit persistence boundary. Implementations must
@@ -41,25 +57,31 @@ type Sink interface {
 // Event is the complete audit record. It deliberately has no raw request,
 // message, tool argument, provider target, secret, or artifact fields.
 type Event struct {
-	TenantID      string        `json:"tenant_id"`
-	AppID         string        `json:"app_id"`
-	Channel       string        `json:"channel"`
-	UserID        string        `json:"user_id"`
-	SessionID     string        `json:"session_id"`
-	AgentName     string        `json:"agent_name"`
-	ToolName      string        `json:"tool_name"`
-	Decision      string        `json:"decision"`
-	Latency       time.Duration `json:"latency"`
-	ErrorType     string        `json:"error_type"`
-	Cost          *float64      `json:"cost,omitempty"`
-	InputTokens   int           `json:"input_tokens"`
-	OutputTokens  int           `json:"output_tokens"`
-	TotalTokens   int           `json:"total_tokens"`
-	TraceID       string        `json:"trace_id"`
-	RequestID     string        `json:"request_id"`
-	ConfigVersion string        `json:"config_version"`
-	EventType     string        `json:"event_type"`
-	CreatedAt     time.Time     `json:"created_at"`
+	TenantID          string        `json:"tenant_id"`
+	AppID             string        `json:"app_id"`
+	ActorID           string        `json:"actor_id,omitempty"`
+	ActorRole         string        `json:"actor_role,omitempty"`
+	RequestedTenantID string        `json:"requested_tenant_id,omitempty"`
+	RequestedAppID    string        `json:"requested_app_id,omitempty"`
+	QueryDigest       string        `json:"query_digest,omitempty"`
+	ResultCount       int           `json:"result_count,omitempty"`
+	Channel           string        `json:"channel"`
+	UserID            string        `json:"user_id"`
+	SessionID         string        `json:"session_id"`
+	AgentName         string        `json:"agent_name"`
+	ToolName          string        `json:"tool_name"`
+	Decision          string        `json:"decision"`
+	Latency           time.Duration `json:"latency"`
+	ErrorType         string        `json:"error_type"`
+	Cost              *float64      `json:"cost,omitempty"`
+	InputTokens       int           `json:"input_tokens"`
+	OutputTokens      int           `json:"output_tokens"`
+	TotalTokens       int           `json:"total_tokens"`
+	TraceID           string        `json:"trace_id"`
+	RequestID         string        `json:"request_id"`
+	ConfigVersion     string        `json:"config_version"`
+	EventType         string        `json:"event_type"`
+	CreatedAt         time.Time     `json:"created_at"`
 }
 
 // Query selects metadata-only events from one exact tenant/application scope.
@@ -69,8 +91,10 @@ type Query struct {
 	TenantID      string
 	AppID         string
 	EventType     string
+	ToolName      string
 	TraceID       string
 	Limit         int
+	Offset        int
 	CreatedAfter  *time.Time
 	CreatedBefore *time.Time
 }
@@ -99,6 +123,9 @@ func RedactString(value string) string {
 // RedactEvent returns an audit event with user-controlled identity metadata
 // redacted. Prompts and raw tool arguments are not part of Event.
 func RedactEvent(e Event) Event {
+	e.ActorID = RedactString(e.ActorID)
+	e.RequestedTenantID = RedactString(e.RequestedTenantID)
+	e.RequestedAppID = RedactString(e.RequestedAppID)
 	e.UserID = RedactString(e.UserID)
 	e.SessionID = RedactString(e.SessionID)
 	e.AgentName = RedactString(e.AgentName)
@@ -113,6 +140,9 @@ func (q Query) Validate() error {
 	}
 	if q.Limit < 0 || q.Limit > 1000 {
 		return errors.New("audit limit is invalid")
+	}
+	if q.Offset < 0 || q.Offset > 1_000_000 {
+		return errors.New("audit offset is invalid")
 	}
 	if q.CreatedAfter != nil && q.CreatedBefore != nil && q.CreatedAfter.After(*q.CreatedBefore) {
 		return errors.New("audit created_after must not be after created_before")
@@ -139,6 +169,9 @@ func (e Event) Validate() error {
 	}
 	if e.InputTokens < 0 || e.OutputTokens < 0 || e.TotalTokens < 0 {
 		return errors.New("token usage must be non-negative")
+	}
+	if e.ResultCount < 0 {
+		return errors.New("result count must be non-negative")
 	}
 	if e.Cost != nil && (*e.Cost < 0 || math.IsNaN(*e.Cost) || math.IsInf(*e.Cost, 0)) {
 		return errors.New("cost must be a finite non-negative value")

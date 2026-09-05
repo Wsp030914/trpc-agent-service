@@ -169,6 +169,49 @@ func (r *Resolver) ResolveInboundStore(
 	return &InboundObjectStore{client: client, prefix: prefix}, nil
 }
 
+// DeleteExactObject deletes one SQL-authorized object using the immutable
+// artifact backend selected by configVersion. The object key is never used to
+// derive tenant scope or to discover platform state.
+func (r *Resolver) DeleteExactObject(
+	ctx context.Context,
+	scope tenant.Scope,
+	configVersion string,
+	ref tenant.BackendRef,
+	objectKey string,
+) error {
+	if r == nil || r.secrets == nil || r.endpoints == nil {
+		return errors.New("cos artifact resolver is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := scope.Validate(); err != nil {
+		return err
+	}
+	if configVersion == "" {
+		return errors.New("artifact config version is required")
+	}
+	if objectKey == "" {
+		return errors.New("artifact object key is required")
+	}
+	endpoint, err := r.resolveEndpoint(ctx, ref)
+	if err != nil {
+		return err
+	}
+	serviceKey, err := artifactServiceKey(scope, configVersion, ref, endpoint)
+	if err != nil {
+		return err
+	}
+	client, err := r.resolveClient(ctx, scope, ref, endpoint, serviceKey)
+	if err != nil {
+		return err
+	}
+	if _, err := client.Object.Delete(ctx, objectKey); err != nil && !cosclient.IsNotFoundError(err) {
+		return fmt.Errorf("delete cos artifact object: %w", err)
+	}
+	return nil
+}
+
 func (r *Resolver) resolveEndpoint(ctx context.Context, ref tenant.BackendRef) (string, error) {
 	if err := ValidateBackend(ref); err != nil {
 		return "", err

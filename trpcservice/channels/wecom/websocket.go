@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -295,10 +297,64 @@ func (c *WebSocketClient) runConnection(ctx context.Context, conn *websocket.Con
 		}
 		if c.config.handler != nil {
 			if err := c.config.handler(ctx, message); err != nil && c.config.onError != nil {
-				c.config.onError(err)
+				c.config.onError(fmt.Errorf("%w (wecom frame shape: %s)", err, safeMessageShape(frame.Cmd, frame.Body)))
 			}
 		}
 	}
+}
+
+// safeMessageShape returns protocol structure only. It intentionally omits
+// all values because message bodies may contain credentials, URLs, IDs, or
+// encrypted media keys. It is used to diagnose provider payload mismatches
+// without turning provider traffic into application logs.
+func safeMessageShape(cmd string, body []byte) string {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
+		return fmt.Sprintf("cmd=%s body=invalid-json", cmd)
+	}
+
+	parts := []string{
+		"cmd=" + cmd,
+		"top_keys=" + sortedJSONKeys(fields),
+	}
+	for _, field := range []string{"from", "file", "image", "text", "mixed", "stream", "event"} {
+		value, ok := fields[field]
+		if !ok {
+			continue
+		}
+		parts = append(parts, field+"="+safeJSONValueShape(value))
+	}
+	return strings.Join(parts, " ")
+}
+
+func safeJSONValueShape(value json.RawMessage) string {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(value, &object); err == nil && object != nil {
+		return "object_keys=" + sortedJSONKeys(object)
+	}
+	trimmed := strings.TrimSpace(string(value))
+	if len(trimmed) == 0 {
+		return "empty"
+	}
+	switch trimmed[0] {
+	case '[':
+		return "array"
+	case '"':
+		return "string"
+	case 'n':
+		return "null"
+	default:
+		return "scalar"
+	}
+}
+
+func sortedJSONKeys(fields map[string]json.RawMessage) string {
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }
 
 func (c *WebSocketClient) heartbeat(ctx context.Context, conn *websocket.Conn, done chan<- struct{}) {

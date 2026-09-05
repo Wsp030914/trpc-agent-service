@@ -449,6 +449,13 @@ func (s *ReplySender) recordFailure(
 		if err := s.outbox.RetryReply(ctx, delivery, errorType, delay, cause); err != nil {
 			return fmt.Errorf("retry reply: %w", err)
 		}
+		if s.metrics != nil {
+			s.metrics.RecordRetry(ctx, platformmetrics.Labels{
+				TenantID: delivery.Reply.TenantID,
+				AppID:    delivery.Reply.AppID,
+				Channel:  string(delivery.Reply.Channel),
+			}, "reply_"+errorType)
+		}
 		return nil
 	}
 	if err := s.outbox.FailReply(ctx, delivery, errorType, cause); err != nil {

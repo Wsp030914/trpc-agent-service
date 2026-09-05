@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,6 +29,8 @@ type options struct {
 	requests      int
 	duration      time.Duration
 	apiKey        string
+	requireAPIKey bool
+	maxErrorRate  float64
 	payload       string
 	timeout       time.Duration
 	sessionPrefix string
@@ -41,6 +44,9 @@ type report struct {
 	TotalRequests   int64   `json:"total_requests"`
 	Success         int64   `json:"success"`
 	Failure         int64   `json:"failure"`
+	ErrorRate       float64 `json:"error_rate"`
+	MaxErrorRate    float64 `json:"max_error_rate"`
+	SuccessCriteria bool    `json:"success_criteria_passed"`
 	Throughput      float64 `json:"throughput_requests_per_second"`
 	MinLatencyMS    float64 `json:"latency_min_ms"`
 	P50LatencyMS    float64 `json:"latency_p50_ms"`
@@ -64,6 +70,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if !result.SuccessCriteria {
+		fmt.Fprintf(os.Stderr, "capacity success criteria failed: total_requests=%d error_rate=%.4f max_error_rate=%.4f\n", result.TotalRequests, result.ErrorRate, result.MaxErrorRate)
+		os.Exit(1)
+	}
 }
 
 func parseOptions(args []string, getenv func(string) string) (options, error) {
@@ -78,6 +88,8 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	flags.IntVar(&values.requests, "requests", 100, "number of requests; use 0 with duration for an open run")
 	flags.DurationVar(&values.duration, "duration", 0, "optional run duration, for example 2m")
 	flags.StringVar(&values.apiKey, "api-key", getenv("TRPC_AGENT_SERVICE_CAPACITY_API_KEY"), "Bearer API key")
+	flags.BoolVar(&values.requireAPIKey, "require-api-key", false, "fail when the API key is empty")
+	flags.Float64Var(&values.maxErrorRate, "max-error-rate", 0.05, "maximum allowed fraction of failed requests")
 	flags.StringVar(&values.payload, "payload", defaultCapacityPayload, "JSON request payload")
 	flags.DurationVar(&values.timeout, "timeout", 2*time.Minute, "per-request timeout")
 	flags.StringVar(&values.sessionPrefix, "session-prefix", "capacity-session", "prefix for generated session IDs")
@@ -121,6 +133,12 @@ func validateOptions(values options) error {
 	}
 	if values.timeout <= 0 {
 		return errors.New("timeout must be positive")
+	}
+	if math.IsNaN(values.maxErrorRate) || values.maxErrorRate < 0 || values.maxErrorRate > 1 {
+		return errors.New("max-error-rate must be between 0 and 1")
+	}
+	if values.requireAPIKey && strings.TrimSpace(values.apiKey) == "" {
+		return errors.New("api-key is required")
 	}
 	if strings.TrimSpace(values.sessionPrefix) == "" {
 		return errors.New("session-prefix is required")
@@ -228,7 +246,12 @@ func buildReport(values options, elapsed time.Duration, success, failure int64, 
 		TotalRequests:   total,
 		Success:         success,
 		Failure:         failure,
+		MaxErrorRate:    values.maxErrorRate,
 	}
+	if total > 0 {
+		result.ErrorRate = float64(failure) / float64(total)
+	}
+	result.SuccessCriteria = total > 0 && result.ErrorRate <= values.maxErrorRate
 	if elapsed > 0 {
 		result.Throughput = float64(total) / elapsed.Seconds()
 	}

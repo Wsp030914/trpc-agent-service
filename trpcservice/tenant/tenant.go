@@ -24,6 +24,17 @@ const (
 	StatusSuspended Status = "SUSPENDED"
 )
 
+// CanaryStatus controls the application-level configuration rollout. The
+// stable version remains ActiveConfigVersion; canary selection is an
+// admission concern and never changes an already admitted execution.
+type CanaryStatus string
+
+const (
+	CanaryDisabled CanaryStatus = "DISABLED"
+	CanaryEnabled  CanaryStatus = "ENABLED"
+	CanaryPaused   CanaryStatus = "PAUSED"
+)
+
 // Tenant describes the top-level isolation boundary for platform data.
 type Tenant struct {
 	ID     string      `json:"tenant_id"`
@@ -56,11 +67,14 @@ func (t Tenant) Scope(appID string) Scope {
 
 // AgentApp describes an agent application owned by a tenant.
 type AgentApp struct {
-	TenantID            string `json:"tenant_id"`
-	AppID               string `json:"app_id"`
-	Name                string `json:"name"`
-	ActiveConfigVersion string `json:"active_config_version"`
-	Status              Status `json:"status"`
+	TenantID            string       `json:"tenant_id"`
+	AppID               string       `json:"app_id"`
+	Name                string       `json:"name"`
+	ActiveConfigVersion string       `json:"active_config_version"`
+	CanaryConfigVersion string       `json:"canary_config_version,omitempty"`
+	CanaryPercentage    int          `json:"canary_percentage"`
+	CanaryStatus        CanaryStatus `json:"canary_status"`
+	Status              Status       `json:"status"`
 }
 
 // Validate checks the persisted agent application metadata. The zero value is invalid.
@@ -79,6 +93,42 @@ func (a AgentApp) Validate() error {
 	}
 	if !validStatus(a.Status) {
 		return errors.New("app status is invalid")
+	}
+	if err := a.validateCanary(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a AgentApp) validateCanary() error {
+	status := a.CanaryStatus
+	// Zero-value AgentApp literals are used by callers that predate Canary.
+	// Treat that representation as the disabled state; persisted rows always
+	// carry the explicit DISABLED default from the schema migration.
+	if status == "" {
+		if a.CanaryConfigVersion != "" || a.CanaryPercentage != 0 {
+			return errors.New("canary status is required when canary config is set")
+		}
+		return nil
+	}
+	if status != CanaryDisabled && status != CanaryEnabled && status != CanaryPaused {
+		return errors.New("canary status is invalid")
+	}
+	if a.CanaryPercentage < 0 || a.CanaryPercentage > 100 {
+		return errors.New("canary percentage must be between 0 and 100")
+	}
+	switch status {
+	case CanaryDisabled:
+		if a.CanaryConfigVersion != "" || a.CanaryPercentage != 0 {
+			return errors.New("disabled canary must not have a target or percentage")
+		}
+	case CanaryEnabled, CanaryPaused:
+		if a.CanaryConfigVersion == "" {
+			return errors.New("canary config version is required")
+		}
+		if a.CanaryPercentage <= 0 {
+			return errors.New("enabled or paused canary percentage must be positive")
+		}
 	}
 	return nil
 }

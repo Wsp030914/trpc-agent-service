@@ -83,7 +83,11 @@ size、checksum 和 status。对象路径不是授权依据：读取前先查 me
 只传 `ArtifactRef`；Worker 在 Runtime 调用模型前按引用恢复 bytes。
 
 对象写入成功但 metadata 写入失败时，调用方立即 best-effort 删除精确对象；删除
-失败只记录错误，不引入 durable cleanup 状态机。
+失败后由 `platform.artifact` 的 cleanup attempt、next-attempt、owner/lease 和
+last-error 字段进入后台补偿队列。Worker 以 SQL metadata 为唯一 authority，按
+tenant/app/session scope 批量认领，只删除精确 object key；完成和重试都受租约条件
+更新保护。过期 AVAILABLE 对象先转为 DELETED，删除前排除有效 Session、Execution
+Event、Reply 和待附着入站媒体引用，不扫描 COS 推断平台状态。
 
 ## Audit Log
 

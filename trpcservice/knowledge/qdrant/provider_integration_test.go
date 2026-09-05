@@ -29,7 +29,7 @@ const (
 func TestScopedKnowledgeUsesQdrantFilterAndSQLAuthority(t *testing.T) {
 	host := os.Getenv(qdrantTestHostEnv)
 	if host == "" {
-		t.Skipf("%s is not set", qdrantTestHostEnv)
+		t.Fatalf("%s is required", qdrantTestHostEnv)
 	}
 	port := 6334
 	if value := os.Getenv(qdrantTestPortEnv); value != "" {
@@ -158,7 +158,7 @@ func openKnowledgeIntegrationPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv(postgresTestDSNEnv)
 	if dsn == "" {
-		t.Skipf("%s is not set", postgresTestDSNEnv)
+		t.Fatalf("%s is required", postgresTestDSNEnv)
 	}
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {

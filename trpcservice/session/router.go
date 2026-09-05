@@ -21,19 +21,34 @@ type Resolver interface {
 type Router struct {
 	postgres Resolver
 	redis    Resolver
+	inmemory Resolver
 }
 
 const (
 	postgresProvider = "postgres"
 	redisProvider    = "redis"
+	inmemoryProvider = "inmemory"
 )
 
-// NewRouter creates the built-in PostgreSQL and Redis Session routes.
-func NewRouter(postgres Resolver, redis Resolver) (*Router, error) {
-	if postgres == nil || redis == nil {
+// NewRouter creates the built-in Session routes. PostgreSQL and Redis are
+// required for the production router; when the optional in-memory route is
+// supplied it may also be used to build a local/test-only router without the
+// persistent providers.
+func NewRouter(postgres Resolver, redis Resolver, inMemory ...Resolver) (*Router, error) {
+	if len(inMemory) > 1 {
+		return nil, errors.New("only one in-memory session provider is supported")
+	}
+	if len(inMemory) == 1 && inMemory[0] == nil {
+		return nil, errors.New("in-memory session provider must not be nil")
+	}
+	if len(inMemory) == 0 && (postgres == nil || redis == nil) {
 		return nil, errors.New("postgres and redis session providers are required")
 	}
-	return &Router{postgres: postgres, redis: redis}, nil
+	router := &Router{postgres: postgres, redis: redis}
+	if len(inMemory) == 1 {
+		router.inmemory = inMemory[0]
+	}
+	return router, nil
 }
 
 // ValidateBackend checks whether the platform's built-in Session provider
@@ -50,6 +65,13 @@ func ValidateBackend(ref tenant.BackendRef) error {
 	case redisProvider:
 		if ref.Kind != tenant.BackendRedis {
 			return fmt.Errorf("session backend kind %q does not match provider %q", ref.Kind, ref.Provider)
+		}
+	case inmemoryProvider:
+		if ref.Kind != tenant.BackendInMemory {
+			return fmt.Errorf("session backend kind %q does not match provider %q", ref.Kind, ref.Provider)
+		}
+		if ref.SecretRef != (tenant.SecretRef{}) {
+			return errors.New("in-memory session backend must not use secret_ref")
 		}
 	default:
 		return fmt.Errorf("session provider %q is not supported", ref.Provider)
@@ -69,6 +91,8 @@ func (r *Router) ResolveSession(ctx context.Context, exec worker.Execution) (fra
 		resolver = r.postgres
 	case redisProvider:
 		resolver = r.redis
+	case inmemoryProvider:
+		resolver = r.inmemory
 	default:
 		return nil, fmt.Errorf("session provider %q is not supported", provider)
 	}
@@ -78,7 +102,7 @@ func (r *Router) ResolveSession(ctx context.Context, exec worker.Execution) (fra
 	return resolver.ResolveSession(ctx, exec)
 }
 
-// Close closes both built-in providers owned by Router.
+// Close closes all configured providers owned by Router.
 func (r *Router) Close() error {
 	if r == nil {
 		return nil
@@ -89,6 +113,9 @@ func (r *Router) Close() error {
 	}
 	if r.redis != nil {
 		errs = append(errs, r.redis.Close())
+	}
+	if r.inmemory != nil {
+		errs = append(errs, r.inmemory.Close())
 	}
 	return errors.Join(errs...)
 }

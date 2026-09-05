@@ -1,37 +1,44 @@
-name: Governance and Security
+name: Security Gate
 
 on:
   push:
   pull_request:
-  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  governance-security:
+  security:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-          cache: true
-      - name: governance, approval, audit, and security contracts
-        run: >-
-          go test
-          ./trpcservice/tenant
-          ./trpcservice/tool
-          ./trpcservice/worker
-          ./trpcservice/admin
-          ./trpcservice/audit
-          ./trpcservice/metrics
-          ./trpcservice/telemetry
-          ./trpcservice/ingress
-          ./trpcservice/channels/feishu
-          ./trpcservice/channels/wecom
-      - name: static secret scan of tracked source
+          fetch-depth: 0
+      - name: gitleaks history and changed-source scan
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "true"
+          GITLEAKS_ENABLE_SUMMARY: "true"
+      - name: verify scanner catches an isolated fixture
         shell: bash
         run: |
           set -euo pipefail
-          if git grep -n -E 'sk-test-super-secret|password=secret123|Bearer token123' -- ':!docs/spec-04-05-hardening.md' ':!**/*_test.go'; then
-            echo 'test credentials must not be committed outside the specification' >&2
+          fixture_dir="$(mktemp -d)"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          access_key="AKIA$(printf 'IOSFODNN7EXAMPLE')"
+          printf 'aws_access_key_id = %s\n' "$access_key" > "$fixture_dir/fixture.txt"
+          if docker run --rm \
+            --mount "type=bind,source=$fixture_dir,target=/fixture,readonly" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:b109bc5f8f76a38196a3e413704fc5b9e3c32360bce4e4b603bd6f45b3721dbb \
+            dir --redact --no-banner /fixture; then
+            echo 'gitleaks failed to detect the isolated fixture' >&2
             exit 1
           fi

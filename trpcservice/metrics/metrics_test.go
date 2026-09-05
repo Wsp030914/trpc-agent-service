@@ -1,10 +1,13 @@
 package metrics_test
 
 import (
+	"context"
 	"testing"
 
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestPricingCatalogKeepsUnknownCostUnknown(t *testing.T) {
@@ -30,5 +33,77 @@ func TestPricingCatalogRejectsNegativePrices(t *testing.T) {
 		"openai/gpt-4.1": {InputPerMillion: -1},
 	}); err == nil {
 		t.Fatal("negative model price was accepted")
+	}
+}
+
+func TestOperationsSnapshotExportsRequiredGauges(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	recorder, err := platformmetrics.New(provider, platformmetrics.PricingCatalog{})
+	if err != nil {
+		t.Fatalf("new metrics recorder: %v", err)
+	}
+	recorder.SetOperationsSnapshot(platformmetrics.OperationsSnapshot{
+		ActiveExecutions:  3,
+		WorkerCount:       2,
+		WorkerCapacity:    8,
+		QueueBacklog:      5,
+		RetryBacklog:      1,
+		ReplyBacklog:      2,
+		PendingApprovals:  4,
+		ActiveMigrations:  1,
+		StuckMigrations:   0,
+		MigrationProgress: 0.75,
+		AuditBacklog:      0,
+	})
+	recorder.SetBackendReadiness("postgres", true)
+	recorder.SetBackendReadiness("redis", false)
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	intValues := map[string]int64{}
+	floatValues := map[string]float64{}
+	backendValues := map[string]int64{}
+	for _, scope := range data.ScopeMetrics {
+		for _, value := range scope.Metrics {
+			switch points := value.Data.(type) {
+			case metricdata.Gauge[int64]:
+				if value.Name == "trpc_agent_service.backend.ready" {
+					for _, point := range points.DataPoints {
+						provider, ok := point.Attributes.Value("provider")
+						if ok {
+							backendValues[provider.AsString()] = point.Value
+						}
+					}
+				} else if len(points.DataPoints) > 0 {
+					intValues[value.Name] = points.DataPoints[0].Value
+				}
+			case metricdata.Gauge[float64]:
+				if len(points.DataPoints) > 0 {
+					floatValues[value.Name] = points.DataPoints[0].Value
+				}
+			}
+		}
+	}
+	for name, want := range map[string]int64{
+		"trpc_agent_service.execution.active": 3,
+		"trpc_agent_service.worker.capacity":  8,
+		"trpc_agent_service.queue.backlog":    5,
+		"trpc_agent_service.approval.pending": 4,
+	} {
+		if got := intValues[name]; got != want {
+			t.Fatalf("metric %s = %d, want %d", name, got, want)
+		}
+	}
+	if got := floatValues["trpc_agent_service.worker.utilization"]; got != 0.375 {
+		t.Fatalf("worker utilization = %v, want 0.375", got)
+	}
+	if got := floatValues["trpc_agent_service.migration.progress"]; got != 0.75 {
+		t.Fatalf("migration progress = %v, want 0.75", got)
+	}
+	if backendValues["postgres"] != 1 || backendValues["redis"] != 0 {
+		t.Fatalf("backend readiness = %#v, want postgres=1 redis=0", backendValues)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
 	frameworksession "trpc.group/trpc-go/trpc-agent-go/session"
 )
 
@@ -267,4 +268,43 @@ func (i *tracedSessionIngestor) IngestSession(
 		}
 	}()
 	return i.Ingestor.IngestSession(opCtx, sess, opts...)
+}
+
+// tracedKnowledge instruments the actual knowledge backend search while
+// keeping query text, history, and retrieved content out of telemetry.
+type tracedKnowledge struct {
+	frameworkknowledge.Knowledge
+	exec    worker.Execution
+	metrics *platformmetrics.Recorder
+}
+
+func (k *tracedKnowledge) Search(
+	ctx context.Context,
+	req *frameworkknowledge.SearchRequest,
+) (result *frameworkknowledge.SearchResult, err error) {
+	opCtx, span := platformtelemetry.StartSpan(ctx, "knowledge.search",
+		attribute.String("tenant_id", k.exec.Tenant.TenantID),
+		attribute.String("app_id", k.exec.Tenant.AppID),
+		attribute.String("config_version", k.exec.Tenant.ConfigVersion),
+		attribute.String("request_id", k.exec.RequestID),
+		attribute.String("backend.provider", k.exec.Config.BackendConfig.Knowledge.Provider),
+	)
+	started := time.Now()
+	defer func() {
+		errorType := ""
+		if err != nil {
+			errorType = "knowledge"
+			platformtelemetry.MarkError(span, "knowledge", err)
+		}
+		span.End()
+		if k.metrics != nil {
+			k.metrics.RecordKnowledge(opCtx, platformmetrics.Labels{
+				TenantID: k.exec.Tenant.TenantID,
+				AppID:    k.exec.Tenant.AppID,
+				Channel:  k.exec.Tenant.Channel,
+				Provider: k.exec.Config.BackendConfig.Knowledge.Provider,
+			}, time.Since(started), errorType)
+		}
+	}()
+	return k.Knowledge.Search(opCtx, req)
 }

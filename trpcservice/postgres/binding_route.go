@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 )
 
 // ResolveBindingByPublicRoute locates one Binding by its opaque public route.
@@ -174,7 +176,10 @@ const channelBindingSelect = `SELECT
     secret_ref,
     public_route_id,
     binding_revision,
-    status
+    status,
+    connection_status,
+    last_connected_at,
+    last_error
 FROM platform.channel_binding`
 
 type channelBindingRow interface {
@@ -185,6 +190,8 @@ func scanChannelBinding(row channelBindingRow) (channels.Binding, error) {
 	var binding channels.Binding
 	var secret []byte
 	var publicRouteID pgtype.Text
+	var lastConnectedAt *time.Time
+	var lastError string
 	err := row.Scan(
 		&binding.TenantID,
 		&binding.AppID,
@@ -195,6 +202,9 @@ func scanChannelBinding(row channelBindingRow) (channels.Binding, error) {
 		&publicRouteID,
 		&binding.BindingRevision,
 		&binding.Status,
+		&binding.ConnectionStatus,
+		&lastConnectedAt,
+		&lastError,
 	)
 	if err != nil {
 		return channels.Binding{}, err
@@ -204,6 +214,10 @@ func scanChannelBinding(row channelBindingRow) (channels.Binding, error) {
 	}
 	if publicRouteID.Valid {
 		binding.PublicRouteID = publicRouteID.String
+	}
+	binding.LastConnectedAt = lastConnectedAt
+	if lastError != "" {
+		binding.LastError = platformlog.SafeError(errors.New(lastError))
 	}
 	return binding, nil
 }

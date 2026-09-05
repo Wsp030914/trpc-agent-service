@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -137,7 +138,17 @@ func (s *Store) Admit(
 		command:          command,
 		payloadHash:      payloadHash,
 		runtimeContext:   request.Identity.Tenant,
+		configVersion:    app.ActiveConfigVersion,
 		channelAdmission: request.ChannelInput != nil,
+	}
+	if request.ChannelInput == nil {
+		admission.configVersion, appConfig, err = resolveAdmissionConfig(
+			ctx, tx, app, admission.runtimeContext, appConfig,
+		)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		admission.runtimeContext.ConfigVersion = admission.configVersion
 	}
 	if request.ChannelInput != nil {
 		if s.identityMapper == nil {
@@ -234,6 +245,13 @@ func (s *Store) Admit(
 		admission.runtimeContext.UserID = mapped.Identity.UserID
 		admission.runtimeContext.TraceParent = request.TraceParent
 		admission.runtimeContext.TraceState = request.TraceState
+		admission.configVersion, appConfig, err = resolveAdmissionConfig(
+			ctx, tx, app, admission.runtimeContext, appConfig,
+		)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
+		admission.runtimeContext.ConfigVersion = admission.configVersion
 		if !appConfig.IMAccess.Allows(
 			admission.runtimeContext.UserID,
 			admission.runtimeContext.SessionPrincipalID,
@@ -260,7 +278,7 @@ func (s *Store) Admit(
 					ErrorType:     "im_access_denied",
 					TraceID:       admission.runtimeContext.TraceID,
 					RequestID:     request.RequestID,
-					ConfigVersion: app.ActiveConfigVersion,
+					ConfigVersion: admission.configVersion,
 					EventType:     platformaudit.IMAccessDenied,
 				}
 				if appConfig.Audit.RedactPII {
@@ -346,7 +364,47 @@ type admissionTransaction struct {
 	command          []byte
 	payloadHash      [sha256.Size]byte
 	runtimeContext   tenant.RuntimeContext
+	configVersion    string
 	channelAdmission bool
+}
+
+func resolveAdmissionConfig(
+	ctx context.Context,
+	tx pgx.Tx,
+	app tenant.AgentApp,
+	runtimeContext tenant.RuntimeContext,
+	active tenant.AppConfig,
+) (string, tenant.AppConfig, error) {
+	version := selectCanaryConfigVersion(app, runtimeContext)
+	if version == active.Version {
+		return version, active, nil
+	}
+	selected, err := resolveAppConfigFrom(ctx, tx, app.TenantID, app.AppID, version)
+	if err != nil {
+		return "", tenant.AppConfig{}, err
+	}
+	return version, selected, nil
+}
+
+// selectCanaryConfigVersion deterministically assigns one routing identity to
+// one bucket. The identity comes from the authenticated credential or channel
+// mapping and is never generated from user-provided message content.
+func selectCanaryConfigVersion(app tenant.AgentApp, runtimeContext tenant.RuntimeContext) string {
+	if app.CanaryStatus != tenant.CanaryEnabled ||
+		app.CanaryConfigVersion == "" || app.CanaryPercentage <= 0 {
+		return app.ActiveConfigVersion
+	}
+	if runtimeContext.SessionPrincipalID == "" || runtimeContext.SessionID == "" {
+		return app.ActiveConfigVersion
+	}
+	key := app.TenantID + "\x00" + app.AppID + "\x00" +
+		runtimeContext.SessionPrincipalID + "\x00" + runtimeContext.SessionID
+	digest := sha256.Sum256([]byte(key))
+	bucket := int(binary.BigEndian.Uint32(digest[:4]) % 100)
+	if bucket < app.CanaryPercentage {
+		return app.CanaryConfigVersion
+	}
+	return app.ActiveConfigVersion
 }
 
 func channelIdentityMappingRequest(request gateway.AdmissionRequest) (IdentityMappingRequest, error) {
@@ -506,7 +564,7 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 			a.ctx,
 			a.tx,
 			*a.request.ChannelInput,
-			a.app.ActiveConfigVersion,
+			a.configVersion,
 			runtimeContext.SessionPrincipalID,
 			runtimeContext.SessionID,
 		); err != nil {
@@ -541,7 +599,7 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 		runtimeContext.SessionID,
 		runtimeContext.UserID,
 		turnSeq,
-		a.app.ActiveConfigVersion,
+		a.configVersion,
 		a.request.Identity.Source,
 		a.request.Identity.SourceID,
 		a.request.IdempotencyKey,
@@ -569,7 +627,7 @@ VALUES ($1, $2, $3)`,
 	}
 	return gateway.AdmissionResult{
 		RequestID:     a.request.RequestID,
-		ConfigVersion: a.app.ActiveConfigVersion,
+		ConfigVersion: a.configVersion,
 		TurnSeq:       turnSeq,
 		Status:        gateway.AdmissionStatusAdmitted,
 	}, nil
@@ -657,7 +715,8 @@ func lockAgentApp(ctx context.Context, tx pgx.Tx, tenantID, appID string) (tenan
 	var app tenant.AgentApp
 	err := tx.QueryRow(
 		ctx,
-		`SELECT tenant_id, app_id, name, active_config_version, status
+		`SELECT tenant_id, app_id, name, active_config_version,
+       COALESCE(canary_config_version, ''), canary_percentage, canary_status, status
 FROM platform.agent_app
 WHERE tenant_id = $1 AND app_id = $2
 FOR UPDATE`,
@@ -668,6 +727,9 @@ FOR UPDATE`,
 		&app.AppID,
 		&app.Name,
 		&app.ActiveConfigVersion,
+		&app.CanaryConfigVersion,
+		&app.CanaryPercentage,
+		&app.CanaryStatus,
 		&app.Status,
 	)
 	if err != nil {

@@ -33,25 +33,32 @@ import (
 )
 
 const (
-	envRole                = "TRPC_AGENT_SERVICE_ROLE"
-	envPostgresDSN         = "TRPC_AGENT_SERVICE_POSTGRES_DSN"
-	envRedisURL            = "TRPC_AGENT_SERVICE_REDIS_URL"
-	envRedisStream         = "TRPC_AGENT_SERVICE_REDIS_STREAM"
-	envRedisGroup          = "TRPC_AGENT_SERVICE_REDIS_GROUP"
-	envDispatcherID        = "TRPC_AGENT_SERVICE_DISPATCHER_ID"
-	envHTTPAddr            = "TRPC_AGENT_SERVICE_HTTP_ADDR"
-	envWorkerID            = "TRPC_AGENT_SERVICE_WORKER_ID"
-	envAdminToken          = "TRPC_AGENT_SERVICE_ADMIN_TOKEN"
-	envTencentDBGateways   = "TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS"
-	envShutdownTimeout     = "TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT"
-	envCOSEndpoints        = "TRPC_AGENT_SERVICE_COS_ENDPOINTS"
-	envQdrantEndpoints     = "TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS"
-	envOTELProtocol        = "TRPC_AGENT_SERVICE_OTEL_PROTOCOL"
-	envOTELTracesEndpoint  = "TRPC_AGENT_SERVICE_OTEL_TRACES_ENDPOINT"
-	envOTELMetricsEndpoint = "TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT"
-	envModelPricing        = "TRPC_AGENT_SERVICE_MODEL_PRICING"
-	envModelTimeout        = "TRPC_AGENT_SERVICE_MODEL_TIMEOUT"
-	envWorkerConcurrency   = "TRPC_AGENT_SERVICE_WORKER_CONCURRENCY"
+	envRole                             = "TRPC_AGENT_SERVICE_ROLE"
+	envPostgresDSN                      = "TRPC_AGENT_SERVICE_POSTGRES_DSN"
+	envRedisURL                         = "TRPC_AGENT_SERVICE_REDIS_URL"
+	envRedisStream                      = "TRPC_AGENT_SERVICE_REDIS_STREAM"
+	envRedisGroup                       = "TRPC_AGENT_SERVICE_REDIS_GROUP"
+	envDispatcherID                     = "TRPC_AGENT_SERVICE_DISPATCHER_ID"
+	envHTTPAddr                         = "TRPC_AGENT_SERVICE_HTTP_ADDR"
+	envWorkerID                         = "TRPC_AGENT_SERVICE_WORKER_ID"
+	envAdminToken                       = "TRPC_AGENT_SERVICE_ADMIN_TOKEN"
+	envTencentDBGateways                = "TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS"
+	envShutdownTimeout                  = "TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT"
+	envCOSEndpoints                     = "TRPC_AGENT_SERVICE_COS_ENDPOINTS"
+	envQdrantEndpoints                  = "TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS"
+	envOTELProtocol                     = "TRPC_AGENT_SERVICE_OTEL_PROTOCOL"
+	envOTELTracesEndpoint               = "TRPC_AGENT_SERVICE_OTEL_TRACES_ENDPOINT"
+	envOTELMetricsEndpoint              = "TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT"
+	envModelPricing                     = "TRPC_AGENT_SERVICE_MODEL_PRICING"
+	envModelTimeout                     = "TRPC_AGENT_SERVICE_MODEL_TIMEOUT"
+	envWorkerConcurrency                = "TRPC_AGENT_SERVICE_WORKER_CONCURRENCY"
+	envFaultPauseAfterClaim             = "TRPC_AGENT_SERVICE_FAULT_PAUSE_AFTER_CLAIM"
+	envFaultPauseAfterMigrationCopy     = "TRPC_AGENT_SERVICE_FAULT_PAUSE_AFTER_MIGRATION_COPY"
+	envFaultPauseAfterMigrationCopyItem = "TRPC_AGENT_SERVICE_FAULT_PAUSE_AFTER_MIGRATION_COPY_ITEM"
+	envArtifactRetention                = "TRPC_AGENT_SERVICE_ARTIFACT_RETENTION"
+	envJaegerURL                        = "TRPC_AGENT_SERVICE_JAEGER_URL"
+	envPrometheusURL                    = "TRPC_AGENT_SERVICE_PROMETHEUS_URL"
+	envGrafanaURL                       = "TRPC_AGENT_SERVICE_GRAFANA_URL"
 
 	defaultHTTPAddr          = ":8080"
 	defaultRedisStream       = "trpc-agent-service:dispatch"
@@ -61,6 +68,10 @@ const (
 	defaultShutdownTimeout   = 30 * time.Second
 	defaultModelTimeout      = time.Minute
 	defaultWorkerConcurrency = 4
+	defaultArtifactRetention = 30 * 24 * time.Hour
+	defaultJaegerURL         = "http://localhost:16686"
+	defaultPrometheusURL     = "http://localhost:19090"
+	defaultGrafanaURL        = "http://localhost:13000"
 	dataMigrationLease       = 30 * time.Second
 	dataMigrationPoll        = time.Second
 )
@@ -76,20 +87,27 @@ const (
 )
 
 type serviceConfig struct {
-	Role              serviceRole
-	PostgresDSN       string
-	RedisURL          string
-	RedisStream       string
-	RedisGroup        string
-	DispatcherID      string
-	HTTPAddr          string
-	WorkerID          string
-	AdminToken        string
-	ShutdownTimeout   time.Duration
-	ModelTimeout      time.Duration
-	WorkerConcurrency int
-	Telemetry         platformtelemetry.Config
-	Pricing           platformmetrics.PricingCatalog
+	Role                        serviceRole
+	PostgresDSN                 string
+	RedisURL                    string
+	RedisStream                 string
+	RedisGroup                  string
+	DispatcherID                string
+	HTTPAddr                    string
+	WorkerID                    string
+	AdminToken                  string
+	ShutdownTimeout             time.Duration
+	ModelTimeout                time.Duration
+	ArtifactRetention           time.Duration
+	WorkerConcurrency           int
+	PauseAfterClaim             time.Duration
+	PauseAfterMigrationCopy     time.Duration
+	PauseAfterMigrationCopyItem time.Duration
+	JaegerURL                   string
+	PrometheusURL               string
+	GrafanaURL                  string
+	Telemetry                   platformtelemetry.Config
+	Pricing                     platformmetrics.PricingCatalog
 }
 
 func main() {
@@ -129,7 +147,11 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 		AdminToken:        getenv(envAdminToken),
 		ShutdownTimeout:   defaultShutdownTimeout,
 		ModelTimeout:      defaultModelTimeout,
+		ArtifactRetention: defaultArtifactRetention,
 		WorkerConcurrency: defaultWorkerConcurrency,
+		JaegerURL:         defaultJaegerURL,
+		PrometheusURL:     defaultPrometheusURL,
+		GrafanaURL:        defaultGrafanaURL,
 		Telemetry: platformtelemetry.Config{
 			Protocol:       getenv(envOTELProtocol),
 			TraceEndpoint:  getenv(envOTELTracesEndpoint),
@@ -177,12 +199,49 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 		}
 		config.ModelTimeout = duration
 	}
+	if value := getenv(envArtifactRetention); value != "" {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration < 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a non-negative duration", envArtifactRetention)
+		}
+		config.ArtifactRetention = duration
+	}
 	if value := getenv(envWorkerConcurrency); value != "" {
 		concurrency, err := strconv.Atoi(value)
 		if err != nil || concurrency <= 0 {
 			return serviceConfig{}, fmt.Errorf("%s must be a positive integer", envWorkerConcurrency)
 		}
 		config.WorkerConcurrency = concurrency
+	}
+	if value := getenv(envFaultPauseAfterClaim); value != "" {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a positive duration", envFaultPauseAfterClaim)
+		}
+		config.PauseAfterClaim = duration
+	}
+	if value := getenv(envFaultPauseAfterMigrationCopy); value != "" {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a positive duration", envFaultPauseAfterMigrationCopy)
+		}
+		config.PauseAfterMigrationCopy = duration
+	}
+	if value := getenv(envFaultPauseAfterMigrationCopyItem); value != "" {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a positive duration", envFaultPauseAfterMigrationCopyItem)
+		}
+		config.PauseAfterMigrationCopyItem = duration
+	}
+	if value := getenv(envJaegerURL); value != "" {
+		config.JaegerURL = value
+	}
+	if value := getenv(envPrometheusURL); value != "" {
+		config.PrometheusURL = value
+	}
+	if value := getenv(envGrafanaURL); value != "" {
+		config.GrafanaURL = value
 	}
 	pricing, err := platformmetrics.ParsePricingJSON(getenv(envModelPricing))
 	if err != nil {
@@ -278,7 +337,10 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		if err != nil {
 			return err
 		}
-		adminHandler, err = newAdminHandler(store, config.AdminToken)
+		adminHandler, err = newAdminHandler(store, config.AdminToken, serviceOperationsReader{
+			store: store, redis: redisClient,
+			jaegerURL: config.JaegerURL, prometheusURL: config.PrometheusURL, grafanaURL: config.GrafanaURL,
+		})
 		if err != nil {
 			return err
 		}
@@ -286,9 +348,19 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 
 	server, err := startServiceServer(config.HTTPAddr, ingressHandler, adminHandler, func(checkCtx context.Context) error {
 		if err := pool.Ping(checkCtx); err != nil {
+			if metricsRecorder != nil {
+				metricsRecorder.SetBackendReadiness("postgres", false)
+			}
 			return fmt.Errorf("ping postgres: %w", err)
 		}
-		return redisClient.Ping(checkCtx)
+		if metricsRecorder != nil {
+			metricsRecorder.SetBackendReadiness("postgres", true)
+		}
+		redisErr := redisClient.Ping(checkCtx)
+		if metricsRecorder != nil {
+			metricsRecorder.SetBackendReadiness("redis", redisErr == nil)
+		}
+		return redisErr
 	})
 	if err != nil {
 		return err
@@ -309,17 +381,21 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	}
 	if config.Role.runsWorker() {
 		runtime, err = newWorkerRuntime(workerRuntimeDependencies{
-			store:             store,
-			redisClient:       redisClient,
-			stream:            stream,
-			owner:             config.WorkerID,
-			getenv:            os.Getenv,
-			artifacts:         artifacts,
-			defaultSessionDSN: config.PostgresDSN,
-			defaultRedisURL:   config.RedisURL,
-			metrics:           metricsRecorder,
-			modelTimeout:      config.ModelTimeout,
-			concurrency:       config.WorkerConcurrency,
+			store:                       store,
+			redisClient:                 redisClient,
+			stream:                      stream,
+			owner:                       config.WorkerID,
+			getenv:                      os.Getenv,
+			artifacts:                   artifacts,
+			defaultSessionDSN:           config.PostgresDSN,
+			defaultRedisURL:             config.RedisURL,
+			metrics:                     metricsRecorder,
+			modelTimeout:                config.ModelTimeout,
+			artifactRetention:           config.ArtifactRetention,
+			concurrency:                 config.WorkerConcurrency,
+			pauseAfterClaim:             config.PauseAfterClaim,
+			pauseAfterMigrationCopy:     config.PauseAfterMigrationCopy,
+			pauseAfterMigrationCopyItem: config.PauseAfterMigrationCopyItem,
 		})
 		if err != nil {
 			return err
@@ -466,14 +542,76 @@ func runChannelAdapters(
 	return firstErr
 }
 
-func newAdminHandler(store *postgres.Store, token string) (http.Handler, error) {
+func newAdminHandler(store *postgres.Store, token string, operations ...admin.OperationsReader) (http.Handler, error) {
 	if store == nil {
 		return nil, errors.New("postgres store is required")
 	}
-	return admin.NewHTTPHandler(admin.API{
+	api := admin.API{
 		Bindings:   store,
 		Repository: store,
-	}, token)
+	}
+	if len(operations) > 0 {
+		if operations[0] == nil {
+			return nil, errors.New("admin operations provider is required")
+		}
+		api.Operations = operations[0]
+	}
+	return admin.NewHTTPHandler(api, token)
+}
+
+type serviceOperationsReader struct {
+	store                                *postgres.Store
+	redis                                *platformredis.Client
+	jaegerURL, prometheusURL, grafanaURL string
+}
+
+func (r serviceOperationsReader) OperationsSummary(ctx context.Context) (admin.OperationsSummary, error) {
+	return r.summary(ctx, nil)
+}
+
+func (r serviceOperationsReader) OperationsSummaryForPrincipal(
+	ctx context.Context,
+	principal admin.AdminPrincipal,
+) (admin.OperationsSummary, error) {
+	if principal.Role == admin.RoleSystemAdmin {
+		return r.summary(ctx, nil)
+	}
+	return r.summary(ctx, principal.TenantIDs)
+}
+
+func (r serviceOperationsReader) summary(ctx context.Context, tenantIDs []string) (admin.OperationsSummary, error) {
+	if r.store == nil || r.redis == nil {
+		return admin.OperationsSummary{}, errors.New("service operations dependencies are required")
+	}
+	var summary admin.OperationsSummary
+	var err error
+	if tenantIDs == nil {
+		summary, err = r.store.OperationsSummary(ctx)
+	} else {
+		summary, err = r.store.OperationsSummaryForTenants(ctx, tenantIDs)
+	}
+	if err != nil {
+		if r.store.Metrics() != nil {
+			r.store.Metrics().SetBackendReadiness("postgres", false)
+		}
+		return admin.OperationsSummary{}, err
+	}
+	redisStatus := "READY"
+	redisErr := r.redis.Ping(ctx)
+	if r.store.Metrics() != nil {
+		r.store.Metrics().SetBackendReadiness("redis", redisErr == nil)
+	}
+	if redisErr != nil {
+		redisStatus = "NOT_READY"
+		summary.GatewayReadiness = "NOT_READY"
+	}
+	summary.Backends = append(summary.Backends, admin.BackendReadiness{
+		Name: "redis", Provider: "redis", Status: redisStatus,
+	})
+	summary.JaegerURL = r.jaegerURL
+	summary.PrometheusURL = r.prometheusURL
+	summary.GrafanaURL = r.grafanaURL
+	return summary, nil
 }
 
 func awaitProviderExit(done <-chan error, timeout time.Duration) error {
@@ -540,6 +678,7 @@ func runWorkerUntilShutdown(
 	go func() {
 		done <- runtime.consumer.Run(runCtx)
 	}()
+	go runtime.runHeartbeat(runCtx)
 	migrationDone := make(chan error, 1)
 	go func() {
 		migrationDone <- runtime.runDataMigrations(auxCtx)

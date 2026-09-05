@@ -236,8 +236,17 @@ func (r *Runtime) toolCallbacks(exec worker.Execution) *frameworktool.Callbacks 
 			name = args.ToolName
 		}
 		errType := ""
+		var classifiedErr error
 		if args != nil && args.Error != nil {
-			errType = "tool"
+			safety := platformtool.SafetySideEffect
+			if r.tools != nil {
+				if resolved, ok := r.tools.Safety(name); ok {
+					safety = resolved
+				}
+			}
+			failureClass := platformtool.ClassifyFailure(safety, args.Error)
+			errType = string(failureClass)
+			classifiedErr = classifyToolExecutionFailure(failureClass, args.Error)
 		}
 		if r.metrics != nil {
 			r.metrics.RecordTool(ctx, platformmetrics.Labels{
@@ -262,9 +271,28 @@ func (r *Runtime) toolCallbacks(exec worker.Execution) *frameworktool.Callbacks 
 				EventType: eventType,
 			})
 		}
+		if classifiedErr != nil {
+			return nil, classifiedErr
+		}
 		return nil, nil
 	})
 	return callbacks
+}
+
+func classifyToolExecutionFailure(class platformtool.FailureClass, err error) error {
+	switch class {
+	case platformtool.FailureInfrastructureRetryable:
+		return worker.NewRetryableExecutionError(err)
+	case platformtool.FailureSideEffectResultUncertain:
+		return worker.NewSideEffectUncertainError(err)
+	case platformtool.FailurePermanent, platformtool.FailureSideEffectResultKnown:
+		return worker.NewPermanentExecutionError(err)
+	default:
+		// Unknown or missing classifications fail closed at the execution
+		// boundary. A malformed provider classification must never turn into
+		// an automatic replay of a possibly mutating Tool.
+		return worker.NewPermanentExecutionError(errors.New("tool failure classification is invalid"))
+	}
 }
 
 func (r *Runtime) recordAudit(ctx context.Context, exec worker.Execution, event platformaudit.Event) {

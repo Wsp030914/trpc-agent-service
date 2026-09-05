@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,6 +131,60 @@ func TestRunCreatesOneClientPerActiveBindingAndStopsOnCancellation(t *testing.T)
 	}
 }
 
+func TestRunReconnectsAfterClientCloseWithBoundedDelay(t *testing.T) {
+	binding := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "secret-a")
+	source, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	starts := make(chan time.Time, 4)
+	var attempts atomic.Int32
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newFeishuRecordingAdmitter()),
+		testFeishuSecrets{key: binding, value: "secret-a"},
+		WithReconnectDelay(20*time.Millisecond, 100*time.Millisecond),
+		WithClientFactory(func(channels.BindingSnapshot, string, *larkdispatcher.EventDispatcher) Client {
+			attempts.Add(1)
+			starts <- time.Now()
+			return &feishuFailingClient{}
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(runCtx) }()
+	var first, second time.Time
+	select {
+	case first = <-starts:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first Feishu client")
+	}
+	select {
+	case second = <-starts:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Feishu reconnect")
+	}
+	if delay := second.Sub(first); delay < 15*time.Millisecond {
+		t.Fatalf("Feishu reconnect delay = %s, want bounded backoff >= 15ms", delay)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("Feishu client attempts before cancellation = %d, want 2", attempts.Load())
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Feishu run error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Feishu shutdown")
+	}
+}
+
 type feishuFakeClientInfo struct {
 	binding channels.BindingSnapshot
 	secret  string
@@ -139,6 +194,13 @@ type feishuBlockingClient struct {
 	started chan struct{}
 	closed  chan struct{}
 }
+
+type feishuFailingClient struct{}
+
+func (*feishuFailingClient) Start(context.Context) error        { return errors.New("fake websocket closed") }
+func (*feishuFailingClient) CloseAndWait(context.Context) error { return nil }
+
+var _ Client = (*feishuFailingClient)(nil)
 
 func (c *feishuBlockingClient) Start(ctx context.Context) error {
 	close(c.started)

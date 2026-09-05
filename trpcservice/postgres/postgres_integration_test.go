@@ -1,3 +1,5 @@
+//go:build integration
+
 package postgres_test
 
 import (
@@ -96,6 +98,49 @@ func TestPostgresMigrationFromEmptySchema(t *testing.T) {
 			t.Fatalf("table platform.%s does not exist", table)
 		}
 	}
+	var checkpointColumns int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*)
+FROM information_schema.columns
+WHERE table_schema = 'platform'
+  AND table_name = 'data_migration'
+  AND column_name IN (
+    'total_sessions', 'copy_progress', 'verify_progress',
+    'success_count', 'last_checkpoint_at', 'last_failure_stage'
+  )`).Scan(&checkpointColumns); err != nil {
+		t.Fatalf("check data migration checkpoint columns: %v", err)
+	}
+	if checkpointColumns != 6 {
+		t.Fatalf("data migration checkpoint columns = %d, want 6", checkpointColumns)
+	}
+	var knowledgeMigrationColumns int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*)
+FROM information_schema.columns
+WHERE table_schema = 'platform'
+  AND table_name = 'data_migration'
+  AND column_name = 'domain'`).Scan(&knowledgeMigrationColumns); err != nil {
+		t.Fatalf("check knowledge migration domain column: %v", err)
+	}
+	if knowledgeMigrationColumns != 1 {
+		t.Fatalf("data migration domain columns = %d, want 1", knowledgeMigrationColumns)
+	}
+	var artifactCleanupColumns int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*)
+FROM information_schema.columns
+WHERE table_schema = 'platform'
+  AND table_name = 'artifact'
+  AND column_name IN (
+    'config_version', 'cleanup_attempts', 'cleanup_next_attempt_at',
+    'cleanup_owner', 'cleanup_lease_until', 'cleanup_last_error',
+    'cleanup_completed_at'
+  )`).Scan(&artifactCleanupColumns); err != nil {
+		t.Fatalf("check artifact cleanup columns: %v", err)
+	}
+	if artifactCleanupColumns != 7 {
+		t.Fatalf("artifact cleanup columns = %d, want 7", artifactCleanupColumns)
+	}
 }
 
 func TestPostgresPublishedRecordsKeepSafetyConstraints(t *testing.T) {
@@ -174,7 +219,7 @@ func openIntegrationPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := *postgresTestDSN
 	if dsn == "" {
-		t.Skipf("%s is not set", postgresTestDSNEnv)
+		t.Fatalf("%s is required", postgresTestDSNEnv)
 	}
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {

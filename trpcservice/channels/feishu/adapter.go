@@ -293,18 +293,36 @@ func (a *Adapter) runBinding(ctx context.Context, binding channels.Binding) erro
 		}
 		key := bindingKey(bindingSnapshot)
 		a.trackClient(key, client)
+		a.recordConnection(ctx, bindingSnapshot, channels.ConnectionReady, nil)
 		startErr := client.Start(ctx)
 		a.untrackClient(key, client)
 		if ctx.Err() != nil {
+			a.recordConnection(context.WithoutCancel(ctx), bindingSnapshot, channels.ConnectionNotReady, nil)
 			return ctx.Err()
 		}
 		if startErr != nil {
 			// Recreate the SDK client after a terminal SDK failure; its normal
 			// connection drops are already handled by WithAutoReconnect(true).
+			a.recordConnection(ctx, bindingSnapshot, channels.ConnectionDegraded, startErr)
 		}
 		if err := waitReconnect(ctx, a.reconnectInitial, a.reconnectMax); err != nil {
 			return err
 		}
+	}
+}
+
+func (a *Adapter) recordConnection(
+	ctx context.Context,
+	binding channels.BindingSnapshot,
+	status channels.ConnectionStatus,
+	cause error,
+) {
+	reporter, ok := a.bindings.(channels.ConnectionStatusReporter)
+	if !ok {
+		return
+	}
+	if err := reporter.RecordChannelConnection(ctx, binding.TenantID, binding.AppID, binding.BindingID, status, cause); err != nil {
+		log.Printf("record feishu connection status failed: %s", platformlog.SafeError(err))
 	}
 }
 

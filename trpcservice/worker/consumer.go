@@ -51,6 +51,7 @@ type Consumer struct {
 	pollInterval  time.Duration
 	concurrency   int
 	retryDelay    func(int) time.Duration
+	afterClaim    func(context.Context, queue.Claim)
 	mu            sync.Mutex
 	stopClaims    chan struct{}
 	claimCancel   context.CancelFunc
@@ -63,6 +64,9 @@ type ConsumerOptions struct {
 	PollInterval  time.Duration
 	Concurrency   int
 	RetryDelay    func(int) time.Duration
+	// AfterClaim is a test/fault-injection hook. Production callers should
+	// leave it nil; it runs after the durable claim and before user code.
+	AfterClaim func(context.Context, queue.Claim)
 }
 
 // NewConsumer creates a consumer for one stable worker identity.
@@ -110,6 +114,7 @@ func NewConsumerWithOptions(
 		pollInterval:  options.PollInterval,
 		concurrency:   options.Concurrency,
 		retryDelay:    options.RetryDelay,
+		afterClaim:    options.AfterClaim,
 		stopClaims:    make(chan struct{}),
 	}, nil
 }
@@ -231,6 +236,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 			<-sem
 			return fmt.Errorf("claimed execution: %w", err)
 		}
+		if c.afterClaim != nil {
+			c.afterClaim(claimCtxWithTrace, claim)
+		}
 		deliveryCtx := platformtelemetry.Extract(ctx, map[string]string{
 			"traceparent": delivery.Dispatch.TraceParent,
 			"tracestate":  delivery.Dispatch.TraceState,
@@ -247,6 +255,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 				if ackErr := c.ackDelivery(runContext, delivery); ackErr != nil && runContext.Err() == nil {
 					log.Printf("ack execution %s failed: %s", claim.Job.RequestID(), platformlog.SafeError(ackErr))
 				}
+			} else if releaser, ok := c.stream.(interface{ Release(queue.Delivery) }); ok {
+				// Keep the Redis delivery pending when its durable transition was
+				// not completed, but allow this process to reclaim it after the
+				// local execution attempt has ended.
+				releaser.Release(delivery)
 			}
 		}(deliveryCtx, claim, delivery)
 	}
@@ -477,8 +490,8 @@ func (c *Consumer) renewLease(ctx context.Context, cancel context.CancelFunc, cl
 			cancelRenew()
 			if err != nil {
 				if ctx.Err() == nil {
-					done <- err
 					cancel()
+					done <- err
 				}
 				return
 			}

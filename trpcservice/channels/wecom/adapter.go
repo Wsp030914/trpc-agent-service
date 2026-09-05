@@ -275,15 +275,34 @@ func (a *Adapter) runBinding(ctx context.Context, binding channels.Binding) erro
 		}
 		key := bindingKey(snapshot)
 		a.trackClient(key, client)
+		a.recordConnection(ctx, snapshot, channels.ConnectionReady, nil)
 		runErr := client.Run(ctx)
 		a.untrackClient(key, client)
 		if ctx.Err() != nil {
+			a.recordConnection(context.WithoutCancel(ctx), snapshot, channels.ConnectionNotReady, nil)
 			return ctx.Err()
 		}
-		_ = runErr
+		if runErr != nil {
+			a.recordConnection(ctx, snapshot, channels.ConnectionDegraded, runErr)
+		}
 		if err := waitReconnect(ctx, a.reconnectInitial, a.reconnectMax); err != nil {
 			return err
 		}
+	}
+}
+
+func (a *Adapter) recordConnection(
+	ctx context.Context,
+	binding channels.BindingSnapshot,
+	status channels.ConnectionStatus,
+	cause error,
+) {
+	reporter, ok := a.bindings.(channels.ConnectionStatusReporter)
+	if !ok {
+		return
+	}
+	if err := reporter.RecordChannelConnection(ctx, binding.TenantID, binding.AppID, binding.BindingID, status, cause); err != nil {
+		log.Printf("record wecom connection status failed: %s", platformlog.SafeError(err))
 	}
 }
 

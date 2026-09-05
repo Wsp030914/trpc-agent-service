@@ -13,6 +13,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -133,6 +134,16 @@ RETURNING lease_until, attempt`, stored.tenantID, stored.appID, stored.requestID
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return queue.Claim{}, false, fmt.Errorf("commit execution claim: %w", err)
+	}
+	if s.metrics != nil && !stored.createdAt.IsZero() {
+		lag := time.Since(stored.createdAt)
+		if lag < 0 {
+			lag = 0
+		}
+		s.metrics.RecordQueueLag(ctx, platformmetrics.Labels{
+			TenantID: stored.tenantID,
+			AppID:    stored.appID,
+		}, lag)
 	}
 	return claim, true, nil
 }
@@ -303,6 +314,7 @@ func (s *Store) Retry(ctx context.Context, claim queue.Claim, cause error) error
 	}
 	defer func() { rollback(tx) }()
 	var attempt int
+	retryScheduled := false
 	err = tx.QueryRow(ctx, `SELECT attempt FROM platform.execution WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3 AND status='RUNNING' AND lease_owner=$4 AND run_token=$5 AND lease_until > clock_timestamp() FOR UPDATE`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), claim.Lease.Owner, claim.Lease.Token).Scan(&attempt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("retry execution: %w", queue.ErrLeaseLost)
@@ -314,6 +326,7 @@ func (s *Store) Retry(ctx context.Context, claim queue.Claim, cause error) error
 		_, err = tx.Exec(ctx, `UPDATE platform.execution SET status='FAILED', last_error=$4, lease_owner=NULL, run_token=NULL, lease_until=NULL, finished_at=clock_timestamp(), updated_at=clock_timestamp() WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), platformlog.SafeError(cause))
 	} else {
 		delay := executionRetryDelay(attempt)
+		retryScheduled = true
 		_, err = tx.Exec(ctx, `UPDATE platform.execution SET status='PENDING', last_error=$4, lease_owner=NULL, run_token=NULL, lease_until=NULL, next_attempt_at=clock_timestamp()+$5::interval, updated_at=clock_timestamp() WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), platformlog.SafeError(cause), intervalLiteral(delay))
 		if err == nil {
 			_, err = tx.Exec(ctx, `INSERT INTO platform.dispatch_outbox (tenant_id, app_id, request_id, next_attempt_at) VALUES ($1,$2,$3,clock_timestamp()+$4::interval)`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), intervalLiteral(delay))
@@ -324,6 +337,13 @@ func (s *Store) Retry(ctx context.Context, claim queue.Claim, cause error) error
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit execution retry: %w", err)
+	}
+	if retryScheduled && s.metrics != nil {
+		s.metrics.RecordRetry(ctx, platformmetrics.Labels{
+			TenantID: claim.Job.Tenant().TenantID,
+			AppID:    claim.Job.Tenant().AppID,
+			Channel:  claim.Job.Tenant().Channel,
+		}, "execution_retry")
 	}
 	return nil
 }
@@ -487,6 +507,7 @@ type storedExecution struct {
 	configVersion                                                     string
 	tenantSource                                                      gateway.TenantSource
 	command                                                           []byte
+	createdAt                                                         time.Time
 	traceID, traceParent, traceState, status                          string
 	attempt                                                           int
 	nextAttemptAt, leaseUntil                                         time.Time
@@ -496,7 +517,7 @@ type storedExecution struct {
 
 func lockExecutionForClaim(ctx context.Context, tx pgx.Tx, d queue.Dispatch) (storedExecution, bool, error) {
 	var v storedExecution
-	err := tx.QueryRow(ctx, `SELECT e.tenant_id,e.app_id,e.request_id,e.session_principal_id,e.session_id,e.user_id,e.turn_seq,e.config_version,e.tenant_source,e.command,e.trace_id,e.trace_parent,e.trace_state,e.status,e.attempt,e.next_attempt_at,COALESCE(e.lease_until,'epoch'::timestamptz),COALESCE(e.lease_until,'epoch'::timestamptz) > clock_timestamp(),e.next_attempt_at <= clock_timestamp(),EXISTS(SELECT 1 FROM platform.execution x WHERE x.tenant_id=e.tenant_id AND x.app_id=e.app_id AND x.session_principal_id=e.session_principal_id AND x.session_id=e.session_id AND x.turn_seq<e.turn_seq AND x.status IN ('PENDING','RUNNING','WAITING_APPROVAL')) FROM platform.execution e JOIN platform.tenant t ON t.tenant_id=e.tenant_id JOIN platform.agent_app a ON a.tenant_id=e.tenant_id AND a.app_id=e.app_id WHERE e.tenant_id=$1 AND e.app_id=$2 AND e.request_id=$3 FOR UPDATE OF e`, d.TenantID, d.AppID, d.RequestID).Scan(&v.tenantID, &v.appID, &v.requestID, &v.sessionPrincipalID, &v.sessionID, &v.userID, &v.turnSeq, &v.configVersion, &v.tenantSource, &v.command, &v.traceID, &v.traceParent, &v.traceState, &v.status, &v.attempt, &v.nextAttemptAt, &v.leaseUntil, &v.leaseActive, &v.attemptReady, &v.hasEarlier)
+	err := tx.QueryRow(ctx, `SELECT e.tenant_id,e.app_id,e.request_id,e.session_principal_id,e.session_id,e.user_id,e.turn_seq,e.config_version,e.tenant_source,e.command,e.created_at,e.trace_id,e.trace_parent,e.trace_state,e.status,e.attempt,e.next_attempt_at,COALESCE(e.lease_until,'epoch'::timestamptz),COALESCE(e.lease_until,'epoch'::timestamptz) > clock_timestamp(),e.next_attempt_at <= clock_timestamp(),EXISTS(SELECT 1 FROM platform.execution x WHERE x.tenant_id=e.tenant_id AND x.app_id=e.app_id AND x.session_principal_id=e.session_principal_id AND x.session_id=e.session_id AND x.turn_seq<e.turn_seq AND x.status IN ('PENDING','RUNNING','WAITING_APPROVAL')) FROM platform.execution e JOIN platform.tenant t ON t.tenant_id=e.tenant_id JOIN platform.agent_app a ON a.tenant_id=e.tenant_id AND a.app_id=e.app_id WHERE e.tenant_id=$1 AND e.app_id=$2 AND e.request_id=$3 FOR UPDATE OF e`, d.TenantID, d.AppID, d.RequestID).Scan(&v.tenantID, &v.appID, &v.requestID, &v.sessionPrincipalID, &v.sessionID, &v.userID, &v.turnSeq, &v.configVersion, &v.tenantSource, &v.command, &v.createdAt, &v.traceID, &v.traceParent, &v.traceState, &v.status, &v.attempt, &v.nextAttemptAt, &v.leaseUntil, &v.leaseActive, &v.attemptReady, &v.hasEarlier)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return v, false, nil
 	}

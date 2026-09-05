@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"encoding/base64"
 	"net"
+	"net/url"
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
@@ -59,18 +60,25 @@ func TestProviderMediaRefKeepsWeComDecryptionMetadataInMemory(t *testing.T) {
 	}
 }
 
-func TestIsAllowedWeComMediaHost(t *testing.T) {
+func TestIsValidWeComMediaURL(t *testing.T) {
 	for _, test := range []struct {
-		host string
+		name string
+		uri  string
 		want bool
 	}{
-		{host: "qyapi.weixin.qq.com", want: true},
-		{host: "WEWORK.QPIC.CN", want: true},
-		{host: "example.test", want: false},
-		{host: "qyapi.weixin.qq.com.evil.test", want: false},
+		{name: "official provider URL", uri: "https://ww-aibot-img-123.cos.ap-guangzhou.myqcloud.com/file?sign=short-lived", want: true},
+		{name: "other HTTPS provider URL", uri: "https://provider.example/file", want: true},
+		{name: "http", uri: "http://provider.example/file", want: false},
+		{name: "userinfo", uri: "https://user:pass@provider.example/file", want: false},
+		{name: "explicit port", uri: "https://provider.example:443/file", want: false},
+		{name: "fragment", uri: "https://provider.example/file#fragment", want: false},
 	} {
-		if got := isAllowedWeComMediaHost(test.host); got != test.want {
-			t.Fatalf("host %q allowed = %t, want %t", test.host, got, test.want)
+		parsed, err := url.Parse(test.uri)
+		if err != nil && test.want {
+			t.Fatalf("parse %q: %v", test.uri, err)
+		}
+		if got := isValidWeComMediaURL(parsed); got != test.want {
+			t.Fatalf("%s valid = %t, want %t", test.name, got, test.want)
 		}
 	}
 }

@@ -63,6 +63,75 @@ func TestConfigFromEnvironmentParsesWorkerConcurrency(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvironmentParsesFaultPauseAfterClaim(t *testing.T) {
+	config, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:                 string(roleWorker),
+		envPostgresDSN:          "postgres://example",
+		envRedisURL:             "redis://example:6379/0",
+		envWorkerID:             "worker-a",
+		envFaultPauseAfterClaim: "10m",
+	}))
+	if err != nil || config.PauseAfterClaim != 10*time.Minute {
+		t.Fatalf("fault pause = %s, err=%v", config.PauseAfterClaim, err)
+	}
+	_, err = configFromEnvironment(environmentReader(map[string]string{
+		envRole:                 string(roleWorker),
+		envPostgresDSN:          "postgres://example",
+		envRedisURL:             "redis://example:6379/0",
+		envWorkerID:             "worker-a",
+		envFaultPauseAfterClaim: "0s",
+	}))
+	if err == nil {
+		t.Fatal("zero fault pause was accepted")
+	}
+}
+
+func TestConfigFromEnvironmentParsesFaultPauseAfterMigrationCopy(t *testing.T) {
+	config, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:                         string(roleWorker),
+		envPostgresDSN:                  "postgres://example",
+		envRedisURL:                     "redis://example:6379/0",
+		envWorkerID:                     "worker-a",
+		envFaultPauseAfterMigrationCopy: "10s",
+	}))
+	if err != nil || config.PauseAfterMigrationCopy != 10*time.Second {
+		t.Fatalf("migration copy fault pause = %s, err=%v", config.PauseAfterMigrationCopy, err)
+	}
+	_, err = configFromEnvironment(environmentReader(map[string]string{
+		envRole:                         string(roleWorker),
+		envPostgresDSN:                  "postgres://example",
+		envRedisURL:                     "redis://example:6379/0",
+		envWorkerID:                     "worker-a",
+		envFaultPauseAfterMigrationCopy: "0s",
+	}))
+	if err == nil {
+		t.Fatal("zero migration copy fault pause was accepted")
+	}
+}
+
+func TestConfigFromEnvironmentParsesFaultPauseAfterMigrationCopyItem(t *testing.T) {
+	config, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:                             string(roleWorker),
+		envPostgresDSN:                      "postgres://example",
+		envRedisURL:                         "redis://example:6379/0",
+		envWorkerID:                         "worker-a",
+		envFaultPauseAfterMigrationCopyItem: "10s",
+	}))
+	if err != nil || config.PauseAfterMigrationCopyItem != 10*time.Second {
+		t.Fatalf("migration copy item fault pause = %s, err=%v", config.PauseAfterMigrationCopyItem, err)
+	}
+	_, err = configFromEnvironment(environmentReader(map[string]string{
+		envRole:                             string(roleWorker),
+		envPostgresDSN:                      "postgres://example",
+		envRedisURL:                         "redis://example:6379/0",
+		envWorkerID:                         "worker-a",
+		envFaultPauseAfterMigrationCopyItem: "0s",
+	}))
+	if err == nil {
+		t.Fatal("zero migration copy item fault pause was accepted")
+	}
+}
+
 func TestConfigFromEnvironmentRejectsInvalidModelTimeout(t *testing.T) {
 	_, err := configFromEnvironment(environmentReader(map[string]string{
 		envRole:         string(roleWorker),
@@ -73,6 +142,41 @@ func TestConfigFromEnvironmentRejectsInvalidModelTimeout(t *testing.T) {
 	}))
 	if err == nil {
 		t.Fatal("config accepted a non-positive model timeout")
+	}
+}
+
+func TestConfigFromEnvironmentParsesArtifactRetention(t *testing.T) {
+	config, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:              string(roleWorker),
+		envPostgresDSN:       "postgres://example",
+		envRedisURL:          "redis://example:6379/0",
+		envWorkerID:          "worker-a",
+		envArtifactRetention: "48h",
+	}))
+	if err != nil || config.ArtifactRetention != 48*time.Hour {
+		t.Fatalf("artifact retention = %s, err=%v", config.ArtifactRetention, err)
+	}
+
+	config, err = configFromEnvironment(environmentReader(map[string]string{
+		envRole:              string(roleWorker),
+		envPostgresDSN:       "postgres://example",
+		envRedisURL:          "redis://example:6379/0",
+		envWorkerID:          "worker-a",
+		envArtifactRetention: "0",
+	}))
+	if err != nil || config.ArtifactRetention != 0 {
+		t.Fatalf("disabled artifact retention = %s, err=%v", config.ArtifactRetention, err)
+	}
+
+	_, err = configFromEnvironment(environmentReader(map[string]string{
+		envRole:              string(roleWorker),
+		envPostgresDSN:       "postgres://example",
+		envRedisURL:          "redis://example:6379/0",
+		envWorkerID:          "worker-a",
+		envArtifactRetention: "-1h",
+	}))
+	if err == nil {
+		t.Fatal("negative artifact retention was accepted")
 	}
 }
 

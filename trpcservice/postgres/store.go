@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
@@ -232,7 +233,8 @@ func (s *Store) ResolveAgentApp(
 	var app tenant.AgentApp
 	err := s.pool.QueryRow(
 		ctx,
-		`SELECT tenant_id, app_id, name, active_config_version, status
+		`SELECT tenant_id, app_id, name, active_config_version,
+       COALESCE(canary_config_version, ''), canary_percentage, canary_status, status
 FROM platform.agent_app
 WHERE tenant_id = $1 AND app_id = $2`,
 		tenantID,
@@ -242,6 +244,9 @@ WHERE tenant_id = $1 AND app_id = $2`,
 		&app.AppID,
 		&app.Name,
 		&app.ActiveConfigVersion,
+		&app.CanaryConfigVersion,
+		&app.CanaryPercentage,
+		&app.CanaryStatus,
 		&app.Status,
 	)
 	if err != nil {
@@ -267,7 +272,12 @@ func (s *Store) CreateCredential(
 	if !credential.ExpiresAt.IsZero() {
 		expiresAt = credential.ExpiresAt
 	}
-	if _, err := s.pool.Exec(
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin create credential: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	if _, err := tx.Exec(
 		ctx,
 		`INSERT INTO platform.api_credential
     (tenant_id, app_id, credential_id, key_digest, key_prefix, status, expires_at)
@@ -281,6 +291,15 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		expiresAt,
 	); err != nil {
 		return fmt.Errorf("create api credential: %w", err)
+	}
+	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
+		credential.TenantID, credential.AppID, "control-plane",
+		platformaudit.CredentialIssued, "issued",
+	)); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit create credential: %w", err)
 	}
 	return nil
 }
@@ -306,7 +325,12 @@ func (s *Store) RevokeCredential(
 	if credentialID == "" {
 		return errors.New("credential_id is required")
 	}
-	commandTag, err := s.pool.Exec(
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin revoke credential: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	commandTag, err := tx.Exec(
 		ctx,
 		`UPDATE platform.api_credential
 SET status = 'REVOKED'
@@ -320,6 +344,14 @@ WHERE tenant_id = $1 AND app_id = $2 AND credential_id = $3`,
 	}
 	if commandTag.RowsAffected() == 0 {
 		return fmt.Errorf("api credential: %w", ErrNotFound)
+	}
+	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
+		tenantID, appID, "control-plane", platformaudit.CredentialRevoked, "revoked",
+	)); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit revoke credential: %w", err)
 	}
 	return nil
 }

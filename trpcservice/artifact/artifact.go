@@ -26,6 +26,7 @@ type Record struct {
 	ID                 string
 	TenantID           string
 	AppID              string
+	ConfigVersion      string
 	SessionPrincipalID string
 	SessionID          string
 	Filename           string

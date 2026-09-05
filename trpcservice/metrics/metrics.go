@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -116,6 +117,23 @@ func setResultForError(labels *Labels, success, errType string) {
 	}
 }
 
+// OperationsSnapshot is the durable control-plane view exported as gauges.
+// Values are intentionally aggregate and contain no tenant or request
+// identity, so the metrics remain useful without creating unbounded series.
+type OperationsSnapshot struct {
+	ActiveExecutions  int64
+	WorkerCount       int64
+	WorkerCapacity    int64
+	QueueBacklog      int64
+	RetryBacklog      int64
+	ReplyBacklog      int64
+	PendingApprovals  int64
+	ActiveMigrations  int64
+	StuckMigrations   int64
+	MigrationProgress float64
+	AuditBacklog      int64
+}
+
 // Recorder owns the service's fixed metric instruments. It is safe for
 // concurrent use and a nil recorder is a no-op.
 type Recorder struct {
@@ -140,6 +158,23 @@ type Recorder struct {
 	auditWriteFailures  metric.Int64Counter
 	auditPurgeEvents    metric.Int64Counter
 	governanceRejected  metric.Int64Counter
+	queueLag            metric.Float64Histogram
+	retryCount          metric.Int64Counter
+	knowledgeLatency    metric.Float64Histogram
+	knowledgeErrors     metric.Int64Counter
+	operationsActive    atomic.Int64
+	operationsWorkers   atomic.Int64
+	workerCapacity      atomic.Int64
+	queueBacklog        atomic.Int64
+	retryBacklog        atomic.Int64
+	replyBacklog        atomic.Int64
+	pendingApprovals    atomic.Int64
+	activeMigrations    atomic.Int64
+	stuckMigrations     atomic.Int64
+	auditBacklog        atomic.Int64
+	migrationProgress   atomic.Uint64
+	postgresReady       atomic.Int64
+	redisReady          atomic.Int64
 	pricing             PricingCatalog
 }
 
@@ -233,7 +268,155 @@ func New(provider metric.MeterProvider, pricing PricingCatalog) (*Recorder, erro
 	if r.governanceRejected, err = newCounter("trpc_agent_service.governance.rejected"); err != nil {
 		return nil, err
 	}
+	if r.queueLag, err = newHistogram("trpc_agent_service.queue.lag"); err != nil {
+		return nil, err
+	}
+	if r.retryCount, err = newCounter("trpc_agent_service.execution.retry.count"); err != nil {
+		return nil, err
+	}
+	if r.knowledgeLatency, err = newHistogram("trpc_agent_service.knowledge.operation.latency"); err != nil {
+		return nil, err
+	}
+	if r.knowledgeErrors, err = newCounter("trpc_agent_service.knowledge.error.count"); err != nil {
+		return nil, err
+	}
+	registerInt64Gauge := func(name, description string, read func(OperationsSnapshot) int64) error {
+		_, gaugeErr := meter.Int64ObservableGauge(
+			name,
+			metric.WithDescription(description),
+			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+				observer.Observe(read(r.operationsSnapshot()))
+				return nil
+			}),
+		)
+		return gaugeErr
+	}
+	for _, gauge := range []struct {
+		name        string
+		description string
+		read        func(OperationsSnapshot) int64
+	}{
+		{"trpc_agent_service.execution.active", "Current active executions.", func(s OperationsSnapshot) int64 { return s.ActiveExecutions }},
+		{"trpc_agent_service.worker.count", "Healthy workers observed by the control plane.", func(s OperationsSnapshot) int64 { return s.WorkerCount }},
+		{"trpc_agent_service.worker.capacity", "Configured concurrency of healthy workers.", func(s OperationsSnapshot) int64 { return s.WorkerCapacity }},
+		{"trpc_agent_service.queue.backlog", "Dispatch queue backlog.", func(s OperationsSnapshot) int64 { return s.QueueBacklog }},
+		{"trpc_agent_service.execution.retry_backlog", "Execution retry backlog.", func(s OperationsSnapshot) int64 { return s.RetryBacklog }},
+		{"trpc_agent_service.im.reply.backlog", "Reply delivery backlog.", func(s OperationsSnapshot) int64 { return s.ReplyBacklog }},
+		{"trpc_agent_service.approval.pending", "Pending human approvals.", func(s OperationsSnapshot) int64 { return s.PendingApprovals }},
+		{"trpc_agent_service.migration.active", "Active data migrations.", func(s OperationsSnapshot) int64 { return s.ActiveMigrations }},
+		{"trpc_agent_service.migration.stuck", "Stuck data migrations.", func(s OperationsSnapshot) int64 { return s.StuckMigrations }},
+		{"trpc_agent_service.audit.backlog", "Audit delivery backlog.", func(s OperationsSnapshot) int64 { return s.AuditBacklog }},
+	} {
+		if err := registerInt64Gauge(gauge.name, gauge.description, gauge.read); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := meter.Float64ObservableGauge(
+		"trpc_agent_service.worker.utilization",
+		metric.WithDescription("Active executions divided by healthy worker capacity."),
+		metric.WithFloat64Callback(func(_ context.Context, observer metric.Float64Observer) error {
+			state := r.operationsSnapshot()
+			value := 0.0
+			if state.WorkerCapacity > 0 {
+				value = float64(state.ActiveExecutions) / float64(state.WorkerCapacity)
+			}
+			observer.Observe(value)
+			return nil
+		}),
+	); err != nil {
+		return nil, err
+	}
+	if _, err := meter.Float64ObservableGauge(
+		"trpc_agent_service.migration.progress",
+		metric.WithDescription("Average progress ratio of active data migrations."),
+		metric.WithFloat64Callback(func(_ context.Context, observer metric.Float64Observer) error {
+			observer.Observe(r.operationsSnapshot().MigrationProgress)
+			return nil
+		}),
+	); err != nil {
+		return nil, err
+	}
+	if _, err := meter.Int64ObservableGauge(
+		"trpc_agent_service.backend.ready",
+		metric.WithDescription("Readiness of required infrastructure backends."),
+		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+			observer.Observe(r.postgresReady.Load(), metric.WithAttributes(attribute.String("provider", "postgres")))
+			observer.Observe(r.redisReady.Load(), metric.WithAttributes(attribute.String("provider", "redis")))
+			return nil
+		}),
+	); err != nil {
+		return nil, err
+	}
 	return r, nil
+}
+
+// SetOperationsSnapshot publishes the latest aggregate control-plane sample.
+// It is safe to call from concurrent admin and maintenance paths.
+func (r *Recorder) SetOperationsSnapshot(snapshot OperationsSnapshot) {
+	if r == nil {
+		return
+	}
+	r.operationsActive.Store(nonNegative(snapshot.ActiveExecutions))
+	r.operationsWorkers.Store(nonNegative(snapshot.WorkerCount))
+	r.workerCapacity.Store(nonNegative(snapshot.WorkerCapacity))
+	r.queueBacklog.Store(nonNegative(snapshot.QueueBacklog))
+	r.retryBacklog.Store(nonNegative(snapshot.RetryBacklog))
+	r.replyBacklog.Store(nonNegative(snapshot.ReplyBacklog))
+	r.pendingApprovals.Store(nonNegative(snapshot.PendingApprovals))
+	r.activeMigrations.Store(nonNegative(snapshot.ActiveMigrations))
+	r.stuckMigrations.Store(nonNegative(snapshot.StuckMigrations))
+	r.auditBacklog.Store(nonNegative(snapshot.AuditBacklog))
+	progress := snapshot.MigrationProgress
+	if math.IsNaN(progress) || math.IsInf(progress, 0) || progress < 0 {
+		progress = 0
+	}
+	if progress > 1 {
+		progress = 1
+	}
+	r.migrationProgress.Store(math.Float64bits(progress))
+}
+
+// SetBackendReadiness publishes one required infrastructure readiness sample.
+func (r *Recorder) SetBackendReadiness(provider string, ready bool) {
+	if r == nil {
+		return
+	}
+	value := int64(0)
+	if ready {
+		value = 1
+	}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "postgres", "postgresql":
+		r.postgresReady.Store(value)
+	case "redis":
+		r.redisReady.Store(value)
+	}
+}
+
+func (r *Recorder) operationsSnapshot() OperationsSnapshot {
+	if r == nil {
+		return OperationsSnapshot{}
+	}
+	return OperationsSnapshot{
+		ActiveExecutions:  r.operationsActive.Load(),
+		WorkerCount:       r.operationsWorkers.Load(),
+		WorkerCapacity:    r.workerCapacity.Load(),
+		QueueBacklog:      r.queueBacklog.Load(),
+		RetryBacklog:      r.retryBacklog.Load(),
+		ReplyBacklog:      r.replyBacklog.Load(),
+		PendingApprovals:  r.pendingApprovals.Load(),
+		ActiveMigrations:  r.activeMigrations.Load(),
+		StuckMigrations:   r.stuckMigrations.Load(),
+		MigrationProgress: math.Float64frombits(r.migrationProgress.Load()),
+		AuditBacklog:      r.auditBacklog.Load(),
+	}
+}
+
+func nonNegative(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 // RecordRequest records ingress volume and optional classified errors.
@@ -359,6 +542,46 @@ func (r *Recorder) RecordMemory(ctx context.Context, labels Labels, latency time
 	if errType != "" {
 		r.memoryErrors.Add(ctx, 1, metric.WithAttributes(attrs...))
 	}
+}
+
+// RecordKnowledge records an immutable-config-selected knowledge backend call.
+func (r *Recorder) RecordKnowledge(ctx context.Context, labels Labels, latency time.Duration, errType string) {
+	if r == nil {
+		return
+	}
+	labels.Operation = "knowledge"
+	labels.ErrorType = errType
+	setResultForError(&labels, "success", errType)
+	attrs := labels.attributes()
+	r.knowledgeLatency.Record(ctx, latency.Seconds(), metric.WithAttributes(attrs...))
+	if errType != "" {
+		r.knowledgeErrors.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+// RecordQueueLag records the time an execution waited before a worker claim.
+func (r *Recorder) RecordQueueLag(ctx context.Context, labels Labels, lag time.Duration) {
+	if r == nil {
+		return
+	}
+	if lag < 0 {
+		lag = 0
+	}
+	labels.Operation = "queue"
+	labels.Result = "claimed"
+	r.queueLag.Record(ctx, lag.Seconds(), metric.WithAttributes(labels.attributes()...))
+}
+
+// RecordRetry records one durable execution or reply retry decision. The
+// caller supplies a stable error class, never a raw provider error.
+func (r *Recorder) RecordRetry(ctx context.Context, labels Labels, errorType string) {
+	if r == nil {
+		return
+	}
+	labels.Operation = "retry"
+	labels.Result = "retrying"
+	labels.ErrorType = errorType
+	r.retryCount.Add(ctx, 1, metric.WithAttributes(labels.attributes()...))
 }
 
 // RecordAuditFailure records a best-effort audit persistence failure.

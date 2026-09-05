@@ -49,6 +49,13 @@ type ModelRuntime struct {
 	GenerationConfig model.GenerationConfig
 }
 
+// ModelResolver builds the model selected by one immutable execution.
+// Production uses OpenAIModelResolver; deterministic E2E workers can provide
+// a model-boundary fake without replacing Runtime, Worker, or Session paths.
+type ModelResolver interface {
+	ResolveModel(context.Context, worker.Execution) (ModelRuntime, error)
+}
+
 // ModelEndpointPolicy resolves a configured OpenAI-compatible endpoint to one
 // approved for the scoped model credential. Implementations must enforce the
 // operator's hostname and network egress policy.
@@ -169,7 +176,7 @@ func (r *OpenAIModelResolver) ResolveModel(ctx context.Context, exec worker.Exec
 // lived session, memory, artifact, and knowledge services are owned by their
 // respective resolvers; the worker owns and closes each returned Runner.
 type Runtime struct {
-	models    *OpenAIModelResolver
+	models    ModelResolver
 	sessions  *platformsession.Router
 	ingestors *memorytencentdb.Resolver
 	artifacts *platformartifact.ExecutionResolver
@@ -192,7 +199,7 @@ func (r *Runtime) SetObservability(auditSink platformaudit.Sink, metricsRecorder
 // NewRuntime creates a runner builder that assembles LLMAgent,
 // Runner, and Session service instances for prepared executions.
 func NewRuntime(
-	models *OpenAIModelResolver,
+	models ModelResolver,
 	sessions *platformsession.Router,
 	ingestors *memorytencentdb.Resolver,
 	artifacts *platformartifact.ExecutionResolver,
@@ -284,6 +291,11 @@ func (r *Runtime) BuildRunner(
 		}
 		if knowledgeService == nil {
 			return nil, errors.New("configured knowledge service is required")
+		}
+		knowledgeService = &tracedKnowledge{
+			Knowledge: knowledgeService,
+			exec:      exec,
+			metrics:   r.metrics,
 		}
 	}
 	if artifactService != nil {

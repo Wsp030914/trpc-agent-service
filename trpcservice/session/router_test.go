@@ -1,10 +1,14 @@
 package session
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	frameworksession "trpc.group/trpc-go/trpc-agent-go/session"
+	"trpc.group/trpc-go/trpc-agent-go/session/noop"
 )
 
 func TestValidateBackend(t *testing.T) {
@@ -37,9 +41,8 @@ func TestValidateBackend(t *testing.T) {
 			wantErr: "does not match",
 		},
 		{
-			name:    "inmemory provider",
-			ref:     tenant.BackendRef{Kind: tenant.BackendInMemory, Provider: "inmemory", Name: "sessions"},
-			wantErr: `session provider "inmemory" is not supported`,
+			name: "inmemory provider",
+			ref:  tenant.BackendRef{Kind: tenant.BackendInMemory, Provider: "inmemory", Name: "sessions"},
 		},
 	}
 
@@ -58,3 +61,26 @@ func TestValidateBackend(t *testing.T) {
 		})
 	}
 }
+
+func TestNewRouterAllowsInMemoryOnlyLocalRuntime(t *testing.T) {
+	provider := testResolver{}
+	router, err := NewRouter(nil, nil, provider)
+	if err != nil {
+		t.Fatalf("NewRouter() error = %v", err)
+	}
+	defer func() { _ = router.Close() }()
+	exec := worker.Execution{Config: tenant.AppConfig{BackendConfig: tenant.BackendConfig{
+		Session: tenant.BackendRef{Kind: tenant.BackendInMemory, Provider: inmemoryProvider, Name: "local"},
+	}}}
+	if _, err := router.ResolveSession(context.Background(), exec); err != nil {
+		t.Fatalf("ResolveSession() error = %v", err)
+	}
+}
+
+type testResolver struct{}
+
+func (testResolver) ResolveSession(context.Context, worker.Execution) (frameworksession.Service, error) {
+	return noop.NewService(), nil
+}
+
+func (testResolver) Close() error { return nil }

@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: trpc
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     ports:
-      - "127.0.0.1:55432:5432"
+      - "127.0.0.1:${TRPC_AGENT_SERVICE_COMPOSE_POSTGRES_PORT:-55432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -20,7 +20,7 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "127.0.0.1:56379:6379"
+      - "127.0.0.1:${TRPC_AGENT_SERVICE_COMPOSE_REDIS_PORT:-56379}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -35,8 +35,8 @@ services:
     volumes:
       - qdrant-data:/qdrant/storage
     ports:
-      - "127.0.0.1:56333:6333"
-      - "127.0.0.1:56334:6334"
+      - "127.0.0.1:${TRPC_AGENT_SERVICE_COMPOSE_QDRANT_HTTP_PORT:-56333}:6333"
+      - "127.0.0.1:${TRPC_AGENT_SERVICE_COMPOSE_QDRANT_GRPC_PORT:-56334}:6334"
     healthcheck:
       test: ["CMD", "/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
       interval: 2s
@@ -62,7 +62,7 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "127.0.0.1:16686:16686"
+      - "127.0.0.1:${TRPC_AGENT_SERVICE_COMPOSE_JAEGER_PORT:-16686}:16686"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:14269/"]
       interval: 10s
@@ -74,27 +74,64 @@ services:
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
     volumes:
       - ./deploy/otel/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/otel/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     ports:
-      - "127.0.0.1:19090:9090"
+      - "127.0.0.1:${TRPC_AGENT_SERVICE_COMPOSE_PROMETHEUS_PORT:-19090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     depends_on:
       otel-collector:
         condition: service_healthy
 
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-local-only-change-me}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${TRPC_AGENT_SERVICE_COMPOSE_GRAFANA_PORT:-13000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   gateway:
     build: .
+    stop_grace_period: ${TRPC_AGENT_SERVICE_COMPOSE_STOP_GRACE_PERIOD:-45s}
     environment:
       TRPC_AGENT_SERVICE_ROLE: gateway
       TRPC_AGENT_SERVICE_POSTGRES_DSN: ${TRPC_AGENT_SERVICE_POSTGRES_DSN:?set TRPC_AGENT_SERVICE_POSTGRES_DSN in .env}
 
       TRPC_AGENT_SERVICE_REDIS_URL: ${TRPC_AGENT_SERVICE_REDIS_URL:?set TRPC_AGENT_SERVICE_REDIS_URL in .env}
+      TRPC_AGENT_SERVICE_REDIS_STREAM: ${TRPC_AGENT_SERVICE_REDIS_STREAM:-trpc-agent-service:dispatch}
+      TRPC_AGENT_SERVICE_REDIS_GROUP: ${TRPC_AGENT_SERVICE_REDIS_GROUP:-workers}
       TRPC_AGENT_SERVICE_DISPATCHER_ID: gateway-1
       TRPC_AGENT_SERVICE_ADMIN_TOKEN: ${TRPC_AGENT_SERVICE_ADMIN_TOKEN:?set TRPC_AGENT_SERVICE_ADMIN_TOKEN in .env}
+      TRPC_AGENT_SERVICE_JAEGER_URL: ${TRPC_AGENT_SERVICE_JAEGER_URL:-http://localhost:16686}
+      TRPC_AGENT_SERVICE_PROMETHEUS_URL: ${TRPC_AGENT_SERVICE_PROMETHEUS_URL:-http://localhost:19090}
+      TRPC_AGENT_SERVICE_GRAFANA_URL: ${TRPC_AGENT_SERVICE_GRAFANA_URL:-http://localhost:13000}
       TRPC_AGENT_SERVICE_OTEL_PROTOCOL: ${TRPC_AGENT_SERVICE_OTEL_PROTOCOL:-grpc}
       TRPC_AGENT_SERVICE_OTEL_TRACES_ENDPOINT: ${TRPC_AGENT_SERVICE_OTEL_TRACES_ENDPOINT:-otel-collector:4317}
       TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT: ${TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT:-otel-collector:4317}
       TRPC_AGENT_SERVICE_MODEL_PRICING: ${TRPC_AGENT_SERVICE_MODEL_PRICING:-}
       TRPC_AGENT_SERVICE_MODEL_TIMEOUT: ${TRPC_AGENT_SERVICE_MODEL_TIMEOUT:-1m}
+      TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT: ${TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT:-30s}
       TRPC_AGENT_SERVICE_WORKER_CONCURRENCY: ${TRPC_AGENT_SERVICE_WORKER_CONCURRENCY:-4}
       TRPC_AGENT_SERVICE_COS_ENDPOINTS: '${TRPC_AGENT_SERVICE_COS_ENDPOINTS:-{}}'
       TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS: '${TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS:-{}}'
@@ -106,7 +143,7 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${TRPC_AGENT_SERVICE_COMPOSE_GATEWAY_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/readyz"]
       interval: 5s
@@ -114,14 +151,25 @@ services:
       retries: 12
       start_period: 5s
 
+  admin-ui:
+    build: ./admin-ui
+    depends_on:
+      gateway:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${TRPC_AGENT_SERVICE_COMPOSE_ADMIN_UI_PORT:-4173}:80"
+
   worker-1:
     build: .
     init: true
+    stop_grace_period: ${TRPC_AGENT_SERVICE_COMPOSE_STOP_GRACE_PERIOD:-45s}
     environment:
       TRPC_AGENT_SERVICE_ROLE: worker
       TRPC_AGENT_SERVICE_WORKER_ID: worker-1
       TRPC_AGENT_SERVICE_POSTGRES_DSN: ${TRPC_AGENT_SERVICE_POSTGRES_DSN:?set TRPC_AGENT_SERVICE_POSTGRES_DSN in .env}
       TRPC_AGENT_SERVICE_REDIS_URL: ${TRPC_AGENT_SERVICE_REDIS_URL:?set TRPC_AGENT_SERVICE_REDIS_URL in .env}
+      TRPC_AGENT_SERVICE_REDIS_STREAM: ${TRPC_AGENT_SERVICE_REDIS_STREAM:-trpc-agent-service:dispatch}
+      TRPC_AGENT_SERVICE_REDIS_GROUP: ${TRPC_AGENT_SERVICE_REDIS_GROUP:-workers}
       TRPC_AGENT_SERVICE_COS_ENDPOINTS: '${TRPC_AGENT_SERVICE_COS_ENDPOINTS:-{}}'
       TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS: '${TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS:-{}}'
       TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS: '${TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS:-{}}'
@@ -133,7 +181,10 @@ services:
       TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT: ${TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT:-otel-collector:4317}
       TRPC_AGENT_SERVICE_MODEL_PRICING: ${TRPC_AGENT_SERVICE_MODEL_PRICING:-}
       TRPC_AGENT_SERVICE_MODEL_TIMEOUT: ${TRPC_AGENT_SERVICE_MODEL_TIMEOUT:-1m}
+      TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT: ${TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT:-30s}
       TRPC_AGENT_SERVICE_WORKER_CONCURRENCY: ${TRPC_AGENT_SERVICE_WORKER_CONCURRENCY:-4}
+      TRPC_AGENT_SERVICE_FAULT_PAUSE_AFTER_CLAIM: ${TRPC_AGENT_SERVICE_FAULT_PAUSE_AFTER_CLAIM:-}
+      TRPC_AGENT_SERVICE_ARTIFACT_RETENTION: ${TRPC_AGENT_SERVICE_ARTIFACT_RETENTION:-720h}
       TRPC_AGENT_SERVICE_HTTP_ADDR: :8080
     depends_on:
       postgres:
@@ -152,11 +203,14 @@ services:
   worker-2:
     build: .
     init: true
+    stop_grace_period: ${TRPC_AGENT_SERVICE_COMPOSE_STOP_GRACE_PERIOD:-45s}
     environment:
       TRPC_AGENT_SERVICE_ROLE: worker
       TRPC_AGENT_SERVICE_WORKER_ID: worker-2
       TRPC_AGENT_SERVICE_POSTGRES_DSN: ${TRPC_AGENT_SERVICE_POSTGRES_DSN:?set TRPC_AGENT_SERVICE_POSTGRES_DSN in .env}
       TRPC_AGENT_SERVICE_REDIS_URL: ${TRPC_AGENT_SERVICE_REDIS_URL:?set TRPC_AGENT_SERVICE_REDIS_URL in .env}
+      TRPC_AGENT_SERVICE_REDIS_STREAM: ${TRPC_AGENT_SERVICE_REDIS_STREAM:-trpc-agent-service:dispatch}
+      TRPC_AGENT_SERVICE_REDIS_GROUP: ${TRPC_AGENT_SERVICE_REDIS_GROUP:-workers}
       TRPC_AGENT_SERVICE_COS_ENDPOINTS: '${TRPC_AGENT_SERVICE_COS_ENDPOINTS:-{}}'
       TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS: '${TRPC_AGENT_SERVICE_QDRANT_ENDPOINTS:-{}}'
       TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS: '${TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS:-{}}'
@@ -168,7 +222,9 @@ services:
       TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT: ${TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT:-otel-collector:4317}
       TRPC_AGENT_SERVICE_MODEL_PRICING: ${TRPC_AGENT_SERVICE_MODEL_PRICING:-}
       TRPC_AGENT_SERVICE_MODEL_TIMEOUT: ${TRPC_AGENT_SERVICE_MODEL_TIMEOUT:-1m}
+      TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT: ${TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT:-30s}
       TRPC_AGENT_SERVICE_WORKER_CONCURRENCY: ${TRPC_AGENT_SERVICE_WORKER_CONCURRENCY:-4}
+      TRPC_AGENT_SERVICE_ARTIFACT_RETENTION: ${TRPC_AGENT_SERVICE_ARTIFACT_RETENTION:-720h}
       TRPC_AGENT_SERVICE_HTTP_ADDR: :8080
     depends_on:
       postgres:
@@ -189,3 +245,4 @@ volumes:
   redis-data:
   qdrant-data:
   prometheus-data:
+  grafana-data:

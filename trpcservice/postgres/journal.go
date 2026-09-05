@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
@@ -18,7 +21,12 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
-const executionEventPollInterval = 200 * time.Millisecond
+const (
+	executionEventPollInterval  = 200 * time.Millisecond
+	executionStreamRetryInitial = 100 * time.Millisecond
+	executionStreamRetryMax     = time.Second
+	executionStreamRetryWindow  = 30 * time.Second
+)
 
 // ExecutionEventJournal persists runner events and exposes them as a durable,
 // tenant-scoped stream for protocol adapters.
@@ -312,12 +320,17 @@ func (j *ExecutionEventJournal) streamExecutionEvents(
 	afterSequence int64,
 ) {
 	defer close(output)
+	retry := executionStreamRetryState{}
 	for {
 		items, err := j.executionEventsAfter(ctx, scope, requestID, afterSequence)
 		if err != nil {
+			if j.retryExecutionStreamRead(ctx, &retry, err) {
+				continue
+			}
 			sendExecutionStreamError(ctx, output, requestID, afterSequence, err)
 			return
 		}
+		retry.reset()
 		for _, item := range items {
 			select {
 			case <-ctx.Done():
@@ -331,9 +344,13 @@ func (j *ExecutionEventJournal) streamExecutionEvents(
 		}
 		status, err := j.executionStatus(ctx, scope, requestID)
 		if err != nil {
+			if j.retryExecutionStreamRead(ctx, &retry, err) {
+				continue
+			}
 			sendExecutionStreamError(ctx, output, requestID, afterSequence, err)
 			return
 		}
+		retry.reset()
 		switch status {
 		case "FAILED", "UNCERTAIN", "CANCELED":
 			terminal := event.NewErrorEvent(
@@ -361,6 +378,91 @@ func (j *ExecutionEventJournal) streamExecutionEvents(
 		case <-timer.C:
 		}
 	}
+}
+
+type executionStreamRetryState struct {
+	startedAt time.Time
+	delay     time.Duration
+}
+
+func (s *executionStreamRetryState) reset() {
+	if s == nil {
+		return
+	}
+	s.startedAt = time.Time{}
+	s.delay = 0
+}
+
+func (j *ExecutionEventJournal) retryExecutionStreamRead(
+	ctx context.Context,
+	state *executionStreamRetryState,
+	err error,
+) bool {
+	if ctx.Err() != nil || !isRetryableExecutionStreamError(err) || state == nil {
+		return false
+	}
+	now := time.Now()
+	if state.startedAt.IsZero() {
+		state.startedAt = now
+	}
+	remaining := executionStreamRetryWindow - now.Sub(state.startedAt)
+	if remaining <= 0 {
+		return false
+	}
+	delay := state.delay
+	if delay <= 0 {
+		delay = executionStreamRetryInitial
+	}
+	if delay > executionStreamRetryMax {
+		delay = executionStreamRetryMax
+	}
+	if delay > remaining {
+		delay = remaining
+	}
+	if j != nil && j.store != nil && j.store.pool != nil {
+		j.store.pool.Reset()
+	}
+	timer := time.NewTimer(delay)
+	select {
+	case <-ctx.Done():
+		if !timer.Stop() {
+			<-timer.C
+		}
+		return false
+	case <-timer.C:
+	}
+	if state.delay == 0 {
+		state.delay = executionStreamRetryInitial * 2
+	} else {
+		state.delay *= 2
+		if state.delay > executionStreamRetryMax {
+			state.delay = executionStreamRetryMax
+		}
+	}
+	return true
+}
+
+func isRetryableExecutionStreamError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if pgconn.SafeToRetry(err) {
+		return true
+	}
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return strings.HasPrefix(pgErr.Code, "08") ||
+			pgErr.Code == "57P01" || pgErr.Code == "57P02" || pgErr.Code == "57P03"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	return errors.Is(err, io.EOF)
 }
 
 func sendExecutionStreamError(

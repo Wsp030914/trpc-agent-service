@@ -1,3 +1,5 @@
+//go:build integration
+
 package postgres_test
 
 import (
@@ -32,7 +34,7 @@ var relayRedisTestURL = flag.String(
 
 func TestRelayDeliversAdmittedExecutionToWorker(t *testing.T) {
 	if *relayRedisTestURL == "" {
-		t.Skip("TRPC_AGENT_SERVICE_REDIS_TEST_URL is not set")
+		t.Fatal("TRPC_AGENT_SERVICE_REDIS_TEST_URL is required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

@@ -1,10 +1,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: trpc-agent-service-gateway
+  name: trpc-agent-service-worker
   labels:
     app.kubernetes.io/name: trpc-agent-service
-    app.kubernetes.io/component: gateway
+    app.kubernetes.io/component: worker
 spec:
   replicas: 2
   strategy:
@@ -15,17 +15,17 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: trpc-agent-service
-      app.kubernetes.io/component: gateway
+      app.kubernetes.io/component: worker
   template:
     metadata:
       labels:
         app.kubernetes.io/name: trpc-agent-service
-        app.kubernetes.io/component: gateway
+        app.kubernetes.io/component: worker
     spec:
       terminationGracePeriodSeconds: 45
       containers:
-        - name: gateway
-          image: trpc-agent-service:dev
+        - name: worker
+          image: trpc-agent-service:0.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -33,12 +33,14 @@ spec:
           envFrom:
             - configMapRef:
                 name: trpc-agent-service-config
+            - secretRef:
+                name: trpc-agent-service-secrets
           env:
             - name: TRPC_AGENT_SERVICE_ROLE
-              value: gateway
+              value: worker
             - name: TRPC_AGENT_SERVICE_HTTP_ADDR
               value: :8080
-            - name: TRPC_AGENT_SERVICE_DISPATCHER_ID
+            - name: TRPC_AGENT_SERVICE_WORKER_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
@@ -47,11 +49,16 @@ spec:
                 secretKeyRef:
                   name: trpc-agent-service-secrets
                   key: TRPC_AGENT_SERVICE_POSTGRES_DSN
-            - name: TRPC_AGENT_SERVICE_ADMIN_TOKEN
+            - name: TRPC_AGENT_SERVICE_REDIS_URL
               valueFrom:
                 secretKeyRef:
                   name: trpc-agent-service-secrets
-                  key: TRPC_AGENT_SERVICE_ADMIN_TOKEN
+                  key: TRPC_AGENT_SERVICE_REDIS_URL
+            # envFrom keeps scoped Provider SecretRef keys available to the
+            # worker. Explicit env values take precedence over envFrom, so the
+            # Gateway-only admin token is not exposed to the worker process.
+            - name: TRPC_AGENT_SERVICE_ADMIN_TOKEN
+              value: ""
           readinessProbe:
             httpGet:
               path: /readyz

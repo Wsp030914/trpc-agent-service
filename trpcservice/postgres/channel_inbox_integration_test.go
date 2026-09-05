@@ -1,3 +1,5 @@
+//go:build integration
+
 package postgres_test
 
 import (
@@ -115,6 +117,69 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = ANY($3)`,
 	}
 	if versions[first.RequestID] != canary.Version || versions[second.RequestID] != stable.Version {
 		t.Fatalf("pinned execution config versions = %#v", versions)
+	}
+}
+
+func TestConfigCanaryEnablePausePromotePinsAdmissionVersion(t *testing.T) {
+	p := newIM05Fixture(t, newIntegrationTargetProtector(t, "v1"))
+	stable, err := p.store.ResolveAppConfig(p.ctx, p.scope.TenantID, p.scope.AppID, "v1")
+	if err != nil {
+		t.Fatalf("resolve stable config: %v", err)
+	}
+	canary := stable
+	canary.Version = "v2"
+	canary.Model.Model = "canary-model"
+	if err := p.store.InsertAppConfigVersion(p.ctx, canary); err != nil {
+		t.Fatalf("insert canary config: %v", err)
+	}
+	app, err := p.store.EnableAppCanary(p.ctx, p.scope.TenantID, p.scope.AppID, canary.Version, 100)
+	if err != nil {
+		t.Fatalf("enable app canary: %v", err)
+	}
+	if app.CanaryConfigVersion != canary.Version || app.CanaryPercentage != 100 || app.CanaryStatus != tenant.CanaryEnabled {
+		t.Fatalf("enabled app canary = %#v", app)
+	}
+
+	first, err := p.store.Admit(p.ctx, newIM05Request(t, p.route, p.binding, "message-canary-v2", "request-canary-v2", channels.MessageTypeText, "canary"))
+	if err != nil {
+		t.Fatalf("admit canary execution: %v", err)
+	}
+	if first.ConfigVersion != canary.Version {
+		t.Fatalf("canary admission config = %q, want %q", first.ConfigVersion, canary.Version)
+	}
+
+	app, err = p.store.PauseAppCanary(p.ctx, p.scope.TenantID, p.scope.AppID)
+	if err != nil {
+		t.Fatalf("pause app canary: %v", err)
+	}
+	if app.CanaryStatus != tenant.CanaryPaused {
+		t.Fatalf("paused app canary = %#v", app)
+	}
+	second, err := p.store.Admit(p.ctx, newIM05Request(t, p.route, p.binding, "message-canary-paused", "request-canary-paused", channels.MessageTypeText, "paused"))
+	if err != nil {
+		t.Fatalf("admit paused canary execution: %v", err)
+	}
+	if second.ConfigVersion != stable.Version {
+		t.Fatalf("paused admission config = %q, want %q", second.ConfigVersion, stable.Version)
+	}
+
+	app, err = p.store.EnableAppCanary(p.ctx, p.scope.TenantID, p.scope.AppID, canary.Version, 100)
+	if err != nil {
+		t.Fatalf("re-enable app canary: %v", err)
+	}
+	app, err = p.store.PromoteAppCanary(p.ctx, p.scope.TenantID, p.scope.AppID)
+	if err != nil {
+		t.Fatalf("promote app canary: %v", err)
+	}
+	if app.ActiveConfigVersion != canary.Version || app.CanaryConfigVersion != "" || app.CanaryStatus != tenant.CanaryDisabled {
+		t.Fatalf("promoted app = %#v", app)
+	}
+	third, err := p.store.Admit(p.ctx, newIM05Request(t, p.route, p.binding, "message-after-promote", "request-after-promote", channels.MessageTypeText, "promoted"))
+	if err != nil {
+		t.Fatalf("admit promoted execution: %v", err)
+	}
+	if third.ConfigVersion != canary.Version {
+		t.Fatalf("promoted admission config = %q, want %q", third.ConfigVersion, canary.Version)
 	}
 }
 

@@ -62,7 +62,9 @@ AppConfig.BackendConfig
 
 Knowledge 只提供 Qdrant 检索：SQL Catalog 先校验 tenant/app/config/knowledge-base
 范围和可用版本，再返回 scoped result。Artifact 只在 SQL metadata 授权后按
-ArtifactRef/version 读取；媒体 bytes 在模型调用边界恢复。
+ArtifactRef/version 读取；媒体 bytes 在模型调用边界恢复。对象残留由 Worker
+maintenance loop 按 SQL metadata 批量精确清理，带租约、重试和引用保护，不进入
+请求主链。
 
 ## IM
 
@@ -76,4 +78,6 @@ resolve/decrypt → provider send。当前选择普通异步文本；stream/card
 
 AppConfig 的后端引用仍按 immutable version 发布。需要复制和切换数据时使用现有
 data migration admission gate；它负责排空旧执行、复制校验并切换 active version。
-知识 importer、索引任务租约和 Artifact cleanup recovery 不属于运行时主链。
+知识 importer、索引任务租约和 Artifact cleanup recovery 不属于运行时主链；其中
+Artifact cleanup 由 Worker maintenance loop 调度，仍复用 SQL authority 和对象存储
+适配器，不新增前端或 Runtime 直连路径。

@@ -1,3 +1,5 @@
+//go:build integration
+
 package postgres_test
 
 import (
@@ -117,7 +119,7 @@ func (t *laneTracker) snapshot() (completions []laneCompletion, violations []str
 // and different sessions interleave freely.
 func TestTwoConsumersPreserveSessionLanes(t *testing.T) {
 	if *relayRedisTestURL == "" {
-		t.Skip("TRPC_AGENT_SERVICE_REDIS_TEST_URL is not set")
+		t.Fatal("TRPC_AGENT_SERVICE_REDIS_TEST_URL is required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

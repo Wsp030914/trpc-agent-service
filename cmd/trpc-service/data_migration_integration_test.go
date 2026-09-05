@@ -40,7 +40,7 @@ var (
 
 func TestWorkerRuntimeCompletesRedisPostgresMigration(t *testing.T) {
 	if *dataMigrationTestDSN == "" || *dataMigrationTestURL == "" {
-		t.Skip("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN and TRPC_AGENT_SERVICE_REDIS_TEST_URL are required")
+		t.Fatal("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN and TRPC_AGENT_SERVICE_REDIS_TEST_URL are required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -118,11 +118,10 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 	if err := store.CreateDataMigration(ctx, record); err != nil {
 		t.Fatalf("create data migration: %v", err)
 	}
-	if _, err := store.BeginDataMigration(ctx, tenantID, appID, record.ID, "worker-previous", time.Now().Add(time.Minute), dataMigrationLease); err != nil {
-		t.Fatalf("begin data migration: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE platform.data_migration SET lease_until = clock_timestamp() - interval '1 second' WHERE migration_id = $1`, record.ID); err != nil {
-		t.Fatalf("expire migration lease: %v", err)
+	if started, err := store.BeginDataMigrationControlPlane(ctx, tenantID, appID, record.ID, time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("begin data migration from control plane: %v", err)
+	} else if started.LeaseOwner != "" || started.Status != migration.StatusDraining {
+		t.Fatalf("control-plane migration begin = %#v", started)
 	}
 
 	redisClient, err := platformredis.NewClient(ctx, *dataMigrationTestURL)
@@ -172,11 +171,29 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 		t.Fatalf("active config = %q, want %q", app.ActiveConfigVersion, v2.Version)
 	}
 	status := migration.Status("")
-	if err := pool.QueryRow(ctx, `SELECT status FROM platform.data_migration WHERE migration_id = $1`, record.ID).Scan(&status); err != nil {
-		t.Fatalf("query migration status: %v", err)
+	var totalSessions, copyProgress, verifyProgress, successCount int64
+	var checkpointAt *time.Time
+	var failureStage string
+	if err := pool.QueryRow(ctx, `
+SELECT status, total_sessions, copy_progress, verify_progress,
+       success_count, last_checkpoint_at, last_failure_stage
+FROM platform.data_migration
+WHERE migration_id = $1`, record.ID).Scan(
+		&status,
+		&totalSessions,
+		&copyProgress,
+		&verifyProgress,
+		&successCount,
+		&checkpointAt,
+		&failureStage,
+	); err != nil {
+		t.Fatalf("query migration checkpoint: %v", err)
 	}
 	if status != migration.StatusSucceeded {
 		t.Fatalf("migration status = %q, want %q", status, migration.StatusSucceeded)
+	}
+	if totalSessions != 1 || copyProgress != 1 || verifyProgress != 1 || successCount != 1 || checkpointAt == nil || failureStage != "" {
+		t.Fatalf("migration checkpoint = total=%d copy=%d verify=%d success=%d checkpoint_at=%v failure_stage=%q", totalSessions, copyProgress, verifyProgress, successCount, checkpointAt, failureStage)
 	}
 	targetExec := dataMigrationExecution(t, key, v2)
 	target, err := runtime.postgresSessions.ResolveSession(ctx, targetExec)
@@ -194,7 +211,7 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 
 func TestWorkerRuntimeFailsMigrationWhenSourceProviderUnavailable(t *testing.T) {
 	if *dataMigrationTestDSN == "" || *dataMigrationTestURL == "" {
-		t.Skip("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN and TRPC_AGENT_SERVICE_REDIS_TEST_URL are required")
+		t.Fatal("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN and TRPC_AGENT_SERVICE_REDIS_TEST_URL are required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -267,7 +284,7 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 
 func TestDataMigrationLeaseTakeoverRejectsPreviousWorker(t *testing.T) {
 	if *dataMigrationTestDSN == "" {
-		t.Skip("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN is required")
+		t.Fatal("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN is required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

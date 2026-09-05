@@ -43,6 +43,16 @@ func NewRetryableError(err error) error {
 // Status identifies the durable lifecycle of one backend data migration.
 type Status string
 
+// Domain identifies the platform-owned data domain being migrated.
+type Domain string
+
+const (
+	// DomainSession migrates durable Session data from Redis to PostgreSQL.
+	DomainSession Domain = "SESSION"
+	// DomainKnowledge migrates derived Knowledge vectors between Qdrant stores.
+	DomainKnowledge Domain = "KNOWLEDGE"
+)
+
 const (
 	// StatusPending means validation completed but request admission remains open.
 	StatusPending Status = "PENDING"
@@ -63,20 +73,43 @@ type Record struct {
 	ID                  string    `json:"migration_id"`
 	TenantID            string    `json:"tenant_id"`
 	AppID               string    `json:"app_id"`
+	Domain              Domain    `json:"domain,omitempty"`
 	SourceConfigVersion string    `json:"source_config_version"`
 	TargetConfigVersion string    `json:"target_config_version"`
 	Status              Status    `json:"status"`
 	LeaseOwner          string    `json:"lease_owner,omitempty"`
 	LeaseUntil          time.Time `json:"lease_until,omitempty"`
-	RunToken            string    `json:"run_token,omitempty"`
-	DrainDeadline       time.Time `json:"drain_deadline,omitempty"`
-	FailureReason       string    `json:"failure_reason,omitempty"`
+	// RunToken is a lease fencing secret. It is never part of an Admin/API
+	// response, even though the worker uses it internally.
+	RunToken         string     `json:"-"`
+	DrainDeadline    time.Time  `json:"drain_deadline,omitempty"`
+	FailureReason    string     `json:"failure_reason,omitempty"`
+	TotalSessions    int64      `json:"total_sessions"`
+	CopyProgress     int64      `json:"copy_progress"`
+	VerifyProgress   int64      `json:"verify_progress"`
+	SuccessCount     int64      `json:"success_count"`
+	LastCheckpointAt *time.Time `json:"last_checkpoint_at,omitempty"`
+	LastFailureStage string     `json:"last_failure_stage,omitempty"`
+	CreatedAt        time.Time  `json:"created_at,omitempty"`
+	UpdatedAt        time.Time  `json:"updated_at,omitempty"`
+}
+
+// EffectiveDomain keeps records created before domain-aware migrations
+// session-compatible while all persisted new records carry an explicit domain.
+func (r Record) EffectiveDomain() Domain {
+	if r.Domain == "" {
+		return DomainSession
+	}
+	return r.Domain
 }
 
 // Validate checks the persisted identity and lifecycle fields of Record.
 func (r Record) Validate() error {
 	if r.ID == "" || r.TenantID == "" || r.AppID == "" {
 		return errors.New("data migration identity is required")
+	}
+	if r.EffectiveDomain() != DomainSession && r.EffectiveDomain() != DomainKnowledge {
+		return errors.New("data migration domain is invalid")
 	}
 	if r.SourceConfigVersion == "" || r.TargetConfigVersion == "" {
 		return errors.New("data migration config versions are required")
@@ -92,6 +125,15 @@ func (r Record) Validate() error {
 	}
 	if r.LeaseOwner != "" && (r.LeaseUntil.IsZero() || r.RunToken == "") {
 		return errors.New("data migration lease is incomplete")
+	}
+	if r.TotalSessions < 0 || r.CopyProgress < 0 || r.VerifyProgress < 0 || r.SuccessCount < 0 {
+		return errors.New("data migration checkpoint values must be non-negative")
+	}
+	if r.CopyProgress > r.TotalSessions || r.VerifyProgress > r.TotalSessions {
+		return errors.New("data migration checkpoint progress exceeds total sessions")
+	}
+	if r.SuccessCount > r.TotalSessions {
+		return errors.New("data migration success count exceeds total sessions")
 	}
 	return nil
 }

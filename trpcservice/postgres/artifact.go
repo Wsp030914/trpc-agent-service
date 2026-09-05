@@ -56,6 +56,7 @@ WHERE tenant_id = $1 AND app_id = $2
 		ID:                 uuid.NewString(),
 		TenantID:           access.Scope.TenantID,
 		AppID:              access.Scope.AppID,
+		ConfigVersion:      access.ConfigVersion,
 		SessionPrincipalID: access.SessionPrincipalID,
 		SessionID:          access.SessionID,
 		Filename:           filename,
@@ -67,8 +68,8 @@ WHERE tenant_id = $1 AND app_id = $2
 	if _, err := tx.Exec(ctx, `
 INSERT INTO platform.artifact (
     artifact_id, tenant_id, app_id, session_principal_id, session_id,
-    filename, version, object_key, mime_type, size_bytes, status
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    filename, version, object_key, mime_type, size_bytes, status, config_version
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		record.ID,
 		record.TenantID,
 		record.AppID,
@@ -80,6 +81,7 @@ INSERT INTO platform.artifact (
 		record.MIMEType,
 		record.Size,
 		record.Status,
+		record.ConfigVersion,
 	); err != nil {
 		return platformartifact.Record{}, fmt.Errorf("reserve artifact metadata: %w", err)
 	}
@@ -131,7 +133,7 @@ func (s *Store) setReservedArtifactStatus(ctx context.Context, record platformar
 	}
 	tag, err := s.pool.Exec(ctx, `
 UPDATE platform.artifact
-SET status = $2, updated_at = clock_timestamp()
+SET status = $2, cleanup_next_attempt_at = clock_timestamp(), updated_at = clock_timestamp()
 WHERE artifact_id = $1 AND status = 'PENDING'`, record.ID, status)
 	if err != nil {
 		return fmt.Errorf("transition artifact reservation: %w", err)
@@ -166,7 +168,7 @@ func (s *Store) FindArtifact(
 	var record platformartifact.Record
 	err := s.pool.QueryRow(ctx, `
 SELECT artifact_id, tenant_id, app_id, session_principal_id, session_id,
-       filename, version, object_key, mime_type, size_bytes, status,
+       filename, version, object_key, mime_type, size_bytes, status, config_version,
        created_at, updated_at
 FROM platform.artifact
 WHERE tenant_id = $1 AND app_id = $2
@@ -193,6 +195,7 @@ LIMIT 1`,
 		&record.MIMEType,
 		&record.Size,
 		&record.Status,
+		&record.ConfigVersion,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	)
@@ -304,12 +307,12 @@ func (s *Store) MarkArtifactsDeleted(
 	}
 	rows, err := s.pool.Query(ctx, `
 UPDATE platform.artifact
-SET status = 'DELETED', updated_at = now()
+SET status = 'DELETED', cleanup_next_attempt_at = clock_timestamp(), updated_at = now()
 WHERE tenant_id = $1 AND app_id = $2
   AND session_principal_id = $3 AND session_id = $4
   AND filename = $5 AND status = 'AVAILABLE'
 	RETURNING artifact_id, tenant_id, app_id, session_principal_id, session_id,
-          filename, version, object_key, mime_type, size_bytes, status,
+          filename, version, object_key, mime_type, size_bytes, status, config_version,
           created_at, updated_at`,
 		access.Scope.TenantID,
 		access.Scope.AppID,
@@ -336,6 +339,7 @@ WHERE tenant_id = $1 AND app_id = $2
 			&record.MIMEType,
 			&record.Size,
 			&record.Status,
+			&record.ConfigVersion,
 			&record.CreatedAt,
 			&record.UpdatedAt,
 		); err != nil {

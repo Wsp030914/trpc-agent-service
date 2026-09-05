@@ -193,8 +193,8 @@ func attachStagedInboundArtifacts(
 		if _, err := tx.Exec(ctx, `
 INSERT INTO platform.artifact (
     artifact_id, tenant_id, app_id, session_principal_id, session_id,
-    filename, version, object_key, mime_type, size_bytes, status
-) VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, 0, $6, $7, $8, 'AVAILABLE')`,
+    filename, version, object_key, mime_type, size_bytes, status, config_version
+) VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, 0, $6, $7, $8, 'AVAILABLE', $9)`,
 			input.TenantID,
 			input.AppID,
 			sessionPrincipalID,
@@ -203,6 +203,7 @@ INSERT INTO platform.artifact (
 			staged.ObjectKey,
 			staged.MIMEType,
 			staged.Size,
+			staged.ConfigVersion,
 		); err != nil {
 			return fmt.Errorf("attach inbound artifact metadata: %w", err)
 		}

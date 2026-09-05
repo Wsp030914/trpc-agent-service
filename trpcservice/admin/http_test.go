@@ -57,14 +57,26 @@ func TestHTTPHandlerCreatesControlPlaneScopeAndOneTimeCredential(t *testing.T) {
 	published := initial.Clone()
 	published.Version = "v2"
 	published.ChannelBinding = []string{binding.BindingID}
-	postAdminJSON(t, handler, "/admin/v1/configs", struct {
+	published.BackendConfig.Session.Options = map[string]string{"endpoint": "postgres.internal:5432", "password": "raw-secret"}
+	publishedResponse := postAdminJSON(t, handler, "/admin/v1/configs", struct {
 		Config tenant.AppConfig `json:"config"`
 	}{Config: published}, http.StatusCreated, nil)
+	if strings.Contains(publishedResponse, "raw-secret") || strings.Contains(publishedResponse, "password") {
+		t.Fatalf("published config response leaked sensitive fields: %s", publishedResponse)
+	}
 	postAdminJSON(t, handler, "/admin/v1/configs/activate", map[string]string{
 		"tenant_id": initial.TenantID,
 		"app_id":    initial.AppID,
 		"version":   published.Version,
 	}, http.StatusNoContent, nil)
+	postAdminJSON(t, handler, "/admin/v1/configs/rollback", map[string]string{
+		"tenant_id": initial.TenantID,
+		"app_id":    initial.AppID,
+		"version":   initial.Version,
+	}, http.StatusNoContent, nil)
+	if repository.activatedVersion != initial.Version {
+		t.Fatalf("rolled back version = %q, want %q", repository.activatedVersion, initial.Version)
+	}
 
 	var issued struct {
 		Credential struct {
@@ -72,20 +84,16 @@ func TestHTTPHandlerCreatesControlPlaneScopeAndOneTimeCredential(t *testing.T) {
 		} `json:"credential"`
 		APIKey string `json:"api_key"`
 	}
-	postAdminJSON(t, handler, "/admin/v1/credentials", map[string]string{
+	credentialResponse := postAdminJSON(t, handler, "/admin/v1/credentials", map[string]string{
 		"tenant_id": initial.TenantID,
 		"app_id":    initial.AppID,
 	}, http.StatusCreated, &issued)
 
-	if issued.APIKey == "" || !strings.HasPrefix(issued.APIKey, "tas_") || issued.Credential.ID == "" {
+	if issued.APIKey != "" || strings.Contains(credentialResponse, `"api_key"`) || issued.Credential.ID == "" {
 		t.Fatalf("issued credential = %#v", issued)
 	}
-	digest, err := auth.DigestAPIKey(issued.APIKey)
-	if err != nil {
-		t.Fatalf("digest issued key: %v", err)
-	}
-	if repository.digest != digest || repository.credential.ID != issued.Credential.ID {
-		t.Fatalf("persisted credential = %#v", repository.credential)
+	if repository.credential.ID != issued.Credential.ID || repository.digest == (auth.APIKeyDigest{}) {
+		t.Fatalf("persisted credential = %#v digest=%#v", repository.credential, repository.digest)
 	}
 	postAdminJSON(t, handler, "/admin/v1/credentials/revoke", map[string]string{
 		"tenant_id":     initial.TenantID,
@@ -144,6 +152,43 @@ func TestHTTPHandlerListsAuditEventsByExactTenantAndAppScope(t *testing.T) {
 	if repository.auditTenantID != "tenant-a" || repository.auditAppID != "support" || repository.auditLimit != 25 {
 		t.Fatalf("audit scope = %q/%q limit=%d", repository.auditTenantID, repository.auditAppID, repository.auditLimit)
 	}
+	if len(repository.auditWrites) != 1 || repository.auditWrites[0].EventType != platformaudit.AuditQueryRead ||
+		repository.auditWrites[0].ActorRole != string(admin.RoleSystemAdmin) || repository.auditWrites[0].ResultCount != 1 ||
+		repository.auditWrites[0].QueryDigest == "" {
+		t.Fatalf("audit query event = %#v", repository.auditWrites)
+	}
+}
+
+func TestHTTPHandlerDerivesRoleAndEnforcesTenantScope(t *testing.T) {
+	repository := &recordingRepository{auditEvents: []platformaudit.Event{
+		{TenantID: "tenant-a", AppID: "support", EventType: platformaudit.ExecutionStarted},
+	}}
+	handler, err := admin.NewHTTPHandlerWithAuth(admin.API{Bindings: repository, Repository: repository}, admin.AdminAuthConfig{
+		SystemAdminToken:  testAdminToken,
+		OperatorToken:     "operator-token",
+		OperatorTenantIDs: []string{"tenant-a"},
+		AuditorToken:      "auditor-token",
+		AuditorTenantIDs:  []string{"tenant-a"},
+	})
+	if err != nil {
+		t.Fatalf("new role handler: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/admin/v1/audit-events?tenant_id=tenant-b&app_id=support", nil)
+	request.Header.Set("Authorization", "Bearer operator-token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("operator foreign tenant status = %d, want %d", response.Code, http.StatusForbidden)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/admin/v1/tenants", strings.NewReader(`{"tenant":{}}`))
+	request.Header.Set("Authorization", "Bearer auditor-token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("auditor write status = %d, want %d", response.Code, http.StatusForbidden)
+	}
 }
 
 func newAdminHandler(t *testing.T, repository *recordingRepository) http.Handler {
@@ -157,19 +202,19 @@ func newAdminHandler(t *testing.T, repository *recordingRepository) http.Handler
 
 func httpTestBinding() channels.Binding {
 	return channels.Binding{
-		TenantID:         "tenant-a",
-		AppID:            "support",
-		BindingID:        "wecom-support",
-		Channel:          channels.ChannelWeCom,
-		ExternalAccount:  "corp-agent-support",
-		Secret:           tenant.SecretRef{Name: "wecom-bot-secret", Version: "v1"},
-		PublicRouteID:    "route-wecom-support",
-		BindingRevision:  1,
-		Status:           channels.BindingActive,
+		TenantID:        "tenant-a",
+		AppID:           "support",
+		BindingID:       "wecom-support",
+		Channel:         channels.ChannelWeCom,
+		ExternalAccount: "corp-agent-support",
+		Secret:          tenant.SecretRef{Name: "wecom-bot-secret", Version: "v1"},
+		PublicRouteID:   "route-wecom-support",
+		BindingRevision: 1,
+		Status:          channels.BindingActive,
 	}
 }
 
-func postAdminJSON(t *testing.T, handler http.Handler, path string, body any, wantStatus int, target any) {
+func postAdminJSON(t *testing.T, handler http.Handler, path string, body any, wantStatus int, target any) string {
 	t.Helper()
 	encoded, err := json.Marshal(body)
 	if err != nil {
@@ -182,11 +227,13 @@ func postAdminJSON(t *testing.T, handler http.Handler, path string, body any, wa
 	if response.Code != wantStatus {
 		t.Fatalf("POST %s status = %d, want %d: %s", path, response.Code, wantStatus, response.Body.String())
 	}
+	responseBody := response.Body.String()
 	if target != nil {
-		if err := json.NewDecoder(response.Body).Decode(target); err != nil {
+		if err := json.Unmarshal([]byte(responseBody), target); err != nil {
 			t.Fatalf("decode response: %v", err)
 		}
 	}
+	return responseBody
 }
 
 func httpTestAppConfig() tenant.AppConfig {

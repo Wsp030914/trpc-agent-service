@@ -34,12 +34,6 @@ const (
 	wecomMediaPort           = "443"
 )
 
-var allowedWeComMediaHosts = map[string]struct{}{
-	"qyapi.weixin.qq.com": {},
-	"wework.qpic.cn":      {},
-	"p.qpic.cn":           {},
-}
-
 // NewIngestor creates the production media ingestor. Media is downloaded only
 // after binding authorization, stored in COS, and represented downstream by an
 // ArtifactRef.
@@ -102,8 +96,8 @@ func (d mediaDownloader) downloadWeCom(
 	if err := media.Validate(); err != nil {
 		return channels.DownloadedMedia{}, err
 	}
-	parsed, err := url.ParseRequestURI(media.Reference)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Port() != "" || !isAllowedWeComMediaHost(parsed.Hostname()) {
+	parsed, err := url.Parse(media.Reference)
+	if err != nil || !isValidWeComMediaURL(parsed) {
 		return channels.DownloadedMedia{}, errors.New("wecom media url is invalid")
 	}
 	client := newWeComMediaClient()
@@ -200,9 +194,11 @@ func decryptWeComMedia(encrypted []byte, encodedKey string) ([]byte, error) {
 	return decrypted[:len(decrypted)-padding], nil
 }
 
-func isAllowedWeComMediaHost(host string) bool {
-	_, ok := allowedWeComMediaHosts[strings.ToLower(host)]
-	return ok
+func isValidWeComMediaURL(value *url.URL) bool {
+	if value == nil || value.Scheme != "https" || value.Host == "" || value.User != nil || value.Fragment != "" || value.Port() != "" {
+		return false
+	}
+	return value.Hostname() != ""
 }
 
 func newWeComMediaClient() *http.Client {
@@ -221,7 +217,7 @@ func newWeComMediaClient() *http.Client {
 
 func dialPublicWeComHost(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
-	if err != nil || !isAllowedWeComMediaHost(host) || port != wecomMediaPort {
+	if err != nil || host == "" || port != wecomMediaPort {
 		return nil, errors.New("wecom media address is not allowed")
 	}
 	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)

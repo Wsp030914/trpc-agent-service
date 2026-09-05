@@ -161,6 +161,16 @@ func (s *Stream) Ack(ctx context.Context, delivery queue.Delivery) error {
 	return nil
 }
 
+// Release removes only this process's local ownership marker. The Redis
+// delivery remains pending and can be reclaimed after a failed durable
+// transition; this method never acknowledges the delivery.
+func (s *Stream) Release(delivery queue.Delivery) {
+	if s == nil || delivery.ID == "" {
+		return
+	}
+	s.forget(delivery.ID)
+}
+
 // Dead appends an undecodable delivery to a stream-local DLQ and acknowledges it.
 func (s *Stream) Dead(ctx context.Context, delivery queue.Delivery, cause error) error {
 	if s == nil || s.client == nil {

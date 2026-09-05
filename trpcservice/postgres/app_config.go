@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -107,6 +108,12 @@ WHERE tenant_id = $1 AND app_id = $2`,
 	}
 	if commandTag.RowsAffected() == 0 {
 		return fmt.Errorf("agent app config: %w", ErrNotFound)
+	}
+	event := controlPlaneAuditEvent(
+		tenantID, appID, version, platformaudit.ConfigActivated, "activated",
+	)
+	if err := recordControlPlaneAuditTx(ctx, tx, event); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit activate app config: %w", err)

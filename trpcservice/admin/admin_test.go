@@ -160,6 +160,7 @@ type recordingRepository struct {
 	auditTenantID       string
 	auditAppID          string
 	auditLimit          int
+	auditWrites         []platformaudit.Event
 }
 
 func (r *recordingRepository) CreateTenant(_ context.Context, value tenant.Tenant) error {
@@ -242,4 +243,9 @@ func (r *recordingRepository) ListAuditEvents(
 		}
 	}
 	return result, nil
+}
+
+func (r *recordingRepository) Record(_ context.Context, event platformaudit.Event) error {
+	r.auditWrites = append(r.auditWrites, event)
+	return nil
 }

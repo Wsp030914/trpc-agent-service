@@ -7,12 +7,41 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 )
+
+func controlPlaneAuditEvent(
+	tenantID, appID, configVersion, eventType, decision string,
+) platformaudit.Event {
+	requestID := "control-plane-" + uuid.NewString()
+	return platformaudit.Event{
+		TenantID:      tenantID,
+		AppID:         appID,
+		ActorID:       "control-plane",
+		ActorRole:     "system",
+		Decision:      decision,
+		TraceID:       requestID,
+		RequestID:     requestID,
+		ConfigVersion: configVersion,
+		EventType:     eventType,
+	}
+}
+
+func recordControlPlaneAuditTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	event platformaudit.Event,
+) error {
+	if err := insertAuditEventTx(ctx, tx, event); err != nil {
+		return fmt.Errorf("record control-plane audit: %w", err)
+	}
+	return nil
+}
 
 var _ platformaudit.Sink = (*Store)(nil)
 
@@ -42,12 +71,20 @@ func insertAuditEvent(ctx context.Context, executor interface {
 	}
 	if _, err := executor.Exec(ctx, `
 INSERT INTO platform.audit_event (
-    tenant_id, app_id, channel, user_id, session_id, agent_name, tool_name,
+    tenant_id, app_id, actor_id, actor_role, requested_tenant_id,
+    requested_app_id, query_digest, result_count, channel, user_id, session_id,
+    agent_name, tool_name,
     decision, latency, error_type, input_tokens, output_tokens, total_tokens,
     cost, trace_id, request_id, config_version, event_type, created_at
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		event.TenantID,
 		event.AppID,
+		event.ActorID,
+		event.ActorRole,
+		event.RequestedTenantID,
+		event.RequestedAppID,
+		event.QueryDigest,
+		event.ResultCount,
 		event.Channel,
 		event.UserID,
 		event.SessionID,
@@ -124,6 +161,10 @@ func (s *Store) ListAuditEventsQuery(ctx context.Context, query platformaudit.Qu
 		args = append(args, query.EventType)
 		clauses = append(clauses, fmt.Sprintf("event_type = $%d", len(args)))
 	}
+	if query.ToolName != "" {
+		args = append(args, query.ToolName)
+		clauses = append(clauses, fmt.Sprintf("tool_name = $%d", len(args)))
+	}
 	if query.TraceID != "" {
 		args = append(args, query.TraceID)
 		clauses = append(clauses, fmt.Sprintf("trace_id = $%d", len(args)))
@@ -137,14 +178,19 @@ func (s *Store) ListAuditEventsQuery(ctx context.Context, query platformaudit.Qu
 		clauses = append(clauses, fmt.Sprintf("created_at <= $%d", len(args)))
 	}
 	args = append(args, limit)
+	limitPosition := len(args)
+	args = append(args, query.Offset)
+	offsetPosition := len(args)
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
 SELECT tenant_id, app_id, channel, user_id, session_id, agent_name, tool_name,
-       decision, latency, error_type, input_tokens, output_tokens, total_tokens,
-       cost, trace_id, request_id, config_version, event_type, created_at
+       actor_id, actor_role, requested_tenant_id, requested_app_id, query_digest,
+       result_count, decision, latency, error_type, input_tokens, output_tokens,
+       total_tokens, cost, trace_id, request_id, config_version, event_type,
+       created_at
 FROM platform.audit_event
 WHERE %s
 ORDER BY created_at DESC, audit_event_id DESC
-LIMIT $%d`, strings.Join(clauses, " AND "), len(args)), args...)
+LIMIT $%d OFFSET $%d`, strings.Join(clauses, " AND "), limitPosition, offsetPosition), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query audit events: %w", err)
 	}
@@ -161,6 +207,12 @@ LIMIT $%d`, strings.Join(clauses, " AND "), len(args)), args...)
 			&event.SessionID,
 			&event.AgentName,
 			&event.ToolName,
+			&event.ActorID,
+			&event.ActorRole,
+			&event.RequestedTenantID,
+			&event.RequestedAppID,
+			&event.QueryDigest,
+			&event.ResultCount,
 			&event.Decision,
 			&latency,
 			&event.ErrorType,
