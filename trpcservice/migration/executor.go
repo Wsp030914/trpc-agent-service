@@ -230,6 +230,11 @@ func (e Executor) runKnowledge(ctx context.Context, record Record) error {
 			if err := e.checkpoint(ctx, record); err != nil {
 				return err
 			}
+			if e.AfterCopyItem != nil {
+				if err := e.AfterCopyItem(ctx, record); err != nil {
+					return err
+				}
+			}
 		}
 		record.SuccessCount = 0
 		if err := e.checkpoint(ctx, record); err != nil {

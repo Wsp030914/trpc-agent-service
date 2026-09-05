@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
 	platformknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge"
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 	platformpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -246,7 +248,8 @@ INSERT INTO platform.knowledge_chunk (
 		return value.Status == string(migration.StatusCopying) && value.CopyProgress > 0 && value.CopyProgress < int64(len(refs))
 	})
 	if err != nil {
-		t.Fatalf("wait knowledge migration checkpoint: %v\n%s", err, first.logs.String())
+		t.Fatalf("wait knowledge migration checkpoint: %v\n%s", err,
+			knowledgeMigrationDiagnostics(ctx, pool, qdrantClient, record.ID, tenantID, appID, sourceCollection, targetCollection, first.logs.String()))
 	}
 	evidence.CrashCheckpoint = checkpoint
 	app, err := store.ResolveAgentApp(ctx, tenantID, appID)
@@ -262,17 +265,30 @@ INSERT INTO platform.knowledge_chunk (
 	delete(resumeEnv, "TRPC_AGENT_SERVICE_FAULT_PAUSE_AFTER_MIGRATION_COPY_ITEM")
 	second := startMigrationWorker(t, ctx, workerBinary, resumeEnv, "knowledge-migration-worker-b")
 	resumed, err := waitMigrationE2EState(ctx, pool, record.ID, func(value migrationE2EState) bool {
-		return value.LeaseOwner == "knowledge-migration-worker-b" && value.CopyProgress > checkpoint.CopyProgress
+		// Copy progress is durable and monotonic. Lease ownership is cleared
+		// when the migration reaches a terminal state, so it is too transient
+		// to use as the resume wait condition.
+		if value.CopyProgress <= checkpoint.CopyProgress {
+			return false
+		}
+		switch value.Status {
+		case string(migration.StatusCopying), string(migration.StatusVerifying), string(migration.StatusSucceeded):
+			return true
+		default:
+			return false
+		}
 	})
 	if err != nil {
-		t.Fatalf("wait knowledge migration reclaim/resume after %s: %v", knowledgeMigrationLeaseWaitBuffer, err)
+		t.Fatalf("wait knowledge migration reclaim/resume after %s: %v\n%s", knowledgeMigrationLeaseWaitBuffer, err,
+			knowledgeMigrationDiagnostics(ctx, pool, qdrantClient, record.ID, tenantID, appID, sourceCollection, targetCollection, second.logs.String()))
 	}
 	evidence.Resume = resumed
 	terminal, err := waitMigrationE2EState(ctx, pool, record.ID, func(value migrationE2EState) bool {
 		return value.Status == string(migration.StatusSucceeded)
 	})
 	if err != nil {
-		t.Fatalf("wait knowledge migration terminal state: %v", err)
+		t.Fatalf("wait knowledge migration terminal state: %v\n%s", err,
+			knowledgeMigrationDiagnostics(ctx, pool, qdrantClient, record.ID, tenantID, appID, sourceCollection, targetCollection, second.logs.String()))
 	}
 	evidence.Terminal = terminal
 	if terminal.TotalSessions != int64(len(refs)) ||
@@ -320,6 +336,77 @@ INSERT INTO platform.knowledge_chunk (
 	}
 	evidence.NoForeignPoint = true
 	stopRuntimeWorker(second, true)
+}
+
+func knowledgeMigrationDiagnostics(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	qdrantClient qdrantstorage.Client,
+	migrationID, tenantID, appID, sourceCollection, targetCollection, workerLogs string,
+) string {
+	diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	lines := []string{fmt.Sprintf("knowledge migration diagnostics: migration_id=%s", migrationID)}
+	if value, err := readMigrationE2EState(diagnosticCtx, pool, migrationID); err != nil {
+		lines = append(lines, "state_error="+platformlog.SafeError(err))
+	} else {
+		lines = append(lines, fmt.Sprintf(
+			"status=%s lease_owner=%s total=%d copy_progress=%d verify_progress=%d failure_stage=%s failure_reason=%s",
+			value.Status, value.LeaseOwner, value.TotalSessions, value.CopyProgress,
+			value.VerifyProgress, value.FailureStage, safeKnowledgeDiagnostic(value.FailureReason)))
+	}
+
+	var catalogCount int64
+	if err := pool.QueryRow(diagnosticCtx, `
+SELECT count(*)
+FROM platform.knowledge_chunk
+WHERE tenant_id = $1 AND app_id = $2`, tenantID, appID).Scan(&catalogCount); err != nil {
+		lines = append(lines, "knowledge_catalog_count_error="+platformlog.SafeError(err))
+	} else {
+		lines = append(lines, fmt.Sprintf("knowledge_catalog_count=%d", catalogCount))
+	}
+
+	sourceExists, sourceErr := qdrantClient.CollectionExists(diagnosticCtx, sourceCollection)
+	targetExists, targetErr := qdrantClient.CollectionExists(diagnosticCtx, targetCollection)
+	lines = append(lines, fmt.Sprintf("source_collection=%s exists=%t", sourceCollection, sourceExists))
+	if sourceErr != nil {
+		lines = append(lines, "source_collection_error="+platformlog.SafeError(sourceErr))
+	}
+	lines = append(lines, fmt.Sprintf("target_collection=%s exists=%t", targetCollection, targetExists))
+	if targetErr != nil {
+		lines = append(lines, "target_collection_error="+platformlog.SafeError(targetErr))
+	}
+	lines = append(lines, "worker_last_log:\n"+safeKnowledgeWorkerLogTail(workerLogs))
+	return strings.Join(lines, "\n")
+}
+
+func safeKnowledgeDiagnostic(value string) string {
+	if value == "" {
+		return ""
+	}
+	return platformlog.SafeError(fmt.Errorf("%s", value))
+}
+
+func safeKnowledgeWorkerLogTail(logs string) string {
+	lines := strings.Split(strings.TrimSpace(logs), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return "(none)"
+	}
+	if len(lines) > 20 {
+		lines = lines[len(lines)-20:]
+	}
+	safeLines := make([]string, 0, len(lines))
+	for _, line := range lines {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "payload") || strings.Contains(lower, "request body") ||
+			strings.Contains(lower, "raw request") || strings.Contains(lower, "raw payload") {
+			safeLines = append(safeLines, "[redacted worker log line]")
+			continue
+		}
+		safeLines = append(safeLines, platformlog.SafeError(fmt.Errorf("%s", line)))
+	}
+	return strings.Join(safeLines, "\n")
 }
 
 type knowledgeMigrationE2EEvidence struct {

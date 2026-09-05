@@ -37,7 +37,6 @@ jobs:
     timeout-minutes: 30
     env:
       COMPOSE_PROJECT_NAME: trpc-agent-service-capacity-${{ github.run_id }}
-      CAPACITY_API_KEY_FILE: ${{ runner.temp }}/trpc-agent-service-capacity-api-key
       CAPACITY_CONCURRENCY: ${{ inputs.concurrency }}
       CAPACITY_REQUESTS: ${{ inputs.requests }}
       CAPACITY_DURATION: ${{ inputs.duration }}
@@ -77,12 +76,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          capacity_api_key_file="$RUNNER_TEMP/trpc-agent-service-capacity-api-key"
           mkdir -p data/capacity
           umask 077
           TRPC_AGENT_SERVICE_POSTGRES_DSN="$CAPACITY_POSTGRES_DSN" \
-            TRPC_CAPACITY_API_KEY_FILE="$CAPACITY_API_KEY_FILE" go run ./cmd/capacity-prepare
-          test -s "$CAPACITY_API_KEY_FILE"
-          export TRPC_AGENT_SERVICE_CAPACITY_API_KEY="$(<"$CAPACITY_API_KEY_FILE")"
+            TRPC_CAPACITY_API_KEY_FILE="$capacity_api_key_file" go run ./cmd/capacity-prepare
+          test -s "$capacity_api_key_file"
+          export TRPC_AGENT_SERVICE_CAPACITY_API_KEY="$(<"$capacity_api_key_file")"
           test -n "$TRPC_AGENT_SERVICE_CAPACITY_API_KEY"
           duration_args=()
           if [ -n "$CAPACITY_DURATION" ]; then
@@ -185,6 +185,6 @@ jobs:
         if: ${{ always() }}
         shell: bash
         run: |
-          rm -f "$CAPACITY_API_KEY_FILE"
+          rm -f "$RUNNER_TEMP/trpc-agent-service-capacity-api-key"
           docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml \
             down --volumes --remove-orphans || true
