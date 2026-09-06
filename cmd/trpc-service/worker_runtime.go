@@ -143,6 +143,25 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		platformartifact.CleanupOptions{
 			Owner:        deps.owner,
 			RetentionAge: deps.artifactRetention,
+			InboundDeleteObject: func(ctx context.Context, candidate platformartifact.InboundCleanupCandidate) error {
+				config, err := deps.store.ResolveAppConfig(
+					ctx, candidate.TenantID, candidate.AppID, candidate.ConfigVersion,
+				)
+				if err != nil {
+					return fmt.Errorf("resolve inbound artifact cleanup config: %w", err)
+				}
+				ref := config.BackendConfig.Artifact
+				if ref.IsZero() {
+					return errors.New("inbound artifact cleanup config has no artifact backend")
+				}
+				return deps.artifacts.DeleteExactObject(
+					ctx,
+					tenant.Scope{TenantID: candidate.TenantID, AppID: candidate.AppID},
+					candidate.ConfigVersion,
+					ref,
+					candidate.ObjectKey,
+				)
+			},
 		},
 	)
 	if err != nil {

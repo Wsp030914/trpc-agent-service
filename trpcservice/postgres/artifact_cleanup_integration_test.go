@@ -160,12 +160,108 @@ WHERE tenant_id = $1 AND app_id = $2 AND filename = 'expired.txt'`, tenantID, ap
 	}
 }
 
+func TestInboundArtifactCleanupClaimsRetriesAndCompletes(t *testing.T) {
+	pool := openIntegrationPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	store, err := platformpostgres.New(pool)
+	if err != nil {
+		t.Fatalf("new postgres store: %v", err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	tenantID := fmt.Sprintf("artifact-cleanup-inbound-%d", time.Now().UnixNano())
+	appID := "support"
+	config := integrationAppConfig("v1", "cleanup-inbound-model")
+	config.TenantID, config.AppID = tenantID, appID
+	if err := store.CreateTenant(ctx, tenant.Tenant{ID: tenantID, Name: tenantID, Status: tenant.StatusActive}); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if err := store.CreateAgentApp(ctx, tenant.AgentApp{
+		TenantID: tenantID, AppID: appID, Name: "Support", ActiveConfigVersion: config.Version, Status: tenant.StatusActive,
+	}, config); err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO platform.channel_binding (
+    tenant_id, app_id, binding_id, channel, external_account, status
+) VALUES ($1, $2, 'binding-inbound-cleanup', 'feishu', 'inbound-cleanup-account', 'ACTIVE')`, tenantID, appID); err != nil {
+		t.Fatalf("create binding: %v", err)
+	}
+
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO platform.inbound_artifact (
+    tenant_id, app_id, binding_id, external_message_id, item_no,
+    artifact_ref, config_version, filename, object_key, mime_type, size_bytes,
+    status, created_at, updated_at, cleanup_next_attempt_at
+) VALUES ($1, $2, 'binding-inbound-cleanup', 'message-inbound-cleanup', 0,
+          'artifact://inbound/cleanup@0', 'v1', 'cleanup.bin', 'objects/inbound-cleanup',
+          'application/octet-stream', 1, 'PENDING', $3, $3, $3)`, tenantID, appID, old); err != nil {
+		t.Fatalf("insert inbound artifact: %v", err)
+	}
+
+	candidates, err := store.ClaimInboundArtifactCleanup(ctx, "inbound-cleanup-1", time.Now().UTC().Add(-time.Hour), time.Minute, 10)
+	if err != nil {
+		t.Fatalf("claim inbound cleanup: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].Attempts != 1 || candidates[0].ObjectKey != "objects/inbound-cleanup" {
+		t.Fatalf("inbound cleanup candidates = %#v", candidates)
+	}
+	candidate := candidates[0]
+	if err := store.RetryInboundArtifactCleanup(ctx, candidate, "inbound-cleanup-1", time.Now().UTC().Add(time.Hour), errors.New("delete failed: api_key=cleanup-secret")); err != nil {
+		t.Fatalf("retry inbound cleanup: %v", err)
+	}
+	var lastError string
+	if err := pool.QueryRow(ctx, `
+SELECT cleanup_last_error
+FROM platform.inbound_artifact
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = 'binding-inbound-cleanup'`, tenantID, appID).Scan(&lastError); err != nil {
+		t.Fatalf("read inbound cleanup retry: %v", err)
+	}
+	if strings.Contains(lastError, "cleanup-secret") {
+		t.Fatalf("persisted inbound cleanup error contains secret: %q", lastError)
+	}
+
+	if _, err := pool.Exec(ctx, `
+UPDATE platform.inbound_artifact
+SET cleanup_next_attempt_at = clock_timestamp() - interval '1 second'
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = 'binding-inbound-cleanup'`, tenantID, appID); err != nil {
+		t.Fatalf("make inbound cleanup retryable: %v", err)
+	}
+	candidates, err = store.ClaimInboundArtifactCleanup(ctx, "inbound-cleanup-2", time.Now().UTC().Add(-time.Hour), time.Minute, 10)
+	if err != nil {
+		t.Fatalf("reclaim inbound cleanup: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].Attempts != 2 {
+		t.Fatalf("reclaimed inbound cleanup candidates = %#v", candidates)
+	}
+	if err := store.CompleteInboundArtifactCleanup(ctx, candidates[0], "inbound-cleanup-2"); err != nil {
+		t.Fatalf("complete inbound cleanup: %v", err)
+	}
+
+	var completedAt *time.Time
+	var owner *string
+	if err := pool.QueryRow(ctx, `
+SELECT cleanup_completed_at, cleanup_owner
+FROM platform.inbound_artifact
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = 'binding-inbound-cleanup'`, tenantID, appID).Scan(&completedAt, &owner); err != nil {
+		t.Fatalf("read completed inbound cleanup: %v", err)
+	}
+	if completedAt == nil || owner != nil {
+		t.Fatalf("completed inbound cleanup state = completed_at %v owner %v", completedAt, owner)
+	}
+}
+
 func cleanupArtifactFixtures(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
 	for _, query := range []string{
 		`DELETE FROM platform.reply_outbox WHERE tenant_id LIKE 'artifact-cleanup-%'`,
 		`DELETE FROM platform.execution_event WHERE tenant_id LIKE 'artifact-cleanup-%'`,
 		`DELETE FROM platform.execution WHERE tenant_id LIKE 'artifact-cleanup-%'`,
+		`DELETE FROM platform.inbound_artifact WHERE tenant_id LIKE 'artifact-cleanup-%'`,
 		`DELETE FROM platform.channel_binding WHERE tenant_id LIKE 'artifact-cleanup-%'`,
 		`DELETE FROM platform.artifact WHERE tenant_id LIKE 'artifact-cleanup-%'`,
 		`DELETE FROM platform.session_lane WHERE tenant_id LIKE 'artifact-cleanup-%'`,

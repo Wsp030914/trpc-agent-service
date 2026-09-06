@@ -359,6 +359,9 @@ func TestWorkerRunDrainsEventsAfterSinkError(t *testing.T) {
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("run error = %v, want sink error", err)
 	}
+	if !worker.IsSideEffectUncertainError(err) {
+		t.Fatalf("run error = %v, want side-effect-uncertain classification", err)
+	}
 	if result.EventCount != 2 {
 		t.Fatalf("event count = %d, want 2", result.EventCount)
 	}

@@ -562,7 +562,11 @@ func (g Gateway) handle(
 		return AdmissionResult{}, err
 	}
 	if err := result.Validate(); err != nil {
-		return AdmissionResult{}, fmt.Errorf("admitter result: %w", err)
+		validationErr := fmt.Errorf("admitter result: %w", err)
+		if cleanup != nil {
+			validationErr = errors.Join(validationErr, cleanup(context.WithoutCancel(admitCtx)))
+		}
+		return AdmissionResult{}, validationErr
 	}
 	return result, nil
 }

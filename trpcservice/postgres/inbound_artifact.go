@@ -34,6 +34,9 @@ type StagedInboundArtifact struct {
 	MIMEType          string
 	Size              int64
 	Status            string
+	// Created reports whether StageInboundArtifact inserted this row for the
+	// current call rather than returning an existing idempotent stage.
+	Created           bool
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
@@ -51,7 +54,7 @@ func (s *Store) StageInboundArtifact(
 	if err := validateStagedInboundArtifact(record); err != nil {
 		return StagedInboundArtifact{}, err
 	}
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 INSERT INTO platform.inbound_artifact (
 	    tenant_id, app_id, binding_id, external_message_id, item_no,
 	    artifact_ref, config_version, filename, object_key, mime_type, size_bytes,
@@ -80,6 +83,7 @@ ON CONFLICT (tenant_id, app_id, binding_id, external_message_id, item_no) DO NOT
 	if staged.Status == inboundArtifactDeleted {
 		return StagedInboundArtifact{}, errors.New("staged inbound artifact was deleted")
 	}
+	staged.Created = tag.RowsAffected() == 1
 	return staged, nil
 }
 

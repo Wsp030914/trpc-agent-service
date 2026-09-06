@@ -142,7 +142,7 @@ WITH candidates AS (
           AND p.binding_id = o.binding_id
           AND p.request_id = o.request_id
           AND p.revision < o.revision
-          AND p.status <> 'SENT'
+          AND p.status IN ('PENDING', 'SENDING', 'UNCERTAIN')
     )
     ORDER BY o.created_at, o.reply_id
     FOR UPDATE SKIP LOCKED

@@ -40,6 +40,18 @@ func TestConfigFromEnvironmentRequiresExplicitWorkerIdentity(t *testing.T) {
 	}
 }
 
+func TestShutdownResourceCloseSkippedAfterShutdownTimeout(t *testing.T) {
+	if !shutdownResourceCloseSkipped(errWorkerShutdownTimeout) {
+		t.Fatal("worker shutdown timeout did not skip shared resource close")
+	}
+	if !shutdownResourceCloseSkipped(context.DeadlineExceeded) {
+		t.Fatal("deadline exceeded did not skip shared resource close")
+	}
+	if shutdownResourceCloseSkipped(errors.New("ordinary shutdown error")) {
+		t.Fatal("ordinary shutdown error incorrectly skipped shared resource close")
+	}
+}
+
 func TestConfigFromEnvironmentParsesWorkerConcurrency(t *testing.T) {
 	config, err := configFromEnvironment(environmentReader(map[string]string{
 		envRole:              string(roleWorker),

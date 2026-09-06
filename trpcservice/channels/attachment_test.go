@@ -41,7 +41,7 @@ func TestArtifactIngestorMaterializesOnlyArtifactRefs(t *testing.T) {
 		t.Fatalf("new channel input: %v", err)
 	}
 
-	writer := &recordingArtifactWriter{ref: "artifact://inbound/one"}
+	writer := &recordingArtifactWriter{ref: "artifact://inbound/one", owned: true}
 	ingestor, err := channels.NewArtifactIngestor(
 		recordingMediaDownloader{download: func(_ context.Context, got channels.ChannelInput, media channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
 			if got.ArtifactRefs != nil {
@@ -91,7 +91,7 @@ func TestArtifactIngestorRejectsOversizedMediaBeforeWrite(t *testing.T) {
 		t.Fatalf("new channel input: %v", err)
 	}
 
-	writer := &recordingArtifactWriter{ref: "artifact://inbound/one"}
+	writer := &recordingArtifactWriter{ref: "artifact://inbound/one", owned: true}
 	ingestor, err := channels.NewArtifactIngestor(
 		recordingMediaDownloader{download: func(context.Context, channels.ChannelInput, channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
 			return channels.DownloadedMedia{Data: []byte("12345")}, nil
@@ -125,7 +125,7 @@ func TestArtifactIngestorPinnedPreparationCompensatesPartialBatch(t *testing.T) 
 	if err != nil {
 		t.Fatalf("new channel input: %v", err)
 	}
-	writer := &recordingArtifactWriter{ref: "artifact://inbound/one@0"}
+	writer := &recordingArtifactWriter{ref: "artifact://inbound/one@0", owned: true}
 	count := 0
 	ingestor, err := channels.NewArtifactIngestor(recordingMediaDownloader{download: func(context.Context, channels.ChannelInput, channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
 		count++
@@ -149,8 +149,43 @@ func TestArtifactIngestorPinnedPreparationCompensatesPartialBatch(t *testing.T) 
 	}
 }
 
+func TestArtifactIngestorDoesNotCompensateSharedArtifact(t *testing.T) {
+	input, err := channels.NewChannelInput(channels.ChannelInput{
+		TenantID: "tenant-a", AppID: "support", Channel: channels.ChannelWeCom,
+		BindingID: "binding-1", BindingRevision: 1, ExternalMessageID: "message-shared",
+		Conversation: channels.ChannelConversation{Kind: channels.ConversationDirect},
+		MessageType:  channels.MessageTypeImage,
+	}, channels.ChannelMappingInput{ExternalSenderID: "user-1", ProviderSenderTarget: "user-1"})
+	if err != nil {
+		t.Fatalf("new channel input: %v", err)
+	}
+	writer := &recordingArtifactWriter{ref: "artifact://inbound/shared@0", owned: false}
+	ingestor, err := channels.NewArtifactIngestor(
+		recordingMediaDownloader{download: func(context.Context, channels.ChannelInput, channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
+			return channels.DownloadedMedia{Filename: "shared.png", MIMEType: "image/png", Data: []byte("shared")}, nil
+		}},
+		writer,
+	)
+	if err != nil {
+		t.Fatalf("new artifact ingestor: %v", err)
+	}
+	_, cleanup, err := ingestor.PreparePinned(context.Background(), input, []channels.ProviderMediaRef{{
+		Kind: channels.MessageTypeImage, Reference: "provider-shared",
+	}}, "v-canary")
+	if err != nil {
+		t.Fatalf("prepare shared artifact: %v", err)
+	}
+	if err := cleanup(context.Background()); err != nil {
+		t.Fatalf("cleanup shared artifact: %v", err)
+	}
+	if len(writer.deleted) != 0 {
+		t.Fatalf("shared artifacts were compensated: %#v", writer.deleted)
+	}
+}
+
 type recordingArtifactWriter struct {
 	ref      string
+	owned    bool
 	artifact channels.InboundArtifact
 	called   bool
 	deleted  []channels.InboundArtifact
@@ -168,10 +203,10 @@ func (d recordingMediaDownloader) Download(
 	return d.download(ctx, input, media)
 }
 
-func (w *recordingArtifactWriter) WriteInboundArtifact(_ context.Context, artifact channels.InboundArtifact) (string, error) {
+func (w *recordingArtifactWriter) WriteInboundArtifact(_ context.Context, artifact channels.InboundArtifact) (string, bool, error) {
 	w.called = true
 	w.artifact = artifact
-	return w.ref, nil
+	return w.ref, w.owned, nil
 }
 
 func (w *recordingArtifactWriter) DeleteInboundArtifact(_ context.Context, artifact channels.InboundArtifact, _ string) error {

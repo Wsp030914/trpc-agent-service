@@ -401,7 +401,10 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		return result, err
 	}
 	if sinkErr != nil {
-		return result, sinkErr
+		// The runner may already have executed a side-effecting tool when event
+		// persistence failed. Do not let Consumer turn a projection failure into
+		// a false FAILED result or blindly replay the whole execution.
+		return result, NewSideEffectUncertainError(sinkErr)
 	}
 	if runnerErr != nil {
 		return result, runnerErr

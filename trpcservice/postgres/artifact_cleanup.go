@@ -167,6 +167,184 @@ RETURNING a.artifact_id, a.tenant_id, a.app_id, a.session_principal_id,
 	return candidates, nil
 }
 
+// ClaimInboundArtifactCleanup leases pre-admission objects that were deleted
+// by compensation or left pending beyond the bounded staging age. ATTACHED
+// rows are excluded by SQL and cannot be reclaimed by this worker.
+func (s *Store) ClaimInboundArtifactCleanup(
+	ctx context.Context,
+	owner string,
+	pendingBefore time.Time,
+	leaseDuration time.Duration,
+	limit int,
+) ([]platformartifact.InboundCleanupCandidate, error) {
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	if owner == "" {
+		return nil, errors.New("inbound artifact cleanup owner is required")
+	}
+	if pendingBefore.IsZero() {
+		return nil, errors.New("inbound artifact cleanup pending cutoff is required")
+	}
+	if leaseDuration <= 0 {
+		return nil, errors.New("inbound artifact cleanup lease duration must be positive")
+	}
+	if limit <= 0 || limit > maxArtifactCleanupBatchSize {
+		return nil, errors.New("inbound artifact cleanup batch size is invalid")
+	}
+	rows, err := s.pool.Query(ctx, `
+WITH candidates AS (
+    SELECT tenant_id, app_id, binding_id, external_message_id, item_no
+    FROM platform.inbound_artifact
+    WHERE cleanup_completed_at IS NULL
+      AND cleanup_next_attempt_at <= clock_timestamp()
+      AND (cleanup_owner IS NULL OR cleanup_lease_until <= clock_timestamp())
+      AND (
+          status = 'DELETED'
+          OR (status = 'PENDING' AND created_at <= $3)
+      )
+    ORDER BY cleanup_next_attempt_at, updated_at, external_message_id, item_no
+    FOR UPDATE SKIP LOCKED
+    LIMIT $4
+)
+UPDATE platform.inbound_artifact AS a
+SET status = 'DELETED',
+    cleanup_owner = $1,
+    cleanup_lease_until = clock_timestamp() + $2::interval,
+    cleanup_attempts = a.cleanup_attempts + 1,
+    cleanup_last_error = '',
+    updated_at = clock_timestamp()
+FROM candidates AS c
+WHERE a.tenant_id = c.tenant_id
+  AND a.app_id = c.app_id
+  AND a.binding_id = c.binding_id
+  AND a.external_message_id = c.external_message_id
+  AND a.item_no = c.item_no
+RETURNING a.tenant_id, a.app_id, a.binding_id, a.external_message_id,
+          a.item_no, a.artifact_ref, a.config_version, a.object_key,
+          a.cleanup_attempts`,
+		owner,
+		intervalLiteral(leaseDuration),
+		pendingBefore.UTC(),
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claim inbound artifact cleanup: %w", err)
+	}
+	defer rows.Close()
+	candidates := make([]platformartifact.InboundCleanupCandidate, 0)
+	for rows.Next() {
+		var candidate platformartifact.InboundCleanupCandidate
+		if err := rows.Scan(
+			&candidate.TenantID,
+			&candidate.AppID,
+			&candidate.BindingID,
+			&candidate.ExternalMessageID,
+			&candidate.ItemNo,
+			&candidate.ArtifactRef,
+			&candidate.ConfigVersion,
+			&candidate.ObjectKey,
+			&candidate.Attempts,
+		); err != nil {
+			return nil, fmt.Errorf("scan inbound artifact cleanup candidate: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate inbound artifact cleanup candidates: %w", err)
+	}
+	return candidates, nil
+}
+
+// CompleteInboundArtifactCleanup acknowledges an exact object only while the
+// cleanup worker still owns its live lease.
+func (s *Store) CompleteInboundArtifactCleanup(
+	ctx context.Context,
+	candidate platformartifact.InboundCleanupCandidate,
+	owner string,
+) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	if owner == "" {
+		return errors.New("inbound artifact cleanup owner is required")
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE platform.inbound_artifact
+SET cleanup_completed_at = clock_timestamp(),
+    cleanup_owner = NULL,
+    cleanup_lease_until = NULL,
+    cleanup_last_error = '',
+    updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
+  AND external_message_id = $4 AND item_no = $5
+  AND artifact_ref = $6 AND cleanup_owner = $7
+  AND cleanup_completed_at IS NULL
+  AND cleanup_lease_until > clock_timestamp()`,
+		candidate.TenantID, candidate.AppID, candidate.BindingID,
+		candidate.ExternalMessageID, candidate.ItemNo, candidate.ArtifactRef, owner,
+	)
+	if err != nil {
+		return fmt.Errorf("complete inbound artifact cleanup: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("inbound artifact cleanup lease is lost")
+	}
+	return nil
+}
+
+// RetryInboundArtifactCleanup releases a failed cleanup claim into the
+// durable retry queue while retaining only a redacted error summary.
+func (s *Store) RetryInboundArtifactCleanup(
+	ctx context.Context,
+	candidate platformartifact.InboundCleanupCandidate,
+	owner string,
+	nextAttempt time.Time,
+	cause error,
+) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	if owner == "" {
+		return errors.New("inbound artifact cleanup owner is required")
+	}
+	if nextAttempt.IsZero() {
+		return errors.New("inbound artifact cleanup next attempt is required")
+	}
+	if cause == nil {
+		return errors.New("inbound artifact cleanup failure is required")
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE platform.inbound_artifact
+SET cleanup_owner = NULL,
+    cleanup_lease_until = NULL,
+    cleanup_next_attempt_at = $7,
+    cleanup_last_error = $8,
+    updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
+  AND external_message_id = $4 AND item_no = $5
+  AND artifact_ref = $6 AND cleanup_owner = $9
+  AND cleanup_completed_at IS NULL
+  AND cleanup_lease_until > clock_timestamp()`,
+		candidate.TenantID, candidate.AppID, candidate.BindingID,
+		candidate.ExternalMessageID, candidate.ItemNo, candidate.ArtifactRef,
+		nextAttempt.UTC(), platformlog.SafeError(cause), owner,
+	)
+	if err != nil {
+		return fmt.Errorf("retry inbound artifact cleanup: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("inbound artifact cleanup lease is lost")
+	}
+	return nil
+}
+
 // CompleteArtifactCleanup marks the exact object as removed only while the
 // worker still owns its live lease. A stale worker cannot acknowledge a new
 // owner's claim after lease expiry.
@@ -280,3 +458,4 @@ func scanArtifactCleanupCandidate(scanner interface{ Scan(...any) error }) (plat
 }
 
 var _ platformartifact.CleanupStore = (*Store)(nil)
+var _ platformartifact.InboundCleanupStore = (*Store)(nil)

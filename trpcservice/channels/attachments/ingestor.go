@@ -265,23 +265,23 @@ type inboundArtifactWriter struct {
 func (w inboundArtifactWriter) WriteInboundArtifact(
 	ctx context.Context,
 	input channels.InboundArtifact,
-) (string, error) {
+) (string, bool, error) {
 	if w.store == nil || w.resolver == nil {
-		return "", errors.New("production artifact writer is not initialized")
+		return "", false, errors.New("production artifact writer is not initialized")
 	}
 	if err := input.Validate(); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if input.ConfigVersion == "" {
-		return "", errors.New("inbound artifact config version is required")
+		return "", false, errors.New("inbound artifact config version is required")
 	}
 	config, err := w.store.ResolveAppConfig(ctx, input.TenantID, input.AppID, input.ConfigVersion)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	ref := config.BackendConfig.Artifact
 	if ref.IsZero() {
-		return "", errors.New("artifact backend is required for inbound media")
+		return "", false, errors.New("artifact backend is required for inbound media")
 	}
 	objectStore, err := w.resolver.ResolveInboundStore(
 		ctx,
@@ -290,7 +290,7 @@ func (w inboundArtifactWriter) WriteInboundArtifact(
 		ref,
 	)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	objectID := uuid.NewString()
 	artifactName := "inbound/" + objectID
@@ -301,7 +301,7 @@ func (w inboundArtifactWriter) WriteInboundArtifact(
 		Name:     input.Filename,
 	})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	staged, err := w.store.StageInboundArtifact(ctx, postgres.StagedInboundArtifact{
 		TenantID:          input.TenantID,
@@ -317,14 +317,22 @@ func (w inboundArtifactWriter) WriteInboundArtifact(
 		Size:              int64(len(input.Data)),
 	})
 	if err != nil {
-		return "", errors.Join(err, objectStore.Delete(context.WithoutCancel(ctx), objectKey))
+		return "", false, errors.Join(err, objectStore.Delete(context.WithoutCancel(ctx), objectKey))
+	}
+	if !staged.Created {
+		if staged.ObjectKey != objectKey {
+			if deleteErr := objectStore.Delete(context.WithoutCancel(ctx), objectKey); deleteErr != nil {
+				return "", false, errors.Join(errors.New("inbound artifact idempotency object mismatch"), deleteErr)
+			}
+		}
+		return staged.ArtifactRef, false, nil
 	}
 	if staged.ObjectKey != objectKey {
 		if deleteErr := objectStore.Delete(context.WithoutCancel(ctx), objectKey); deleteErr != nil {
-			return "", errors.Join(errors.New("inbound artifact idempotency object mismatch"), deleteErr)
+			return "", false, errors.Join(errors.New("inbound artifact idempotency object mismatch"), deleteErr)
 		}
 	}
-	return staged.ArtifactRef, nil
+	return staged.ArtifactRef, true, nil
 }
 
 // DeleteInboundArtifact compensates a pre-admission upload. The durable stage

@@ -46,6 +46,40 @@ func TestCleanupWorkerCompletesExactCandidates(t *testing.T) {
 	}
 }
 
+func TestCleanupWorkerProcessesInboundArtifactCleanup(t *testing.T) {
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	candidate := InboundCleanupCandidate{
+		TenantID: "tenant-1", AppID: "app-1", BindingID: "binding-1",
+		ExternalMessageID: "message-1", ItemNo: 0,
+		ArtifactRef: "artifact://inbound/item@0", ConfigVersion: "v1",
+		ObjectKey: "objects/inbound-item", Attempts: 1,
+	}
+	store := &inboundCleanupStoreFake{inboundCandidates: []InboundCleanupCandidate{candidate}}
+	var deleted []string
+	worker, err := NewCleanupWorker(store, func(context.Context, CleanupCandidate) error { return nil }, CleanupOptions{
+		Owner: "worker-1",
+		Now:   func() time.Time { return now },
+		InboundDeleteObject: func(_ context.Context, value InboundCleanupCandidate) error {
+			deleted = append(deleted, value.ObjectKey)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new cleanup worker: %v", err)
+	}
+
+	count, err := worker.RunPass(context.Background())
+	if err != nil {
+		t.Fatalf("run cleanup pass: %v", err)
+	}
+	if count != 1 || len(deleted) != 1 || deleted[0] != candidate.ObjectKey {
+		t.Fatalf("inbound cleanup count/objects = %d/%v", count, deleted)
+	}
+	if len(store.inboundCompleted) != 1 || store.inboundCompleted[0].ArtifactRef != candidate.ArtifactRef {
+		t.Fatalf("completed inbound candidates = %#v", store.inboundCompleted)
+	}
+}
+
 func TestCleanupWorkerPersistsRetryAfterDeleteFailure(t *testing.T) {
 	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 	candidate := cleanupTestCandidate("artifact-2", StatusPending, 3)
@@ -132,6 +166,12 @@ type cleanupStoreFake struct {
 	retried         []cleanupRetry
 }
 
+type inboundCleanupStoreFake struct {
+	cleanupStoreFake
+	inboundCandidates []InboundCleanupCandidate
+	inboundCompleted  []InboundCleanupCandidate
+}
+
 type cleanupRetry struct {
 	candidate   CleanupCandidate
 	owner       string
@@ -166,3 +206,34 @@ func (s *cleanupStoreFake) RetryArtifactCleanup(_ context.Context, candidate Cle
 }
 
 var _ CleanupStore = (*cleanupStoreFake)(nil)
+
+func (s *inboundCleanupStoreFake) ClaimInboundArtifactCleanup(
+	_ context.Context,
+	_ string,
+	_ time.Time,
+	_ time.Duration,
+	_ int,
+) ([]InboundCleanupCandidate, error) {
+	return s.inboundCandidates, nil
+}
+
+func (s *inboundCleanupStoreFake) CompleteInboundArtifactCleanup(
+	_ context.Context,
+	candidate InboundCleanupCandidate,
+	_ string,
+) error {
+	s.inboundCompleted = append(s.inboundCompleted, candidate)
+	return nil
+}
+
+func (s *inboundCleanupStoreFake) RetryInboundArtifactCleanup(
+	_ context.Context,
+	_ InboundCleanupCandidate,
+	_ string,
+	_ time.Time,
+	_ error,
+) error {
+	return nil
+}
+
+var _ InboundCleanupStore = (*inboundCleanupStoreFake)(nil)

@@ -271,6 +271,9 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		telemetryRuntime = platformtelemetry.NewNoop(ctx, config.Telemetry.ServiceName)
 	}
 	defer func() {
+		if shutdownResourceCloseSkipped(serviceErr) {
+			return
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
 		defer cancel()
 		serviceErr = errors.Join(serviceErr, telemetryRuntime.Close(shutdownCtx))
@@ -284,7 +287,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		return fmt.Errorf("connect postgres: %w", err)
 	}
 	defer func() {
-		if !errors.Is(serviceErr, errWorkerShutdownTimeout) {
+		if !shutdownResourceCloseSkipped(serviceErr) {
 			pool.Close()
 		}
 	}()
@@ -316,12 +319,20 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	if err != nil {
 		return err
 	}
-	defer func() { serviceErr = errors.Join(serviceErr, artifacts.Close()) }()
+	defer func() {
+		if !shutdownResourceCloseSkipped(serviceErr) {
+			serviceErr = errors.Join(serviceErr, artifacts.Close())
+		}
+	}()
 	redisClient, err := platformredis.NewClient(ctx, config.RedisURL)
 	if err != nil {
 		return fmt.Errorf("connect redis: %w", err)
 	}
-	defer func() { serviceErr = errors.Join(serviceErr, redisClient.Close()) }()
+	defer func() {
+		if !shutdownResourceCloseSkipped(serviceErr) {
+			serviceErr = errors.Join(serviceErr, redisClient.Close())
+		}
+	}()
 	stream, err := platformredis.NewStream(redisClient, config.RedisStream, config.RedisGroup, dispatchLeaseDuration)
 	if err != nil {
 		return err
@@ -401,7 +412,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 			return err
 		}
 		defer func() {
-			if !errors.Is(serviceErr, errWorkerShutdownTimeout) {
+			if !shutdownResourceCloseSkipped(serviceErr) {
 				serviceErr = errors.Join(serviceErr, runtime.close())
 			}
 		}()
@@ -630,8 +641,12 @@ func awaitProviderExit(done <-chan error, timeout time.Duration) error {
 		}
 		return nonCancellationError(err)
 	case <-ctx.Done():
-		return fmt.Errorf("channel adapters did not stop: %w", ctx.Err())
+		return fmt.Errorf("%w: channel adapters did not stop: %w", errWorkerShutdownTimeout, ctx.Err())
 	}
+}
+
+func shutdownResourceCloseSkipped(err error) bool {
+	return errors.Is(err, errWorkerShutdownTimeout) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func waitForGatewayShutdown(

@@ -83,9 +83,10 @@ type MediaDownloader interface {
 
 // ArtifactWriter stores one inbound artifact and returns a tenant-scoped
 // ArtifactRef. Implementations should use the external message and ItemNo as
-// an idempotency key.
+// an idempotency key. owned is true only when this call created the durable
+// stage; a shared idempotent result must not be compensated by this caller.
 type ArtifactWriter interface {
-	WriteInboundArtifact(context.Context, InboundArtifact) (string, error)
+	WriteInboundArtifact(context.Context, InboundArtifact) (artifactRef string, owned bool, err error)
 }
 
 // ArtifactCompensator removes a pre-admission artifact without trusting the
@@ -182,6 +183,7 @@ func (i *ArtifactIngestor) prepare(
 	type writtenArtifact struct {
 		input InboundArtifact
 		ref   string
+		owned bool
 	}
 	written := make([]writtenArtifact, 0, len(media))
 	cleanup := func(cleanupCtx context.Context) error {
@@ -194,6 +196,9 @@ func (i *ArtifactIngestor) prepare(
 		}
 		var cleanupErr error
 		for index := len(written) - 1; index >= 0; index-- {
+			if !written[index].owned {
+				continue
+			}
 			cleanupErr = errors.Join(cleanupErr, compensator.DeleteInboundArtifact(
 				cleanupCtx,
 				written[index].input,
@@ -234,7 +239,7 @@ func (i *ArtifactIngestor) prepare(
 			MIMEType:          downloaded.MIMEType,
 			Data:              downloaded.Data,
 		}
-		artifactRef, err := i.writer.WriteInboundArtifact(ctx, artifact)
+		artifactRef, owned, err := i.writer.WriteInboundArtifact(ctx, artifact)
 		if err != nil {
 			return ChannelInput{}, nil, errors.Join(
 				fmt.Errorf("write inbound artifact %d: %w", itemNo, err),
@@ -253,7 +258,8 @@ func (i *ArtifactIngestor) prepare(
 				ExternalMessageID: input.ExternalMessageID, ItemNo: itemNo,
 				ConfigVersion: configVersion,
 			},
-			ref: artifactRef,
+			ref:   artifactRef,
+			owned: owned,
 		})
 		prepared.ArtifactRefs = append(prepared.ArtifactRefs, artifactRef)
 	}
