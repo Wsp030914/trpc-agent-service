@@ -345,6 +345,18 @@ type AttachmentIngestor interface {
 	Prepare(ctx context.Context, input ChannelInput, media []ProviderMediaRef) (ChannelInput, error)
 }
 
+// PinnedAttachmentIngestor materializes media against the exact config
+// version selected by the trusted admission boundary. The returned cleanup
+// is used when admission does not commit.
+type PinnedAttachmentIngestor interface {
+	PreparePinned(
+		ctx context.Context,
+		input ChannelInput,
+		media []ProviderMediaRef,
+		configVersion string,
+	) (ChannelInput, func(context.Context) error, error)
+}
+
 // ProviderMediaRef is an adapter-owned opaque media handle. Its value must not
 // be copied into Gateway, Worker, Session, or persistence.
 type ProviderMediaRef struct {

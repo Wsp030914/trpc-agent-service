@@ -134,6 +134,63 @@ WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
 	return record, nil
 }
 
+// MarkInboundArtifactDeleted moves a staged object out of PENDING under a row
+// lock. It is idempotent for a previously deleted row and deliberately does
+// nothing for ATTACHED rows, which are now owned by a committed execution.
+func (s *Store) MarkInboundArtifactDeleted(
+	ctx context.Context,
+	record StagedInboundArtifact,
+) (StagedInboundArtifact, bool, error) {
+	if err := s.validate(); err != nil {
+		return StagedInboundArtifact{}, false, err
+	}
+	if record.TenantID == "" || record.AppID == "" || record.BindingID == "" ||
+		record.ExternalMessageID == "" || record.ArtifactRef == "" || record.ConfigVersion == "" {
+		return StagedInboundArtifact{}, false, errors.New("inbound artifact compensation scope is required")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return StagedInboundArtifact{}, false, fmt.Errorf("begin inbound artifact compensation: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	staged, err := s.findStagedInboundArtifact(ctx, tx, record.TenantID, record.AppID, record.BindingID, record.ExternalMessageID, record.ItemNo)
+	if errors.Is(err, ErrNotFound) {
+		return StagedInboundArtifact{}, false, nil
+	}
+	if err != nil {
+		return StagedInboundArtifact{}, false, err
+	}
+	if staged.ArtifactRef != record.ArtifactRef || staged.ConfigVersion != record.ConfigVersion {
+		return StagedInboundArtifact{}, false, errors.New("inbound artifact compensation identity mismatch")
+	}
+	if staged.Status == inboundArtifactAttached {
+		if err := tx.Commit(ctx); err != nil {
+			return StagedInboundArtifact{}, false, fmt.Errorf("commit attached artifact compensation check: %w", err)
+		}
+		return staged, false, nil
+	}
+	if staged.Status != inboundArtifactPending && staged.Status != inboundArtifactDeleted {
+		return StagedInboundArtifact{}, false, fmt.Errorf("inbound artifact status %q cannot be compensated", staged.Status)
+	}
+	if staged.Status == inboundArtifactPending {
+		if _, err := tx.Exec(ctx, `
+UPDATE platform.inbound_artifact
+SET status = 'DELETED', updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
+  AND external_message_id = $4 AND item_no = $5
+  AND artifact_ref = $6 AND status = 'PENDING'`,
+			staged.TenantID, staged.AppID, staged.BindingID, staged.ExternalMessageID,
+			staged.ItemNo, staged.ArtifactRef,
+		); err != nil {
+			return StagedInboundArtifact{}, false, fmt.Errorf("mark inbound artifact deleted: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return StagedInboundArtifact{}, false, fmt.Errorf("commit inbound artifact compensation: %w", err)
+	}
+	return staged, true, nil
+}
+
 func scanStagedInboundArtifact(row interface{ Scan(...any) error }) (StagedInboundArtifact, error) {
 	var record StagedInboundArtifact
 	err := row.Scan(

@@ -11,6 +11,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	platformruntime "github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
@@ -155,6 +156,44 @@ func TestWorkerRunCallsRunnerAndDrainsEvents(t *testing.T) {
 	}
 	if !runner.closed {
 		t.Fatal("runner was not closed after events were drained")
+	}
+}
+
+func TestWorkerMarksTerminalEventForAtomicProjection(t *testing.T) {
+	runner := &recordingRunner{events: []*event.Event{runnerCompletionEvent()}}
+	var projected worker.Execution
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = fixedRunner(runner)
+	w.Events = eventSinkFunc(func(_ context.Context, exec worker.Execution, _ *event.Event) error {
+		projected = exec
+		return nil
+	})
+
+	if _, err := w.Run(context.Background(), testJob("request-terminal", "tenant-a", "session-1")); err != nil {
+		t.Fatalf("run job: %v", err)
+	}
+	if projected.TerminalStatus != queue.CompletionSucceeded {
+		t.Fatalf("projected terminal status = %q, want %q", projected.TerminalStatus, queue.CompletionSucceeded)
+	}
+}
+
+func TestWorkerCleanupErrorsDoNotChangeBusinessResult(t *testing.T) {
+	closeErr := errors.New("runner close failed")
+	runner := &recordingRunner{
+		events:   []*event.Event{runnerCompletionEvent()},
+		closeErr: closeErr,
+	}
+	locker := &recordingSessionLocker{releaseErr: errors.New("session release failed")}
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = fixedRunner(runner)
+	w.SessionLocker = locker
+
+	result, err := w.Run(context.Background(), testJob("request-cleanup", "tenant-a", "session-1"))
+	if err != nil {
+		t.Fatalf("run job = %v, want nil business error", err)
+	}
+	if !errors.Is(result.CleanupError, closeErr) || !errors.Is(result.CleanupError, locker.releaseErr) {
+		t.Fatalf("cleanup error = %v, want runner and session cleanup errors", result.CleanupError)
 	}
 }
 
@@ -654,6 +693,7 @@ type recordingRunner struct {
 	err       error
 	cancel    context.CancelFunc
 	closed    bool
+	closeErr  error
 }
 
 type managedBlockingRunner struct {
@@ -817,19 +857,22 @@ type sessionLockTestContextKey struct{}
 type recordingSessionLocker struct {
 	partitionKey string
 	lock         *recordingSessionLock
+	releaseErr   error
 }
 
 func (l *recordingSessionLocker) Lock(ctx context.Context, partitionKey string) (worker.SessionLock, error) {
 	l.partitionKey = partitionKey
 	l.lock = &recordingSessionLock{
-		ctx: context.WithValue(ctx, sessionLockTestContextKey{}, "locked"),
+		ctx:        context.WithValue(ctx, sessionLockTestContextKey{}, "locked"),
+		releaseErr: l.releaseErr,
 	}
 	return l.lock, nil
 }
 
 type recordingSessionLock struct {
-	ctx      context.Context
-	released atomic.Bool
+	ctx        context.Context
+	released   atomic.Bool
+	releaseErr error
 }
 
 func (l *recordingSessionLock) Context() context.Context {
@@ -838,7 +881,7 @@ func (l *recordingSessionLock) Context() context.Context {
 
 func (l *recordingSessionLock) Release() error {
 	l.released.Store(true)
-	return nil
+	return l.releaseErr
 }
 
 type eventSinkFunc func(context.Context, worker.Execution, *event.Event) error
@@ -883,7 +926,7 @@ func (p staticEndpointPolicy) ResolveModelBaseURL(
 
 func (r *recordingRunner) Close() error {
 	r.closed = true
-	return nil
+	return r.closeErr
 }
 
 type recordingEventSink struct {

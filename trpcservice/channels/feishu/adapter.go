@@ -375,12 +375,29 @@ func (a *Adapter) HandleMessage(
 		attribute.String("binding_id", binding.BindingID),
 	)
 	defer span.End()
-	_, err = a.admissionGateway.Handle(eventCtx, gateway.Request{
+	admissionRequest := gateway.Request{
 		RequestID:      requestID,
 		IdempotencyKey: envelope.ExternalMessageID,
 		Tenant:         identityResolver,
 		ChannelInput:   &input,
-	})
+	}
+	if len(envelope.Media) > 0 {
+		pinnedIngestor, ok := a.attachmentIngestor.(channels.PinnedAttachmentIngestor)
+		if !ok {
+			return errAttachmentIngestorReq
+		}
+		media := append([]channels.ProviderMediaRef(nil), envelope.Media...)
+		_, err = a.admissionGateway.HandleChannel(eventCtx, admissionRequest,
+			func(
+				prepareCtx context.Context,
+				prepareInput channels.ChannelInput,
+				configVersion string,
+			) (channels.ChannelInput, func(context.Context) error, error) {
+				return pinnedIngestor.PreparePinned(prepareCtx, prepareInput, media, configVersion)
+			})
+	} else {
+		_, err = a.admissionGateway.Handle(eventCtx, admissionRequest)
+	}
 	if err != nil {
 		platformtelemetry.MarkError(span, "admission", err)
 	}
@@ -462,15 +479,6 @@ func (a *Adapter) channelInput(ctx context.Context, envelope VerifiedProviderEnv
 	input, err := channels.NewChannelInput(input, envelope.mapping)
 	if err != nil {
 		return channels.ChannelInput{}, err
-	}
-	if len(envelope.Media) > 0 {
-		if a.attachmentIngestor == nil {
-			return channels.ChannelInput{}, errAttachmentIngestorReq
-		}
-		input, err = a.attachmentIngestor.Prepare(ctx, input, append([]channels.ProviderMediaRef(nil), envelope.Media...))
-		if err != nil {
-			return channels.ChannelInput{}, fmt.Errorf("prepare feishu media: %w", err)
-		}
 	}
 	return channels.WithMessageReplyTarget(input, channels.MessageReplyTarget{
 		ProviderTarget: envelope.replyTarget,

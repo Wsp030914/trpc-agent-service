@@ -45,6 +45,7 @@ type InboundArtifact struct {
 	BindingID         string
 	ExternalMessageID string
 	ItemNo            int
+	ConfigVersion     string
 	Kind              MessageType
 	Filename          string
 	MIMEType          string
@@ -87,6 +88,13 @@ type ArtifactWriter interface {
 	WriteInboundArtifact(context.Context, InboundArtifact) (string, error)
 }
 
+// ArtifactCompensator removes a pre-admission artifact without trusting the
+// provider reference. Implementations must be idempotent and must not remove
+// an artifact that has already been atomically attached by admission.
+type ArtifactCompensator interface {
+	DeleteInboundArtifact(context.Context, InboundArtifact, string) error
+}
+
 // ArtifactIngestor materializes provider media before PostgreSQL admission.
 // It is independent of a concrete object store; the supplied ArtifactWriter
 // is the only persistence boundary.
@@ -127,53 +135,130 @@ func (i *ArtifactIngestor) Prepare(
 	input ChannelInput,
 	media []ProviderMediaRef,
 ) (ChannelInput, error) {
+	prepared, _, err := i.prepare(ctx, input, media, "")
+	return prepared, err
+}
+
+// PreparePinned is the production attachment path. Every write is pinned to
+// the immutable config selected by Gateway, and the returned compensator can
+// remove all staged objects if admission fails.
+func (i *ArtifactIngestor) PreparePinned(
+	ctx context.Context,
+	input ChannelInput,
+	media []ProviderMediaRef,
+	configVersion string,
+) (ChannelInput, func(context.Context) error, error) {
+	if strings.TrimSpace(configVersion) == "" {
+		return ChannelInput{}, nil, errors.New("attachment config version is required")
+	}
+	return i.prepare(ctx, input, media, configVersion)
+}
+
+func (i *ArtifactIngestor) prepare(
+	ctx context.Context,
+	input ChannelInput,
+	media []ProviderMediaRef,
+	configVersion string,
+) (ChannelInput, func(context.Context) error, error) {
 	if i == nil || i.downloader == nil || i.writer == nil {
-		return ChannelInput{}, errors.New("artifact ingestor is not initialized")
+		return ChannelInput{}, nil, errors.New("artifact ingestor is not initialized")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return ChannelInput{}, err
+		return ChannelInput{}, nil, err
 	}
 	if err := input.Validate(); err != nil {
-		return ChannelInput{}, err
+		return ChannelInput{}, nil, err
 	}
 	if len(media) == 0 {
-		return input.Clone(), nil
+		return input.Clone(), func(context.Context) error { return nil }, nil
+	}
+	if _, ok := i.writer.(ArtifactCompensator); !ok && configVersion != "" {
+		return ChannelInput{}, nil, errors.New("artifact compensation is required for pinned preparation")
 	}
 	prepared := input.Clone()
+	type writtenArtifact struct {
+		input InboundArtifact
+		ref   string
+	}
+	written := make([]writtenArtifact, 0, len(media))
+	cleanup := func(cleanupCtx context.Context) error {
+		compensator, ok := i.writer.(ArtifactCompensator)
+		if !ok || len(written) == 0 {
+			return nil
+		}
+		if cleanupCtx == nil {
+			cleanupCtx = context.Background()
+		}
+		var cleanupErr error
+		for index := len(written) - 1; index >= 0; index-- {
+			cleanupErr = errors.Join(cleanupErr, compensator.DeleteInboundArtifact(
+				cleanupCtx,
+				written[index].input,
+				written[index].ref,
+			))
+		}
+		return cleanupErr
+	}
 	for itemNo, reference := range media {
 		if err := reference.Validate(); err != nil {
-			return ChannelInput{}, fmt.Errorf("provider media %d: %w", itemNo, err)
+			return ChannelInput{}, nil, errors.Join(
+				fmt.Errorf("provider media %d: %w", itemNo, err),
+				cleanup(context.WithoutCancel(ctx)),
+			)
 		}
 		downloaded, err := i.downloader.Download(ctx, input, reference)
 		if err != nil {
-			return ChannelInput{}, fmt.Errorf("download provider media %d: %w", itemNo, err)
+			return ChannelInput{}, nil, errors.Join(
+				fmt.Errorf("download provider media %d: %w", itemNo, err),
+				cleanup(context.WithoutCancel(ctx)),
+			)
 		}
 		if int64(len(downloaded.Data)) > i.maxBytes {
-			return ChannelInput{}, fmt.Errorf("provider media %d exceeds size limit", itemNo)
+			return ChannelInput{}, nil, errors.Join(
+				fmt.Errorf("provider media %d exceeds size limit", itemNo),
+				cleanup(context.WithoutCancel(ctx)),
+			)
 		}
-		artifactRef, err := i.writer.WriteInboundArtifact(ctx, InboundArtifact{
+		artifact := InboundArtifact{
 			TenantID:          input.TenantID,
 			AppID:             input.AppID,
 			BindingID:         input.BindingID,
 			ExternalMessageID: input.ExternalMessageID,
 			ItemNo:            itemNo,
+			ConfigVersion:     configVersion,
 			Kind:              reference.Kind,
 			Filename:          downloaded.Filename,
 			MIMEType:          downloaded.MIMEType,
 			Data:              downloaded.Data,
-		})
+		}
+		artifactRef, err := i.writer.WriteInboundArtifact(ctx, artifact)
 		if err != nil {
-			return ChannelInput{}, fmt.Errorf("write inbound artifact %d: %w", itemNo, err)
+			return ChannelInput{}, nil, errors.Join(
+				fmt.Errorf("write inbound artifact %d: %w", itemNo, err),
+				cleanup(context.WithoutCancel(ctx)),
+			)
 		}
 		if !strings.HasPrefix(artifactRef, "artifact://") || strings.TrimSpace(strings.TrimPrefix(artifactRef, "artifact://")) == "" {
-			return ChannelInput{}, fmt.Errorf("inbound artifact %d returned invalid artifact ref", itemNo)
+			return ChannelInput{}, nil, errors.Join(
+				fmt.Errorf("inbound artifact %d returned invalid artifact ref", itemNo),
+				cleanup(context.WithoutCancel(ctx)),
+			)
 		}
+		written = append(written, writtenArtifact{
+			input: InboundArtifact{
+				TenantID: input.TenantID, AppID: input.AppID, BindingID: input.BindingID,
+				ExternalMessageID: input.ExternalMessageID, ItemNo: itemNo,
+				ConfigVersion: configVersion,
+			},
+			ref: artifactRef,
+		})
 		prepared.ArtifactRefs = append(prepared.ArtifactRefs, artifactRef)
 	}
-	return prepared, nil
+	return prepared, cleanup, nil
 }
 
 var _ AttachmentIngestor = (*ArtifactIngestor)(nil)
+var _ PinnedAttachmentIngestor = (*ArtifactIngestor)(nil)

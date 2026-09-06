@@ -142,9 +142,19 @@ func (s *Store) Admit(
 		channelAdmission: request.ChannelInput != nil,
 	}
 	if request.ChannelInput == nil {
-		admission.configVersion, appConfig, err = resolveAdmissionConfig(
-			ctx, tx, app, admission.runtimeContext, appConfig,
-		)
+		if request.Identity.ConfigVersionPinned() {
+			admission.configVersion = request.Identity.Tenant.ConfigVersion
+			if admission.configVersion == "" {
+				return gateway.AdmissionResult{}, errors.New("pinned channel config version is required")
+			}
+			appConfig, err = resolveAppConfigFrom(
+				ctx, tx, app.TenantID, app.AppID, admission.configVersion,
+			)
+		} else {
+			admission.configVersion, appConfig, err = resolveAdmissionConfig(
+				ctx, tx, app, admission.runtimeContext, appConfig,
+			)
+		}
 		if err != nil {
 			return gateway.AdmissionResult{}, err
 		}
@@ -245,9 +255,19 @@ func (s *Store) Admit(
 		admission.runtimeContext.UserID = mapped.Identity.UserID
 		admission.runtimeContext.TraceParent = request.TraceParent
 		admission.runtimeContext.TraceState = request.TraceState
-		admission.configVersion, appConfig, err = resolveAdmissionConfig(
-			ctx, tx, app, admission.runtimeContext, appConfig,
-		)
+		if request.Identity.ConfigVersionPinned() {
+			admission.configVersion = request.Identity.Tenant.ConfigVersion
+			if admission.configVersion == "" {
+				return gateway.AdmissionResult{}, errors.New("pinned channel config version is required")
+			}
+			appConfig, err = resolveAppConfigFrom(
+				ctx, tx, app.TenantID, app.AppID, admission.configVersion,
+			)
+		} else {
+			admission.configVersion, appConfig, err = resolveAdmissionConfig(
+				ctx, tx, app, admission.runtimeContext, appConfig,
+			)
+		}
 		if err != nil {
 			return gateway.AdmissionResult{}, err
 		}
@@ -324,6 +344,75 @@ func (s *Store) Admit(
 		return admission.reconcileExisting(existing)
 	}
 	return admission.createExecution()
+}
+
+// PinChannelConfig selects the exact config version that a channel request
+// will use before provider media is materialized. The identity mapping runs
+// in the same transaction as the app canary read, then the transaction is
+// rolled back because the real admission repeats and commits the mapping.
+func (s *Store) PinChannelConfig(
+	ctx context.Context,
+	request gateway.AdmissionRequest,
+) (string, error) {
+	if err := s.validate(); err != nil {
+		return "", err
+	}
+	if err := request.Validate(); err != nil {
+		return "", err
+	}
+	if request.ChannelInput == nil || request.Identity.Source != gateway.TenantSourceVerifiedChannelBinding {
+		return "", gateway.ErrChannelInputRequired
+	}
+	if s.identityMapper == nil {
+		return "", errors.New("channel identity mapper is required")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return "", fmt.Errorf("begin channel config pin: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	tenantID := request.Identity.Tenant.TenantID
+	appID := request.Identity.Tenant.AppID
+	tnt, err := lockTenant(ctx, tx, tenantID)
+	if err != nil {
+		return "", err
+	}
+	if tnt.Status != tenant.StatusActive {
+		return "", auth.ErrTenantInactive
+	}
+	app, err := lockAgentApp(ctx, tx, tenantID, appID)
+	if err != nil {
+		return "", err
+	}
+	if app.Status != tenant.StatusActive {
+		return "", auth.ErrAppInactive
+	}
+	if err := revalidateChannelBindingSnapshot(ctx, tx, request.Identity); err != nil {
+		return "", err
+	}
+	mappingRequest, err := channelIdentityMappingRequest(request)
+	if err != nil {
+		return "", err
+	}
+	mapped, err := s.identityMapper.mapInTransaction(ctx, tx, mappingRequest)
+	if err != nil {
+		return "", err
+	}
+	runtimeContext := request.Identity.Tenant
+	runtimeContext.SessionPrincipalID = mapped.SessionPrincipalID
+	runtimeContext.SessionID = mapped.SessionID
+	runtimeContext.UserID = mapped.Identity.UserID
+	active, err := resolveAppConfigFrom(ctx, tx, app.TenantID, app.AppID, app.ActiveConfigVersion)
+	if err != nil {
+		return "", err
+	}
+	version := selectCanaryConfigVersion(app, runtimeContext)
+	if version != active.Version {
+		if _, err := resolveAppConfigFrom(ctx, tx, app.TenantID, app.AppID, version); err != nil {
+			return "", err
+		}
+	}
+	return version, nil
 }
 
 func rejectChannelInboxForAccess(

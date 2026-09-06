@@ -128,6 +128,7 @@ type AdmissionIdentity struct {
 	// claims and revalidated by the PostgreSQL admission transaction.
 	PublicRouteID            string
 	BindingRevision          int64
+	configVersionPinned      bool
 	channelBindingProvenance *channelBindingProvenance
 	channelMappingPending    bool
 }
@@ -145,10 +146,12 @@ type channelBindingProvenance struct {
 	publicRouteID    string
 	bindingRevision  int64
 	mappingPending   bool
+	configPinned     bool
 }
 
 // Validate checks the trusted source and identity fields required for atomic
-// admission. The config version is advisory and is re-read by the backend.
+// admission. A normal config version is advisory; a channel pin is marked by
+// private provenance and must be honored by the authoritative backend.
 func (i AdmissionIdentity) Validate() error {
 	return i.validate(false)
 }
@@ -190,6 +193,9 @@ func (i AdmissionIdentity) validate(allowPendingMapping bool) error {
 			provenance.mappingPending != i.channelMappingPending {
 			return errors.New("channel binding provenance does not match identity")
 		}
+		if provenance.configPinned != i.configVersionPinned {
+			return errors.New("channel binding config pin provenance does not match identity")
+		}
 		if err := channels.Channel(i.Tenant.Channel).Validate(); err != nil {
 			return fmt.Errorf("channel binding channel: %w", err)
 		}
@@ -209,6 +215,12 @@ func (i AdmissionIdentity) validate(allowPendingMapping bool) error {
 		}
 	}
 	return nil
+}
+
+// ConfigVersionPinned reports whether Gateway selected the immutable config
+// version for a channel request before any attachment was materialized.
+func (i AdmissionIdentity) ConfigVersionPinned() bool {
+	return i.configVersionPinned
 }
 
 func validatePendingRuntimeContext(context tenant.RuntimeContext) error {
@@ -369,6 +381,21 @@ type Admitter interface {
 	Admit(ctx context.Context, request AdmissionRequest) (AdmissionResult, error)
 }
 
+// ChannelConfigVersionPinner selects the immutable config version used by a
+// channel admission. It is implemented by the authoritative admission store.
+type ChannelConfigVersionPinner interface {
+	PinChannelConfig(context.Context, AdmissionRequest) (string, error)
+}
+
+// ChannelAttachmentPreparer is an adapter-owned media boundary. Raw provider
+// media handles stay in the adapter closure and only resulting ArtifactRefs
+// cross into Gateway admission.
+type ChannelAttachmentPreparer func(
+	context.Context,
+	channels.ChannelInput,
+	string,
+) (channels.ChannelInput, func(context.Context) error, error)
+
 // Gateway converts trusted requests into atomic admission commands.
 type Gateway struct {
 	admitter Admitter
@@ -383,6 +410,28 @@ func New(admitter Admitter) *Gateway {
 // Handle validates a request and submits it to the authoritative admission
 // backend. It never performs a separate in-memory enqueue.
 func (g Gateway) Handle(ctx context.Context, req Request) (result AdmissionResult, err error) {
+	return g.handle(ctx, req, nil)
+}
+
+// HandleChannel pins the channel config before invoking the adapter-owned
+// attachment preparer. Failed admission invokes the returned compensator so
+// pre-admission objects do not remain orphaned.
+func (g Gateway) HandleChannel(
+	ctx context.Context,
+	req Request,
+	prepare ChannelAttachmentPreparer,
+) (result AdmissionResult, err error) {
+	if prepare == nil {
+		return AdmissionResult{}, errors.New("channel attachment preparer is required")
+	}
+	return g.handle(ctx, req, prepare)
+}
+
+func (g Gateway) handle(
+	ctx context.Context,
+	req Request,
+	prepare ChannelAttachmentPreparer,
+) (result AdmissionResult, err error) {
 	if g.admitter == nil {
 		return AdmissionResult{}, ErrAdmitterRequired
 	}
@@ -460,8 +509,56 @@ func (g Gateway) Handle(ctx context.Context, req Request) (result AdmissionResul
 	if err := admissionRequest.Validate(); err != nil {
 		return AdmissionResult{}, err
 	}
+	var cleanup func(context.Context) error
+	if prepare != nil {
+		if channelInput == nil || identity.Source != TenantSourceVerifiedChannelBinding {
+			return AdmissionResult{}, errors.New("channel attachment requires a verified channel input")
+		}
+		pinner, ok := g.admitter.(ChannelConfigVersionPinner)
+		if !ok {
+			return AdmissionResult{}, errors.New("channel config version pinner is required")
+		}
+		pinnedVersion, err := pinner.PinChannelConfig(admitCtx, admissionRequest)
+		if err != nil {
+			return AdmissionResult{}, fmt.Errorf("pin channel config version: %w", err)
+		}
+		if pinnedVersion == "" {
+			return AdmissionResult{}, errors.New("pinned channel config version is required")
+		}
+		identity.Tenant.ConfigVersion = pinnedVersion
+		identity.configVersionPinned = true
+		if identity.channelBindingProvenance != nil {
+			identity.channelBindingProvenance.runtimeContext = identity.Tenant
+			identity.channelBindingProvenance.configPinned = true
+		}
+		admissionRequest.Identity = identity
+		prepared, compensator, prepareErr := prepare(admitCtx, *channelInput, pinnedVersion)
+		if prepareErr != nil {
+			if compensator != nil {
+				prepareErr = errors.Join(prepareErr, compensator(context.WithoutCancel(admitCtx)))
+			}
+			return AdmissionResult{}, prepareErr
+		}
+		cleanup = compensator
+		prepared = prepared.Clone()
+		channelInput = &prepared
+		admissionRequest.ChannelInput = channelInput
+		admissionRequest.Message = Message{
+			Text:         prepared.Text,
+			ArtifactRefs: slices.Clone(prepared.ArtifactRefs),
+		}
+		if err := admissionRequest.Validate(); err != nil {
+			if cleanup != nil {
+				err = errors.Join(err, cleanup(context.WithoutCancel(admitCtx)))
+			}
+			return AdmissionResult{}, err
+		}
+	}
 	result, err = g.admitter.Admit(admitCtx, admissionRequest)
 	if err != nil {
+		if cleanup != nil {
+			err = errors.Join(err, cleanup(context.WithoutCancel(admitCtx)))
+		}
 		return AdmissionResult{}, err
 	}
 	if err := result.Validate(); err != nil {

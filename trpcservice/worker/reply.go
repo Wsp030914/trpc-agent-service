@@ -262,16 +262,24 @@ func (s *ReplySender) SendBatch(ctx context.Context) (int, error) {
 	if err := s.outbox.RecoverReplyLeases(ctx); err != nil {
 		return 0, fmt.Errorf("recover reply leases: %w", err)
 	}
-	deliveries, err := s.outbox.ClaimReplies(ctx, s.owner, s.lease, s.batchSize)
-	if err != nil {
-		return 0, fmt.Errorf("claim replies: %w", err)
-	}
-	for _, delivery := range deliveries {
-		if err := s.sendOne(ctx, delivery); err != nil {
-			return len(deliveries), err
+	// Claim one row at a time. If sending the first provider-attempted row
+	// fails, later rows remain PENDING and therefore retryable; claiming the
+	// whole batch first would incorrectly leave those rows in SENDING.
+	processed := 0
+	for processed < s.batchSize {
+		deliveries, err := s.outbox.ClaimReplies(ctx, s.owner, s.lease, 1)
+		if err != nil {
+			return processed, fmt.Errorf("claim replies: %w", err)
 		}
+		if len(deliveries) == 0 {
+			return processed, nil
+		}
+		if err := s.sendOne(ctx, deliveries[0]); err != nil {
+			return processed, err
+		}
+		processed++
 	}
-	return len(deliveries), nil
+	return processed, nil
 }
 
 // Run delivers replies until ctx is canceled. Backend outages do not stop the

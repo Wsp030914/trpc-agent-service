@@ -2,6 +2,7 @@ package channels_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
@@ -114,10 +115,45 @@ func TestArtifactIngestorRejectsOversizedMediaBeforeWrite(t *testing.T) {
 	}
 }
 
+func TestArtifactIngestorPinnedPreparationCompensatesPartialBatch(t *testing.T) {
+	input, err := channels.NewChannelInput(channels.ChannelInput{
+		TenantID: "tenant-a", AppID: "support", Channel: channels.ChannelWeCom,
+		BindingID: "binding-1", BindingRevision: 1, ExternalMessageID: "message-2",
+		Conversation: channels.ChannelConversation{Kind: channels.ConversationDirect},
+		MessageType:  channels.MessageTypeMixed, Text: "hello",
+	}, channels.ChannelMappingInput{ExternalSenderID: "user-1", ProviderSenderTarget: "user-1"})
+	if err != nil {
+		t.Fatalf("new channel input: %v", err)
+	}
+	writer := &recordingArtifactWriter{ref: "artifact://inbound/one@0"}
+	count := 0
+	ingestor, err := channels.NewArtifactIngestor(recordingMediaDownloader{download: func(context.Context, channels.ChannelInput, channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
+		count++
+		if count == 2 {
+			return channels.DownloadedMedia{}, errors.New("second media failed")
+		}
+		return channels.DownloadedMedia{Filename: "one.png", MIMEType: "image/png", Data: []byte("one")}, nil
+	}}, writer)
+	if err != nil {
+		t.Fatalf("new artifact ingestor: %v", err)
+	}
+	_, _, err = ingestor.PreparePinned(context.Background(), input, []channels.ProviderMediaRef{
+		{Kind: channels.MessageTypeImage, Reference: "provider-1"},
+		{Kind: channels.MessageTypeImage, Reference: "provider-2"},
+	}, "v-canary")
+	if err == nil {
+		t.Fatal("partial media preparation succeeded")
+	}
+	if len(writer.deleted) != 1 || writer.deleted[0].ConfigVersion != "v-canary" {
+		t.Fatalf("compensated artifacts = %#v", writer.deleted)
+	}
+}
+
 type recordingArtifactWriter struct {
 	ref      string
 	artifact channels.InboundArtifact
 	called   bool
+	deleted  []channels.InboundArtifact
 }
 
 type recordingMediaDownloader struct {
@@ -138,4 +174,10 @@ func (w *recordingArtifactWriter) WriteInboundArtifact(_ context.Context, artifa
 	return w.ref, nil
 }
 
+func (w *recordingArtifactWriter) DeleteInboundArtifact(_ context.Context, artifact channels.InboundArtifact, _ string) error {
+	w.deleted = append(w.deleted, artifact)
+	return nil
+}
+
 var _ channels.ArtifactWriter = (*recordingArtifactWriter)(nil)
+var _ channels.ArtifactCompensator = (*recordingArtifactWriter)(nil)

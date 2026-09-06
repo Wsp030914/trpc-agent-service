@@ -35,6 +35,28 @@ func TestConsumerAcknowledgesAfterExecutionCompletion(t *testing.T) {
 	}
 }
 
+func TestConsumerIgnoresExecutionCleanupErrorForCompletion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claim := testQueueClaim(t, "request-consumer-cleanup")
+	stream := &testStream{delivery: queue.Delivery{ID: "1-cleanup", Dispatch: queue.Dispatch{
+		OutboxID: 11, TenantID: "tenant-a", AppID: "support", RequestID: claim.Job.RequestID(),
+	}}, cancel: cancel}
+	store := &testExecutionStore{claim: claim}
+	consumer, err := worker.NewConsumer(&consumerExecutor{
+		result: worker.RunResult{RunnerCompleted: true, CleanupError: errors.New("cleanup failed")},
+	}, stream, store, "worker-1")
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v", err)
+	}
+	if store.completed != queue.CompletionSucceeded || store.retries != 0 || stream.acks != 1 {
+		t.Fatalf("completion=%q retries=%d acks=%d", store.completed, store.retries, stream.acks)
+	}
+}
+
 func TestConsumerRetriesAndAcknowledgesFailedRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

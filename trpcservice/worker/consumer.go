@@ -404,6 +404,9 @@ func (c *Consumer) executeClaim(ctx context.Context, claim queue.Claim) (bool, e
 	go c.renewLease(runCtx, cancelRun, claim, done)
 	result, runErr := c.executor.Run(runCtx, claim.Job)
 	cancelRun()
+	if result.CleanupError != nil {
+		log.Printf("execution cleanup failed request_id=%s: %s", result.Execution.RequestID, platformlog.SafeError(result.CleanupError))
+	}
 	leaseErr := <-done
 	if errors.Is(leaseErr, queue.ErrLeaseLost) {
 		return true, nil

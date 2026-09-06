@@ -14,6 +14,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
@@ -45,6 +46,9 @@ type Execution struct {
 	Config       tenant.AppConfig
 	Message      gateway.Message
 	PartitionKey string
+	// TerminalStatus is set only on the terminal event passed to a durable
+	// EventSink. The sink must persist it in the same transaction as that event.
+	TerminalStatus queue.CompletionStatus
 }
 
 // SessionLock owns an acquired session partition lock. Context is canceled
@@ -82,6 +86,10 @@ type RunResult struct {
 	OutputTokens    int
 	TotalTokens     int
 	Cost            *float64
+	// CleanupError is diagnostic only. Runner/session cleanup happens after the
+	// business result has been durably projected and must not turn success into
+	// a retryable execution failure.
+	CleanupError error
 }
 
 type approvalContinuation struct {
@@ -278,7 +286,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	}
 	defer func() {
 		if releaseErr := lock.Release(); releaseErr != nil {
-			err = errors.Join(err, fmt.Errorf("release session partition: %w", releaseErr))
+			result.CleanupError = errors.Join(result.CleanupError, fmt.Errorf("release session partition: %w", releaseErr))
 		}
 	}()
 	runCtx := lock.Context()
@@ -313,7 +321,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	}
 	defer func() {
 		if closeErr := r.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("close runner: %w", closeErr))
+			result.CleanupError = errors.Join(result.CleanupError, fmt.Errorf("close runner: %w", closeErr))
 		}
 	}()
 	runnerCtx, runnerSpan := platformtelemetry.StartSpan(workerCtx, "runner.run",
@@ -370,7 +378,17 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		if w.Events == nil || sinkTimedOut || runnerCtx.Err() != nil {
 			continue
 		}
-		if err := w.handleRunnerEvent(runnerCtx, exec, evt); err != nil {
+		eventExec := exec
+		approvalPending, _ := approval.snapshot()
+		if !approvalPending {
+			switch {
+			case evt.IsTerminalError():
+				eventExec.TerminalStatus = queue.CompletionFailed
+			case evt.IsRunnerCompletion():
+				eventExec.TerminalStatus = queue.CompletionSucceeded
+			}
+		}
+		if err := w.handleRunnerEvent(runnerCtx, eventExec, evt); err != nil {
 			if sinkErr == nil {
 				sinkErr = err
 			}

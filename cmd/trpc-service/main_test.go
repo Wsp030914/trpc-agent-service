@@ -367,6 +367,13 @@ func TestAwaitDataMigrationExitReturnsResult(t *testing.T) {
 	}
 }
 
+func TestReplyShutdownTimeoutIsObservable(t *testing.T) {
+	shutdownErr := replyShutdownError(context.DeadlineExceeded, false)
+	if !errors.Is(shutdownErr, errWorkerShutdownTimeout) {
+		t.Fatalf("reply shutdown error = %v, want worker shutdown timeout", shutdownErr)
+	}
+}
+
 func TestEnvironmentSecretsAreScoped(t *testing.T) {
 	scope := tenant.Scope{TenantID: "tenant-a", AppID: "app-a"}
 	ref := tenant.SecretRef{Name: "model-key", Version: "v1"}

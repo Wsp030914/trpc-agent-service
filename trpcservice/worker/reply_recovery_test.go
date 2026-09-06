@@ -148,16 +148,50 @@ func TestReplySenderMarksCompletionFailureUncertain(t *testing.T) {
 	}
 }
 
+func TestReplySenderDoesNotClaimLaterRowsAfterSendFailure(t *testing.T) {
+	first := testReplyDelivery()
+	second := testReplyDelivery()
+	second.Reply.ReplyID = "reply-2"
+	outbox := &replyOutboxStub{deliveries: []ReplyDelivery{first, second}, retryErr: errors.New("persist retry failed")}
+	sender, err := NewReplySender(
+		outbox,
+		func(context.Context, ReplyDelivery) (string, error) { return "target", nil },
+		func(context.Context, ReplyDelivery) (ReplyProvider, error) {
+			return ReplyProvider{Client: replyClientFunc(func(context.Context, channels.Reply, string) (channels.ProviderReceipt, error) {
+				return channels.ProviderReceipt{}, retryAfterTestError{delay: time.Second}
+			})}, nil
+		},
+		ReplySenderOptions{Owner: "worker-1", BatchSize: 2},
+	)
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	if _, err := sender.SendBatch(context.Background()); err == nil {
+		t.Fatal("send batch succeeded after retry persistence failure")
+	}
+	if outbox.claims != 1 || len(outbox.deliveries) != 1 || !outbox.retried {
+		t.Fatalf("claims=%d remaining=%d retried=%t", outbox.claims, len(outbox.deliveries), outbox.retried)
+	}
+}
+
 type replyOutboxStub struct {
 	deliveries []ReplyDelivery
+	claims     int
 	retried    bool
 	failed     bool
 	uncertain  bool
 	delay      time.Duration
+	retryErr   error
 }
 
 func (s *replyOutboxStub) ClaimReplies(context.Context, string, time.Duration, int) ([]ReplyDelivery, error) {
-	return s.deliveries, nil
+	s.claims++
+	if len(s.deliveries) == 0 {
+		return nil, nil
+	}
+	delivery := s.deliveries[0]
+	s.deliveries = s.deliveries[1:]
+	return []ReplyDelivery{delivery}, nil
 }
 func (*replyOutboxStub) CompleteReply(context.Context, ReplyDelivery, channels.ProviderReceipt) error {
 	return errors.New("unexpected completion")
@@ -169,7 +203,7 @@ func (s *replyOutboxStub) MarkReplyUncertain(context.Context, ReplyDelivery, str
 func (s *replyOutboxStub) RetryReply(_ context.Context, _ ReplyDelivery, _ string, delay time.Duration, _ error) error {
 	s.retried = true
 	s.delay = delay
-	return nil
+	return s.retryErr
 }
 func (s *replyOutboxStub) FailReply(context.Context, ReplyDelivery, string, error) error {
 	s.failed = true

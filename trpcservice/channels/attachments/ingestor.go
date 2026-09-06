@@ -272,11 +272,10 @@ func (w inboundArtifactWriter) WriteInboundArtifact(
 	if err := input.Validate(); err != nil {
 		return "", err
 	}
-	app, err := w.store.ResolveAgentApp(ctx, input.TenantID, input.AppID)
-	if err != nil {
-		return "", err
+	if input.ConfigVersion == "" {
+		return "", errors.New("inbound artifact config version is required")
 	}
-	config, err := w.store.ResolveAppConfig(ctx, input.TenantID, input.AppID, app.ActiveConfigVersion)
+	config, err := w.store.ResolveAppConfig(ctx, input.TenantID, input.AppID, input.ConfigVersion)
 	if err != nil {
 		return "", err
 	}
@@ -287,7 +286,7 @@ func (w inboundArtifactWriter) WriteInboundArtifact(
 	objectStore, err := w.resolver.ResolveInboundStore(
 		ctx,
 		tenant.Scope{TenantID: input.TenantID, AppID: input.AppID},
-		app.ActiveConfigVersion,
+		input.ConfigVersion,
 		ref,
 	)
 	if err != nil {
@@ -311,7 +310,7 @@ func (w inboundArtifactWriter) WriteInboundArtifact(
 		ExternalMessageID: input.ExternalMessageID,
 		ItemNo:            input.ItemNo,
 		ArtifactRef:       artifactRef,
-		ConfigVersion:     app.ActiveConfigVersion,
+		ConfigVersion:     input.ConfigVersion,
 		Filename:          artifactName,
 		ObjectKey:         objectKey,
 		MIMEType:          input.MIMEType,
@@ -327,3 +326,44 @@ func (w inboundArtifactWriter) WriteInboundArtifact(
 	}
 	return staged.ArtifactRef, nil
 }
+
+// DeleteInboundArtifact compensates a pre-admission upload. The durable stage
+// is first moved out of PENDING, preventing a concurrent admission from
+// attaching the object after it has been selected for deletion. ATTACHED
+// stages are never deleted here.
+func (w inboundArtifactWriter) DeleteInboundArtifact(
+	ctx context.Context,
+	input channels.InboundArtifact,
+	artifactRef string,
+) error {
+	if w.store == nil || w.resolver == nil {
+		return errors.New("production artifact writer is not initialized")
+	}
+	if input.ConfigVersion == "" || artifactRef == "" {
+		return errors.New("inbound artifact compensation scope is required")
+	}
+	staged, shouldDelete, err := w.store.MarkInboundArtifactDeleted(ctx, postgres.StagedInboundArtifact{
+		TenantID: input.TenantID, AppID: input.AppID, BindingID: input.BindingID,
+		ExternalMessageID: input.ExternalMessageID, ItemNo: input.ItemNo,
+		ArtifactRef: artifactRef, ConfigVersion: input.ConfigVersion,
+	})
+	if err != nil || !shouldDelete {
+		return err
+	}
+	config, err := w.store.ResolveAppConfig(ctx, input.TenantID, input.AppID, staged.ConfigVersion)
+	if err != nil {
+		return err
+	}
+	if config.BackendConfig.Artifact.IsZero() {
+		return errors.New("artifact backend is required for inbound media compensation")
+	}
+	return w.resolver.DeleteExactObject(
+		ctx,
+		tenant.Scope{TenantID: input.TenantID, AppID: input.AppID},
+		staged.ConfigVersion,
+		config.BackendConfig.Artifact,
+		staged.ObjectKey,
+	)
+}
+
+var _ channels.ArtifactCompensator = inboundArtifactWriter{}

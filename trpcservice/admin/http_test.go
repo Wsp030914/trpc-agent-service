@@ -191,6 +191,41 @@ func TestHTTPHandlerDerivesRoleAndEnforcesTenantScope(t *testing.T) {
 	}
 }
 
+func TestHTTPHandlerEnforcesTenantScopeBeforeMutation(t *testing.T) {
+	repository := &recordingRepository{}
+	handler, err := admin.NewHTTPHandlerWithAuth(admin.API{Bindings: repository, Repository: repository}, admin.AdminAuthConfig{
+		SystemAdminToken:  testAdminToken,
+		OperatorToken:     "operator-token",
+		OperatorTenantIDs: []string{"tenant-a"},
+	})
+	if err != nil {
+		t.Fatalf("new role handler: %v", err)
+	}
+	post := func(token, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/admin/v1/configs/activate", strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if response := post("operator-token", `{"tenant_id":"tenant-a","app_id":"support","version":"v1"}`); response.Code != http.StatusNoContent {
+		t.Fatalf("allowed operator mutation status = %d: %s", response.Code, response.Body.String())
+	}
+	if repository.activatedTenantID != "tenant-a" {
+		t.Fatalf("allowed mutation tenant = %q", repository.activatedTenantID)
+	}
+	repository.activatedTenantID = ""
+	if response := post("operator-token", `{"tenant_id":"tenant-b","app_id":"support","version":"v1"}`); response.Code != http.StatusForbidden {
+		t.Fatalf("foreign operator mutation status = %d: %s", response.Code, response.Body.String())
+	}
+	if repository.activatedTenantID != "" {
+		t.Fatal("foreign operator mutation reached repository")
+	}
+	if response := post(testAdminToken, `{"tenant_id":"tenant-b","app_id":"support","version":"v1"}`); response.Code != http.StatusNoContent {
+		t.Fatalf("system admin mutation status = %d: %s", response.Code, response.Body.String())
+	}
+}
+
 func newAdminHandler(t *testing.T, repository *recordingRepository) http.Handler {
 	t.Helper()
 	handler, err := admin.NewHTTPHandler(admin.API{Bindings: repository, Repository: repository}, testAdminToken)

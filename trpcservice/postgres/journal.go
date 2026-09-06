@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
@@ -186,6 +187,53 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
 			replies,
 		); err != nil {
 			return fmt.Errorf("insert reply outbox: %w", err)
+		}
+	}
+	if exec.TerminalStatus != "" {
+		if err := exec.TerminalStatus.Validate(); err != nil {
+			return fmt.Errorf("terminal execution status: %w", err)
+		}
+		lastError := ""
+		if exec.TerminalStatus == queue.CompletionFailed {
+			lastError = platformlog.SafeError(evt.Error)
+		}
+		result, err := tx.Exec(ctx, `
+UPDATE platform.execution
+SET status = $10,
+    last_error = $11,
+    lease_owner = NULL,
+    run_token = NULL,
+    lease_until = NULL,
+    finished_at = clock_timestamp(),
+    updated_at = clock_timestamp()
+WHERE tenant_id = $1
+  AND app_id = $2
+  AND request_id = $3
+  AND status = 'RUNNING'
+  AND lease_owner = $4
+  AND run_token = $5
+  AND lease_until > clock_timestamp()
+  AND session_principal_id = $6
+  AND session_id = $7
+  AND user_id = $8
+  AND config_version = $9`,
+			exec.Tenant.TenantID,
+			exec.Tenant.AppID,
+			exec.RequestID,
+			lease.Owner,
+			lease.Token,
+			exec.Tenant.SessionPrincipalID,
+			exec.Tenant.SessionID,
+			exec.Tenant.UserID,
+			exec.Tenant.ConfigVersion,
+			exec.TerminalStatus,
+			lastError,
+		)
+		if err != nil {
+			return fmt.Errorf("update terminal execution: %w", err)
+		}
+		if result.RowsAffected() != 1 {
+			return fmt.Errorf("update terminal execution: %w", queue.ErrLeaseLost)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

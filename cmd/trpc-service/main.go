@@ -678,7 +678,11 @@ func runWorkerUntilShutdown(
 	go func() {
 		done <- runtime.consumer.Run(runCtx)
 	}()
-	go runtime.runHeartbeat(runCtx)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		runtime.runHeartbeat(auxCtx)
+	}()
 	migrationDone := make(chan error, 1)
 	go func() {
 		migrationDone <- runtime.runDataMigrations(auxCtx)
@@ -691,61 +695,40 @@ func runWorkerUntilShutdown(
 	}
 	server.MarkReady()
 
+	var cause error
+	serverStopped := false
 	select {
 	case err := <-relayDone:
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
-		cancelRun()
-		return err
+		cancelAux()
+		cause = err
 	case err := <-providerDone:
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
-		cancelRun()
-		return err
+		cancelAux()
+		cause = err
 	case err := <-done:
 		server.MarkNotReady()
-		cancelRun()
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancelShutdown()
-		migrationErr, stopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
-		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
-		return dataMigrationShutdownResult(errors.Join(err, replyShutdownError(replyErr, replyStopped)), migrationErr, stopped)
+		runtime.consumer.StopClaiming()
+		cancelAux()
+		cause = err
 	case err := <-replyDone:
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
-		cancelRun()
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancelShutdown()
-		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
-		migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
-		return dataMigrationShutdownResult(
-			workerShutdownResult(err, workerErr, stopped),
-			migrationErr,
-			migrationStopped,
-		)
+		cancelAux()
+		cause = err
 	case err := <-migrationDone:
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
-		cancelRun()
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancelShutdown()
-		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
-		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
-		return dataMigrationShutdownResult(
-			workerShutdownResult(errors.Join(nonCancellationError(err), replyShutdownError(replyErr, replyStopped)), workerErr, stopped),
-			err,
-			true,
-		)
+		cancelAux()
+		cause = nonCancellationError(err)
 	case <-server.done:
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
-		cancelRun()
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancelShutdown()
-		workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
-		migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
-		replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
-		return dataMigrationShutdownResult(workerShutdownResult(errors.Join(server.wait(), replyShutdownError(replyErr, replyStopped)), workerErr, stopped), migrationErr, migrationStopped)
+		cancelAux()
+		cause = server.wait()
+		serverStopped = true
 	case <-ctx.Done():
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
@@ -754,14 +737,31 @@ func runWorkerUntilShutdown(
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancelShutdown()
-	serverErr := server.shutdown(shutdownCtx)
+	var serverErr error
+	if !serverStopped {
+		serverErr = server.shutdown(shutdownCtx)
+	}
 	if serverErr != nil {
 		cancelRun()
 	}
-	workerErr, stopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
+	workerErr, workerStopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
 	migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
 	replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
-	return dataMigrationShutdownResult(workerShutdownResult(errors.Join(serverErr, replyShutdownError(replyErr, replyStopped)), workerErr, stopped), migrationErr, migrationStopped)
+	heartbeatStopped := awaitHeartbeatExit(shutdownCtx, heartbeatDone)
+	return dataMigrationShutdownResult(
+		workerShutdownResult(
+			errors.Join(
+				cause,
+				serverErr,
+				replyShutdownError(replyErr, replyStopped),
+				heartbeatShutdownError(heartbeatStopped),
+			),
+			workerErr,
+			workerStopped,
+		),
+		migrationErr,
+		migrationStopped,
+	)
 }
 
 func awaitWorkerExit(ctx context.Context, done <-chan error, cancel context.CancelFunc) (error, bool) {
@@ -812,10 +812,34 @@ func awaitReplyExit(ctx context.Context, done <-chan error, cancel context.Cance
 }
 
 func replyShutdownError(err error, stopped bool) error {
-	if !stopped || errors.Is(err, context.Canceled) {
+	if !stopped {
+		return fmt.Errorf("%w: reply sender: %s", errWorkerShutdownTimeout, platformlog.SafeError(err))
+	}
+	if errors.Is(err, context.Canceled) {
 		return nil
 	}
 	return err
+}
+
+func awaitHeartbeatExit(ctx context.Context, done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+func heartbeatShutdownError(stopped bool) error {
+	if stopped {
+		return nil
+	}
+	return fmt.Errorf("%w: worker heartbeat", errWorkerShutdownTimeout)
 }
 
 func nonCancellationError(err error) error {

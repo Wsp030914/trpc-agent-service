@@ -327,6 +327,22 @@ func (h adminHTTPHandler) requireRoles(next http.HandlerFunc, roles ...AdminRole
 	}
 }
 
+// authorizeTenant enforces the tenant boundary after decoding the operation
+// scope. Role authorization alone is insufficient for operator and auditor
+// credentials because the tenant is carried in the JSON command.
+func (h adminHTTPHandler) authorizeTenant(w http.ResponseWriter, r *http.Request, scope tenant.Scope) bool {
+	principal, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return false
+	}
+	if !principal.AllowsTenant(scope.TenantID) {
+		writeJSONError(w, http.StatusForbidden, "forbidden")
+		return false
+	}
+	return true
+}
+
 func parseListOptions(w http.ResponseWriter, r *http.Request, tenantRequired bool) (ListOptions, bool) {
 	query := r.URL.Query()
 	options := ListOptions{
@@ -479,6 +495,9 @@ func (h adminHTTPHandler) createAgentApp(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusBadRequest, "invalid agent app")
 		return
 	}
+	if !h.authorizeTenant(w, r, tenant.Scope{TenantID: request.App.TenantID}) {
+		return
+	}
 	if err := h.api.CreateAgentApp(r.Context(), request.App, request.InitialConfig); err != nil {
 		writeAdminOperationError(w, err, "create agent app failed")
 		return
@@ -490,6 +509,9 @@ func (h adminHTTPHandler) createChannelBinding(w http.ResponseWriter, r *http.Re
 	var request createChannelBindingRequest
 	if !decodeJSON(w, r, &request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid channel binding")
+		return
+	}
+	if !h.authorizeTenant(w, r, tenant.Scope{TenantID: request.Binding.TenantID}) {
 		return
 	}
 	binding, err := h.api.ProvisionChannelBinding(r.Context(), request.Binding)
@@ -514,6 +536,9 @@ func (h adminHTTPHandler) setChannelBindingStatus(w http.ResponseWriter, r *http
 		writeJSONError(w, http.StatusBadRequest, "invalid channel binding status request")
 		return
 	}
+	if !h.authorizeTenant(w, r, tenant.Scope{TenantID: request.TenantID}) {
+		return
+	}
 	binding, err := h.api.SetChannelBindingStatus(r.Context(), tenant.Scope{
 		TenantID: request.TenantID, AppID: request.AppID,
 	}, request.BindingID, status)
@@ -528,6 +553,9 @@ func (h adminHTTPHandler) publishAppConfig(w http.ResponseWriter, r *http.Reques
 	var request publishAppConfigRequest
 	if !decodeJSON(w, r, &request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid app config")
+		return
+	}
+	if !h.authorizeTenant(w, r, tenant.Scope{TenantID: request.Config.TenantID}) {
 		return
 	}
 	if err := h.api.PublishAppConfig(r.Context(), request.Config); err != nil {
@@ -562,6 +590,9 @@ func (h adminHTTPHandler) setActiveAppConfig(
 		return
 	}
 	scope := tenant.Scope{TenantID: request.TenantID, AppID: request.AppID}
+	if !h.authorizeTenant(w, r, scope) {
+		return
+	}
 	if err := mutate(r.Context(), scope, request.Version); err != nil {
 		writeAdminOperationError(w, err, failureMessage)
 		return
@@ -575,9 +606,11 @@ func (h adminHTTPHandler) enableAppCanary(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusBadRequest, "invalid canary enable request")
 		return
 	}
-	value, err := h.api.EnableAppCanary(r.Context(), tenant.Scope{
-		TenantID: request.TenantID, AppID: request.AppID,
-	}, request.Version, request.Percentage)
+	scope := tenant.Scope{TenantID: request.TenantID, AppID: request.AppID}
+	if !h.authorizeTenant(w, r, scope) {
+		return
+	}
+	value, err := h.api.EnableAppCanary(r.Context(), scope, request.Version, request.Percentage)
 	if err != nil {
 		writeAdminOperationError(w, err, "enable app canary failed")
 		return
@@ -612,7 +645,11 @@ func (h adminHTTPHandler) mutateAppCanary(
 		writeJSONError(w, http.StatusBadRequest, "invalid canary request")
 		return
 	}
-	value, err := operation(r.Context(), tenant.Scope{TenantID: request.TenantID, AppID: request.AppID})
+	scope := tenant.Scope{TenantID: request.TenantID, AppID: request.AppID}
+	if !h.authorizeTenant(w, r, scope) {
+		return
+	}
+	value, err := operation(r.Context(), scope)
 	if err != nil {
 		writeAdminOperationError(w, err, failureMessage)
 		return
@@ -629,6 +666,9 @@ func (h adminHTTPHandler) createDataMigration(w http.ResponseWriter, r *http.Req
 	scope := tenant.Scope{
 		TenantID: request.TenantID,
 		AppID:    request.AppID,
+	}
+	if !h.authorizeTenant(w, r, scope) {
+		return
 	}
 	domain := request.Domain
 	if domain == "" {
@@ -656,6 +696,9 @@ func (h adminHTTPHandler) beginDataMigration(w http.ResponseWriter, r *http.Requ
 	var request beginDataMigrationRequest
 	if !decodeJSON(w, r, &request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid data migration")
+		return
+	}
+	if !h.authorizeTenant(w, r, tenant.Scope{TenantID: request.TenantID}) {
 		return
 	}
 	leaseDuration := time.Duration(0)

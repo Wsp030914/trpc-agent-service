@@ -28,11 +28,12 @@ var (
 )
 
 var (
-	_ auth.CredentialStore        = (*Store)(nil)
-	_ auth.Directory              = (*Store)(nil)
-	_ config.Resolver             = (*Store)(nil)
-	_ gateway.PublicRouteResolver = (*Store)(nil)
-	_ gateway.Admitter            = (*Store)(nil)
+	_ auth.CredentialStore               = (*Store)(nil)
+	_ auth.Directory                     = (*Store)(nil)
+	_ config.Resolver                    = (*Store)(nil)
+	_ gateway.PublicRouteResolver        = (*Store)(nil)
+	_ gateway.Admitter                   = (*Store)(nil)
+	_ gateway.ChannelConfigVersionPinner = (*Store)(nil)
 )
 
 // Store is the concrete PostgreSQL implementation for platform-owned records.

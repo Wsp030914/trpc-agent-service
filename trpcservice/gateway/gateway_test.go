@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -182,6 +183,81 @@ func TestGatewayAcceptsValidatedArtifactReference(t *testing.T) {
 	if admitter.request.RequestID == "" || len(admitter.request.Message.ArtifactRefs) != 1 {
 		t.Fatalf("admission request = %#v", admitter.request)
 	}
+}
+
+func TestGatewayPinsChannelConfigBeforeAttachmentsAndCompensatesAdmissionFailure(t *testing.T) {
+	binding := testChannelBinding()
+	resolver, err := gateway.NewChannelBindingInputIdentityResolverFromBinding(
+		binding.Snapshot(),
+		tenant.RuntimeContext{
+			TenantID: binding.TenantID, AppID: binding.AppID,
+			Channel: string(binding.Channel), BindingID: binding.BindingID,
+			TraceID: "request-attachment",
+		},
+	)
+	if err != nil {
+		t.Fatalf("new channel resolver: %v", err)
+	}
+	input, err := channels.NewChannelInput(channels.ChannelInput{
+		TenantID: binding.TenantID, AppID: binding.AppID, Channel: binding.Channel,
+		BindingID: binding.BindingID, BindingRevision: binding.BindingRevision,
+		ExternalMessageID: "message-attachment", Conversation: channels.ChannelConversation{
+			Kind: channels.ConversationDirect,
+		}, MessageType: channels.MessageTypeText, Text: "hello",
+	}, channels.ChannelMappingInput{
+		ExternalSenderID: "user-1", ProviderSenderTarget: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("new channel input: %v", err)
+	}
+	admitter := &pinnerAdmitter{
+		result: gateway.AdmissionResult{RequestID: "request-attachment", ConfigVersion: "v-canary", TurnSeq: 1},
+		err:    errors.New("admission failed"),
+	}
+	cleanupCalled := false
+	prepared, err := gateway.New(admitter).HandleChannel(context.Background(), gateway.Request{
+		RequestID: "request-attachment", IdempotencyKey: "message-attachment",
+		Tenant: resolver, ChannelInput: &input,
+	}, func(_ context.Context, input channels.ChannelInput, version string) (channels.ChannelInput, func(context.Context) error, error) {
+		if version != "v-canary" {
+			t.Fatalf("attachment config version = %q, want v-canary", version)
+		}
+		input.ArtifactRefs = []string{"artifact://inbound/one@0"}
+		return input, func(context.Context) error {
+			cleanupCalled = true
+			return nil
+		}, nil
+	})
+	if err == nil || prepared.RequestID != "" {
+		t.Fatalf("handle result=%#v err=%v, want admission failure", prepared, err)
+	}
+	if !cleanupCalled {
+		t.Fatal("admission failure did not invoke attachment compensation")
+	}
+	if admitter.request.Identity.Tenant.ConfigVersion != "v-canary" || !admitter.request.Identity.ConfigVersionPinned() {
+		t.Fatalf("pinned admission identity = %#v", admitter.request.Identity)
+	}
+	if len(admitter.request.Message.ArtifactRefs) != 1 || len(admitter.request.ChannelInput.ArtifactRefs) != 1 {
+		t.Fatalf("prepared admission artifacts = %#v", admitter.request)
+	}
+}
+
+type pinnerAdmitter struct {
+	request gateway.AdmissionRequest
+	result  gateway.AdmissionResult
+	err     error
+}
+
+func (a *pinnerAdmitter) PinChannelConfig(context.Context, gateway.AdmissionRequest) (string, error) {
+	return "v-canary", nil
+}
+
+func (a *pinnerAdmitter) Admit(_ context.Context, request gateway.AdmissionRequest) (gateway.AdmissionResult, error) {
+	a.request = request
+	if a.err != nil {
+		return gateway.AdmissionResult{}, a.err
+	}
+	return a.result, nil
 }
 
 func validAdmissionIdentity() gateway.AdmissionIdentity {
