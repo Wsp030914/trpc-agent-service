@@ -110,7 +110,7 @@ WHERE tenant_id = $1 AND app_id = $2`,
 		return fmt.Errorf("agent app config: %w", ErrNotFound)
 	}
 	event := controlPlaneAuditEvent(
-		tenantID, appID, version, platformaudit.ConfigActivated, "activated",
+		ctx, tenantID, appID, version, platformaudit.ConfigActivated, "activated",
 	)
 	if err := recordControlPlaneAuditTx(ctx, tx, event); err != nil {
 		return err

@@ -38,6 +38,21 @@ func TestVerifiedRedisSourceAcceptsConfirmedAbsence(t *testing.T) {
 	}
 }
 
+func TestVerifiedRedisSourceAcceptsEmptySessionWithoutSummary(t *testing.T) {
+	t.Parallel()
+	key := session.Key{AppName: "app", UserID: "user", SessionID: "empty"}
+	source := verifiedRedisSource{Service: &redisSourceStub{
+		value: &session.Session{ID: key.SessionID, AppName: key.AppName, UserID: key.UserID},
+	}}
+	summaries, err := source.GetSessionSummaries(context.Background(), key)
+	if err != nil {
+		t.Fatalf("GetSessionSummaries() error = %v", err)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("GetSessionSummaries() = %#v, want empty inventory", summaries)
+	}
+}
+
 type redisSourceStub struct {
 	session.Service
 	value   *session.Session

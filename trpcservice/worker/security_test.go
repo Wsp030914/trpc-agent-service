@@ -2,8 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -55,6 +58,34 @@ func TestToolPermissionPolicyReturnsAskForReviewRequiredTool(t *testing.T) {
 	if decision.Action != frameworktool.PermissionActionAsk {
 		t.Fatalf("decision = %q, want %q", decision.Action, frameworktool.PermissionActionAsk)
 	}
+}
+
+func TestToolPermissionPolicyRejectsLostExecutionLease(t *testing.T) {
+	w := Worker{
+		LeaseValidator: executionLeaseValidatorFunc(func(context.Context, Execution, queue.Lease) error {
+			return queue.ErrLeaseLost
+		}),
+	}
+	exec := securityTestExecution()
+	exec.Config.Tools = tenant.ToolPolicy{ExecutableTools: []string{"todo_write"}}
+	ctx, err := ContextWithJobLease(context.Background(), queue.Lease{
+		Owner: "worker-a", Token: "run-a", Until: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("attach execution lease: %v", err)
+	}
+	_, err = w.toolPermissionPolicy(exec).CheckToolPermission(ctx, &frameworktool.PermissionRequest{
+		ToolName: "todo_write",
+	})
+	if !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("permission error = %v, want lease lost", err)
+	}
+}
+
+type executionLeaseValidatorFunc func(context.Context, Execution, queue.Lease) error
+
+func (f executionLeaseValidatorFunc) ValidateExecutionLease(ctx context.Context, exec Execution, lease queue.Lease) error {
+	return f(ctx, exec, lease)
 }
 
 func securityTestExecution() Execution {

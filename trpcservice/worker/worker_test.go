@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
+	platformapproval "github.com/liuzengh/trpc-agent-service/trpcservice/approval"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
@@ -425,6 +426,78 @@ func TestWorkerRunDrainsEventsAfterSinkTimeout(t *testing.T) {
 	}
 }
 
+func TestWorkerDoesNotPersistCompletionAfterApprovalBoundary(t *testing.T) {
+	backend := sharedBackendConfig()
+	appConfig := testAppConfig("tenant-a", backend)
+	appConfig.Tools = tenant.ToolPolicy{
+		ExecutableTools:     []string{"delete"},
+		ReviewRequiredTools: []string{"delete"},
+	}
+	configs, err := config.NewStaticResolver(appConfig)
+	if err != nil {
+		t.Fatalf("new config resolver: %v", err)
+	}
+	callID := "approval-call-1"
+	runner := &recordingRunner{
+		permissionRequest: &frameworktool.PermissionRequest{
+			ToolName:   "delete",
+			ToolCallID: callID,
+			Arguments:  []byte(`{"resource":"record-1"}`),
+		},
+		events: []*event.Event{
+			event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+				Object: model.ObjectTypeChatCompletion,
+				Done:   true,
+				Choices: []model.Choice{{Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{{
+						ID: callID, Type: "function",
+						Function: model.FunctionDefinitionParam{
+							Name: "delete", Arguments: []byte(`{"resource":"record-1"}`),
+						},
+					}},
+				}}},
+			}),
+			event.NewResponseEvent("invocation-1", "tool", &model.Response{
+				Object: model.ObjectTypeToolResponse,
+				Choices: []model.Choice{{Message: model.Message{
+					Role:     model.RoleTool,
+					ToolID:   callID,
+					ToolName: "delete",
+					Content:  `{"status":"approval_required"}`,
+				}}},
+			}),
+			event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+				Object:  model.ObjectTypeChatCompletion,
+				Done:    true,
+				Choices: []model.Choice{{Message: model.NewAssistantMessage("must not be persisted")}},
+			}),
+			runnerCompletionEvent(),
+		},
+	}
+	sink := &recordingEventSink{}
+	w := *worker.New(configs, nil, testSessionLocker{}, sink, nil)
+	w.Runner = fixedRunner(runner)
+	w.Approvals = &pendingApprovalRepository{}
+
+	result, err := w.Run(context.Background(), testJob("request-approval-boundary", "tenant-a", "session-1"))
+	if err != nil {
+		t.Fatalf("run job: %v", err)
+	}
+	if !result.ApprovalPending || result.ApprovalID == "" {
+		t.Fatalf("approval result = %#v, want durable pending approval", result)
+	}
+	if len(sink.events) != 3 {
+		t.Fatalf("persisted event count = %d, want tool call, tool result, and runner completion", len(sink.events))
+	}
+	for _, persisted := range sink.events {
+		if persisted.Response != nil && len(persisted.Response.Choices) > 0 &&
+			persisted.Response.Choices[0].Message.Content == "must not be persisted" {
+			t.Fatal("assistant completion after approval boundary was persisted")
+		}
+	}
+}
+
 func TestOpenAIModelResolverAppliesModelParametersWithoutConfigCredentials(t *testing.T) {
 	w := testWorker(t, sharedBackendConfig())
 	exec, err := w.Prepare(context.Background(), testJob("request-1", "tenant-a", "session-1"))
@@ -499,6 +572,26 @@ func TestWorkerRunSkipsSinkAfterLockContextCanceled(t *testing.T) {
 	}
 	if len(sink.events) != 0 {
 		t.Fatalf("sink received %d events after lock context cancellation", len(sink.events))
+	}
+}
+
+func TestWorkerRunClassifiesLostSessionLeaseAsUncertain(t *testing.T) {
+	lockContext, cancelLock := context.WithCancelCause(context.Background())
+	cancelLock(worker.ErrSessionLeaseLost)
+	runner := &recordingRunner{events: []*event.Event{runnerCompletionEvent()}}
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = fixedRunner(runner)
+	w.SessionLocker = staticSessionLocker{ctx: lockContext}
+
+	result, err := w.Run(context.Background(), testJob("request-lease-lost", "tenant-a", "session-1"))
+	if !worker.IsSideEffectUncertainError(err) {
+		t.Fatalf("run error = %v, want side-effect-uncertain classification", err)
+	}
+	if !errors.Is(err, worker.ErrSessionLeaseLost) {
+		t.Fatalf("run error = %v, want session lease lost cause", err)
+	}
+	if !result.RunnerStarted {
+		t.Fatal("runner start was not recorded")
 	}
 }
 
@@ -687,16 +780,19 @@ func fixedRunner(value frameworkrunner.Runner) func(context.Context, worker.Exec
 }
 
 type recordingRunner struct {
-	ctx       context.Context
-	userID    string
-	sessionID string
-	message   model.Message
-	options   agent.RunOptions
-	events    []*event.Event
-	err       error
-	cancel    context.CancelFunc
-	closed    bool
-	closeErr  error
+	ctx                context.Context
+	userID             string
+	sessionID          string
+	message            model.Message
+	options            agent.RunOptions
+	events             []*event.Event
+	permissionRequest  *frameworktool.PermissionRequest
+	permissionDecision frameworktool.PermissionDecision
+	permissionErr      error
+	err                error
+	cancel             context.CancelFunc
+	closed             bool
+	closeErr           error
 }
 
 type managedBlockingRunner struct {
@@ -815,6 +911,13 @@ func (r *recordingRunner) Run(
 	r.sessionID = sessionID
 	r.message = message
 	r.options = agent.NewRunOptions(runOpts...)
+	if r.permissionRequest != nil {
+		if r.options.ToolPermissionPolicy == nil {
+			r.permissionErr = errors.New("tool permission policy is missing")
+		} else {
+			r.permissionDecision, r.permissionErr = r.options.ToolPermissionPolicy.CheckToolPermission(ctx, r.permissionRequest)
+		}
+	}
 	if r.cancel != nil {
 		r.cancel()
 	}
@@ -827,6 +930,33 @@ func (r *recordingRunner) Run(
 	}
 	close(ch)
 	return ch, nil
+}
+
+type pendingApprovalRepository struct{}
+
+func (*pendingApprovalRepository) ResolveOrCreate(_ context.Context, request platformapproval.Request) (platformapproval.Record, error) {
+	return platformapproval.Record{
+		ApprovalID:     "approval-1",
+		TenantID:       request.TenantID,
+		AppID:          request.AppID,
+		ConfigVersion:  request.ConfigVersion,
+		RequestID:      request.RequestID,
+		SessionID:      request.SessionID,
+		ToolName:       request.ToolName,
+		ToolCallID:     request.ToolCallID,
+		ArgumentDigest: request.ArgumentDigest,
+		Status:         platformapproval.StatusPending,
+		ExpiresAt:      request.ExpiresAt,
+		CreatedAt:      time.Now(),
+	}, nil
+}
+
+func (*pendingApprovalRepository) List(context.Context, platformapproval.Query) ([]platformapproval.Record, error) {
+	return nil, nil
+}
+
+func (*pendingApprovalRepository) Decide(context.Context, string, string, string, platformapproval.Status) (platformapproval.Record, error) {
+	return platformapproval.Record{}, nil
 }
 
 type testSessionLocker struct{}

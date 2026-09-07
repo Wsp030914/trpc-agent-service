@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/liuzengh/trpc-agent-service/internal/e2e"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
 	platformpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -127,12 +127,19 @@ func run(parent context.Context) error {
 	}
 
 	requestID := "deployment-e2e-" + runID
-	responseStatus, err := postGatewayRequest(ctx, client, gatewayURL, issued.APIKey, requestID)
+	responseStatus, responseBody, err := postGatewayRequest(ctx, client, gatewayURL, issued.APIKey, requestID)
 	if err != nil {
 		return err
 	}
 	if responseStatus != http.StatusOK {
 		return fmt.Errorf("gateway request status=%d", responseStatus)
+	}
+	projection, err := e2e.DecodeChatCompletion(responseBody, false)
+	if err != nil || projection.Kind != e2e.ProjectionFinal {
+		if err == nil {
+			err = errors.New("response is not a final assistant projection")
+		}
+		return fmt.Errorf("gateway response projection: %w", err)
 	}
 
 	final, err := waitDurableExecution(ctx, pool, tenantID, appID, requestID)
@@ -187,7 +194,9 @@ func getStatus(ctx context.Context, client *http.Client, endpoint, token string)
 		return 0, err
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, response.Body)
+	if _, err := e2e.ReadBody(response.Body); err != nil {
+		return 0, err
+	}
 	return response.StatusCode, nil
 }
 
@@ -207,18 +216,20 @@ func postJSON(ctx context.Context, client *http.Client, endpoint, token string, 
 		return err
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, response.Body)
+	if _, err := e2e.ReadBody(response.Body); err != nil {
+		return err
+	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("status=%d", response.StatusCode)
 	}
 	return nil
 }
 
-func postGatewayRequest(ctx context.Context, client *http.Client, gatewayURL, apiKey, requestID string) (int, error) {
+func postGatewayRequest(ctx context.Context, client *http.Client, gatewayURL, apiKey, requestID string) (int, []byte, error) {
 	body := bytes.NewBufferString(`{"model":"ignored","messages":[{"role":"user","content":"deployment golden path"}]}`)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, gatewayURL+"/v1/chat/completions", body)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+apiKey)
 	request.Header.Set("X-Request-ID", requestID)
@@ -226,11 +237,14 @@ func postGatewayRequest(ctx context.Context, client *http.Client, gatewayURL, ap
 	request.Header.Set("X-Session-ID", "deployment-session")
 	response, err := client.Do(request)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, response.Body)
-	return response.StatusCode, nil
+	responseBody, err := e2e.ReadBody(response.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return response.StatusCode, responseBody, nil
 }
 
 type durableExecution struct {

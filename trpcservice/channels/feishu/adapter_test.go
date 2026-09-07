@@ -131,6 +131,182 @@ func TestRunCreatesOneClientPerActiveBindingAndStopsOnCancellation(t *testing.T)
 	}
 }
 
+func TestRunReconcilesNewBindingWhileExistingClientBlocks(t *testing.T) {
+	bindingA := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "secret-a")
+	bindingB := testFeishuBinding("tenant-b", "support", "binding-b", "app-b", "secret-b")
+	source := newMutableFeishuBindingSource(bindingA)
+	secrets := testFeishuSecrets{
+		key:   bindingA,
+		value: "secret-a",
+		more:  map[string]string{testFeishuSecretKey(bindingB): "secret-b"},
+	}
+	started := make(chan feishuFakeClientInfo, 2)
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newFeishuRecordingAdmitter()),
+		secrets,
+		WithReconcileInterval(10*time.Millisecond),
+		WithClientFactory(func(binding channels.BindingSnapshot, appSecret string, _ *larkdispatcher.EventDispatcher) Client {
+			started <- feishuFakeClientInfo{binding: binding, secret: appSecret}
+			return &feishuBlockingClient{started: make(chan struct{}), closed: make(chan struct{})}
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(runCtx) }()
+	select {
+	case info := <-started:
+		if info.binding.BindingID != bindingA.BindingID {
+			t.Fatalf("first binding = %q, want %q", info.binding.BindingID, bindingA.BindingID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first binding")
+	}
+	source.Set(bindingB)
+	select {
+	case info := <-started:
+		if info.binding.BindingID != bindingB.BindingID || info.secret != "secret-b" {
+			t.Fatalf("reconciled binding = %#v, want binding-b/secret-b", info)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new active Feishu binding waited for unrelated client")
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for adapter shutdown")
+	}
+}
+
+func TestCloseLetsRunOwnActiveClientShutdown(t *testing.T) {
+	binding := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "secret-a")
+	source, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &feishuCloseCountingClient{
+		started:      make(chan struct{}),
+		closeStarted: make(chan struct{}),
+		closeGate:    make(chan struct{}),
+	}
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newFeishuRecordingAdmitter()),
+		testFeishuSecrets{key: binding, value: "secret-a"},
+		WithClientFactory(func(channels.BindingSnapshot, string, *larkdispatcher.EventDispatcher) Client {
+			return client
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(runCtx) }()
+	select {
+	case <-client.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Feishu client")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- adapter.Close(context.Background()) }()
+	select {
+	case <-client.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("adapter Close did not close the active Feishu client")
+	}
+	close(client.closeGate)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("close adapter: %v", err)
+	}
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v, want context canceled", err)
+	}
+	if got := client.closeCalls.Load(); got != 1 {
+		t.Fatalf("Feishu client close calls = %d, want 1", got)
+	}
+}
+
+func TestRunRebuildsChangedBindingAndStopsSuspendedBinding(t *testing.T) {
+	binding := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "secret-a")
+	updated := binding
+	updated.BindingRevision = 2
+	updated.Secret = tenant.SecretRef{Name: "secret-b", Version: "v1"}
+	source := newMutableFeishuBindingSource(binding)
+	secrets := testFeishuSecrets{
+		key:   binding,
+		value: "secret-a",
+		more:  map[string]string{testFeishuSecretKey(updated): "secret-b"},
+	}
+	started := make(chan feishuFakeClientInfo, 2)
+	clients := make(chan *feishuBlockingClient, 2)
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newFeishuRecordingAdmitter()),
+		secrets,
+		WithReconcileInterval(10*time.Millisecond),
+		WithClientFactory(func(binding channels.BindingSnapshot, appSecret string, _ *larkdispatcher.EventDispatcher) Client {
+			client := &feishuBlockingClient{started: make(chan struct{}), closed: make(chan struct{})}
+			started <- feishuFakeClientInfo{binding: binding, secret: appSecret}
+			clients <- client
+			return client
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(runCtx) }()
+	first := <-clients
+	firstInfo := <-started
+	if firstInfo.binding.BindingRevision != 1 || firstInfo.secret != "secret-a" {
+		t.Fatalf("initial binding = %#v", firstInfo)
+	}
+	source.Set(updated)
+	second := <-clients
+	secondInfo := <-started
+	if secondInfo.binding.BindingRevision != 2 || secondInfo.secret != "secret-b" {
+		t.Fatalf("updated binding = %#v", secondInfo)
+	}
+	if err := adapter.HandleMessage(context.Background(), binding.Snapshot(), feishuTextEvent("app-a", "stale-message", "ou-1", "p2p", "stale")); !errors.Is(err, gateway.ErrChannelBindingSnapshotStale) {
+		t.Fatalf("stale Feishu message error = %v", err)
+	}
+	select {
+	case <-first.closed:
+	case <-time.After(time.Second):
+		t.Fatal("old Feishu client was not closed after revision change")
+	}
+
+	suspended := updated
+	suspended.Status = channels.BindingSuspended
+	source.Set(suspended)
+	select {
+	case <-second.closed:
+	case <-time.After(time.Second):
+		t.Fatal("active Feishu client was not closed after suspension")
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Feishu shutdown")
+	}
+}
+
 func TestRunReconnectsAfterClientCloseWithBoundedDelay(t *testing.T) {
 	binding := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "secret-a")
 	source, err := config.NewStaticBindingResolver(binding)
@@ -195,7 +371,77 @@ type feishuBlockingClient struct {
 	closed  chan struct{}
 }
 
+type feishuCloseCountingClient struct {
+	started      chan struct{}
+	closeStarted chan struct{}
+	closeGate    chan struct{}
+	closeCalls   atomic.Int32
+}
+
+func (c *feishuCloseCountingClient) Start(ctx context.Context) error {
+	close(c.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (c *feishuCloseCountingClient) CloseAndWait(ctx context.Context) error {
+	if c.closeCalls.Add(1) == 1 {
+		close(c.closeStarted)
+	}
+	select {
+	case <-c.closeGate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+var _ Client = (*feishuCloseCountingClient)(nil)
+
 type feishuFailingClient struct{}
+
+type mutableFeishuBindingSource struct {
+	mu       sync.RWMutex
+	bindings map[string]channels.Binding
+}
+
+func newMutableFeishuBindingSource(bindings ...channels.Binding) *mutableFeishuBindingSource {
+	source := &mutableFeishuBindingSource{bindings: make(map[string]channels.Binding)}
+	for _, binding := range bindings {
+		source.bindings[bindingKey(binding.Snapshot())] = binding
+	}
+	return source
+}
+
+func (s *mutableFeishuBindingSource) Set(bindings ...channels.Binding) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, binding := range bindings {
+		s.bindings[bindingKey(binding.Snapshot())] = binding
+	}
+}
+
+func (s *mutableFeishuBindingSource) ResolveBinding(_ context.Context, tenantID, appID, bindingID string) (channels.Binding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	binding, ok := s.bindings[tenantID+"\x00"+appID+"\x00"+bindingID]
+	if !ok {
+		return channels.Binding{}, errors.New("binding not found")
+	}
+	return binding, nil
+}
+
+func (s *mutableFeishuBindingSource) ListActiveChannelBindings(_ context.Context, channel channels.Channel) ([]channels.Binding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]channels.Binding, 0, len(s.bindings))
+	for _, binding := range s.bindings {
+		if binding.Channel == channel && binding.Status == channels.BindingActive {
+			result = append(result, binding)
+		}
+	}
+	return result, nil
+}
 
 func (*feishuFailingClient) Start(context.Context) error        { return errors.New("fake websocket closed") }
 func (*feishuFailingClient) CloseAndWait(context.Context) error { return nil }

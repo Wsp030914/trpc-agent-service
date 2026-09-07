@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	defaultReconnectInitial = time.Second
-	defaultReconnectMax     = 30 * time.Second
+	defaultReconnectInitial  = time.Second
+	defaultReconnectMax      = 30 * time.Second
+	defaultReconcileInterval = time.Second
 )
 
 var errAttachmentIngestorRequired = errors.New("attachment ingestor is required")
@@ -94,6 +95,19 @@ func WithReconnectDelay(initial, maximum time.Duration) AdapterOption {
 	}
 }
 
+// WithReconcileInterval controls how often the adapter refreshes active
+// binding snapshots. A short interval is useful for tests and deployments
+// that need prompt control-plane changes without restarting the service.
+func WithReconcileInterval(interval time.Duration) AdapterOption {
+	return func(adapter *Adapter) error {
+		if interval <= 0 {
+			return errors.New("reconcile interval is invalid")
+		}
+		adapter.reconcileInterval = interval
+		return nil
+	}
+}
+
 // Adapter owns one authenticated WeCom long connection per active Binding and
 // submits normalized messages to Gateway. It does not call Runner or own Reply
 // Outbox delivery.
@@ -107,12 +121,46 @@ type Adapter struct {
 	clientFactory      ClientFactory
 	reconnectInitial   time.Duration
 	reconnectMax       time.Duration
+	reconcileInterval  time.Duration
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
 	runDone   chan struct{}
+	stopMu    sync.Mutex
 	clientsMu sync.Mutex
 	clients   map[string]ClientRunner
+	runsMu    sync.Mutex
+	runs      map[string]*wecomBindingRun
+}
+
+type wecomBindingRun struct {
+	snapshot channels.Binding
+	cancel   context.CancelFunc
+	done     chan error
+	clientMu sync.Mutex
+	client   *wecomClientHandle
+}
+
+type wecomClientHandle struct {
+	client    ClientRunner
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (h *wecomClientHandle) close(ctx context.Context) error {
+	if h == nil || h.client == nil {
+		return nil
+	}
+	h.closeOnce.Do(func() {
+		h.closeErr = h.client.Close(ctx)
+	})
+	return h.closeErr
+}
+
+type wecomBindingRunResult struct {
+	key string
+	run *wecomBindingRun
+	err error
 }
 
 // NewAdapter creates a WeCom AI Bot long-connection adapter. Binding.ExternalAccount
@@ -133,14 +181,16 @@ func NewAdapter(
 		return nil, errors.New("secret provider is required")
 	}
 	adapter := &Adapter{
-		bindings:         bindings,
-		admissionGateway: admissionGateway,
-		secrets:          secrets,
-		now:              time.Now,
-		clientFactory:    defaultClientFactory,
-		reconnectInitial: defaultReconnectInitial,
-		reconnectMax:     defaultReconnectMax,
-		clients:          make(map[string]ClientRunner),
+		bindings:          bindings,
+		admissionGateway:  admissionGateway,
+		secrets:           secrets,
+		now:               time.Now,
+		clientFactory:     defaultClientFactory,
+		reconnectInitial:  defaultReconnectInitial,
+		reconnectMax:      defaultReconnectMax,
+		reconcileInterval: defaultReconcileInterval,
+		clients:           make(map[string]ClientRunner),
+		runs:              make(map[string]*wecomBindingRun),
 	}
 	for _, opt := range opts {
 		if opt == nil {
@@ -168,8 +218,9 @@ func defaultClientFactory(
 	)
 }
 
-// Run enumerates active bindings and starts one client for each. Cancellation
-// stops all clients and waits for their lifecycle goroutines to finish.
+// Run reconciles active bindings and starts one client for each. Binding
+// additions and updates do not wait for unrelated long connections to exit;
+// changed/removed snapshots are canceled and closed independently.
 func (a *Adapter) Run(ctx context.Context) error {
 	if a == nil || a.bindings == nil || a.admissionGateway == nil || a.secrets == nil {
 		return errors.New("wecom adapter is not initialized")
@@ -196,42 +247,153 @@ func (a *Adapter) Run(ctx context.Context) error {
 		a.runDone = nil
 		a.runMu.Unlock()
 	}()
+	results := make(chan wecomBindingRunResult, 32)
+	ticker := time.NewTicker(a.reconcileInterval)
+	defer ticker.Stop()
 	for {
 		bindings, err := a.bindings.ListActiveChannelBindings(runCtx, channels.ChannelWeCom)
 		if err != nil {
+			a.stopAllBindings(runCtx)
 			return fmt.Errorf("list active wecom bindings: %w", err)
 		}
-		if len(bindings) == 0 {
-			if err := waitReconnect(runCtx, a.reconnectInitial, a.reconnectMax); err != nil {
-				return err
-			}
-			continue
-		}
-		done := make(chan error, len(bindings))
-		for _, binding := range bindings {
-			binding := binding
-			go func() { done <- a.runBinding(runCtx, binding) }()
-		}
-		var firstErr error
-		for range bindings {
-			if runErr := <-done; runErr != nil && !errors.Is(runErr, context.Canceled) && firstErr == nil {
-				firstErr = runErr
-				cancel()
-			}
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if firstErr != nil {
-			return firstErr
-		}
-		if err := waitReconnect(runCtx, a.reconnectInitial, a.reconnectMax); err != nil {
+		if err := a.reconcileBindings(runCtx, bindings, results); err != nil {
+			a.stopAllBindings(runCtx)
 			return err
+		}
+		select {
+		case <-runCtx.Done():
+			a.stopAllBindings(context.Background())
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return runCtx.Err()
+		case result := <-results:
+			a.finishBindingRun(result)
+			if result.err != nil && !errors.Is(result.err, context.Canceled) {
+				a.stopAllBindings(runCtx)
+				return result.err
+			}
+		case <-ticker.C:
 		}
 	}
 }
 
-func (a *Adapter) runBinding(ctx context.Context, binding channels.Binding) error {
+func (a *Adapter) reconcileBindings(
+	ctx context.Context,
+	bindings []channels.Binding,
+	results chan<- wecomBindingRunResult,
+) error {
+	desired := make(map[string]channels.Binding, len(bindings))
+	for _, binding := range bindings {
+		if err := binding.Validate(); err != nil {
+			return fmt.Errorf("wecom binding: %w", err)
+		}
+		desired[bindingKey(binding.Snapshot())] = binding
+	}
+	a.runsMu.Lock()
+	current := make(map[string]*wecomBindingRun, len(a.runs))
+	for key, run := range a.runs {
+		current[key] = run
+	}
+	a.runsMu.Unlock()
+	for key, run := range current {
+		binding, ok := desired[key]
+		if !ok {
+			a.stopBinding(ctx, key, run)
+			continue
+		}
+		if wecomBindingRuntimeEqual(run.snapshot, binding) {
+			continue
+		}
+		a.stopBinding(ctx, key, run)
+	}
+	for key, binding := range desired {
+		a.runsMu.Lock()
+		run := a.runs[key]
+		a.runsMu.Unlock()
+		if run != nil {
+			continue
+		}
+		bindingCtx, cancel := context.WithCancel(ctx)
+		run = &wecomBindingRun{snapshot: binding, cancel: cancel, done: make(chan error, 1)}
+		a.runsMu.Lock()
+		if existing := a.runs[key]; existing != nil {
+			a.runsMu.Unlock()
+			cancel()
+			continue
+		}
+		a.runs[key] = run
+		a.runsMu.Unlock()
+		go func(key string, run *wecomBindingRun, binding channels.Binding, bindingCtx context.Context) {
+			err := a.runBinding(bindingCtx, binding, run)
+			run.done <- err
+			select {
+			case results <- wecomBindingRunResult{key: key, run: run, err: err}:
+			case <-bindingCtx.Done():
+			}
+		}(key, run, binding, bindingCtx)
+	}
+	return nil
+}
+
+func wecomBindingRuntimeEqual(left, right channels.Binding) bool {
+	return left.TenantID == right.TenantID && left.AppID == right.AppID &&
+		left.BindingID == right.BindingID && left.Channel == right.Channel &&
+		left.ExternalAccount == right.ExternalAccount && left.Secret == right.Secret &&
+		left.BindingRevision == right.BindingRevision && left.Status == right.Status
+}
+
+func (a *Adapter) finishBindingRun(result wecomBindingRunResult) {
+	a.runsMu.Lock()
+	if current := a.runs[result.key]; current == result.run {
+		delete(a.runs, result.key)
+	}
+	a.runsMu.Unlock()
+}
+
+func (a *Adapter) stopAllBindings(ctx context.Context) {
+	a.runsMu.Lock()
+	current := make(map[string]*wecomBindingRun, len(a.runs))
+	for key, run := range a.runs {
+		current[key] = run
+	}
+	a.runsMu.Unlock()
+	for key, run := range current {
+		a.stopBinding(ctx, key, run)
+	}
+}
+
+func (a *Adapter) stopBinding(ctx context.Context, key string, run *wecomBindingRun) {
+	if run == nil {
+		return
+	}
+	a.stopMu.Lock()
+	defer a.stopMu.Unlock()
+	a.runsMu.Lock()
+	if current := a.runs[key]; current != run {
+		a.runsMu.Unlock()
+		return
+	}
+	a.runsMu.Unlock()
+	run.clientMu.Lock()
+	client := run.client
+	run.clientMu.Unlock()
+	run.cancel()
+	if client != nil {
+		closeWeComClient(ctx, client)
+	}
+	select {
+	case <-run.done:
+	case <-time.After(5 * time.Second):
+	}
+	a.runsMu.Lock()
+	if current := a.runs[key]; current == run {
+		delete(a.runs, key)
+	}
+	a.runsMu.Unlock()
+}
+
+func (a *Adapter) runBinding(ctx context.Context, binding channels.Binding, run *wecomBindingRun) error {
 	if err := binding.Validate(); err != nil {
 		return fmt.Errorf("wecom binding: %w", err)
 	}
@@ -274,10 +436,20 @@ func (a *Adapter) runBinding(ctx context.Context, binding channels.Binding) erro
 			return errors.New("wecom client factory returned nil")
 		}
 		key := bindingKey(snapshot)
+		handle := &wecomClientHandle{client: client}
+		run.clientMu.Lock()
+		run.client = handle
+		run.clientMu.Unlock()
 		a.trackClient(key, client)
 		a.recordConnection(ctx, snapshot, channels.ConnectionReady, nil)
 		runErr := client.Run(ctx)
 		a.untrackClient(key, client)
+		closeWeComClient(ctx, handle)
+		run.clientMu.Lock()
+		if run.client == handle {
+			run.client = nil
+		}
+		run.clientMu.Unlock()
 		if ctx.Err() != nil {
 			a.recordConnection(context.WithoutCancel(ctx), snapshot, channels.ConnectionNotReady, nil)
 			return ctx.Err()
@@ -289,6 +461,15 @@ func (a *Adapter) runBinding(ctx context.Context, binding channels.Binding) erro
 			return err
 		}
 	}
+}
+
+func closeWeComClient(ctx context.Context, handle *wecomClientHandle) {
+	if handle == nil {
+		return
+	}
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = handle.close(closeCtx)
 }
 
 func (a *Adapter) recordConnection(
@@ -429,6 +610,13 @@ func (a *Adapter) Close(ctx context.Context) error {
 	a.runMu.Unlock()
 	if runCancel != nil {
 		runCancel()
+		a.stopAllBindings(context.WithoutCancel(ctx))
+		select {
+		case <-runDone:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	a.clientsMu.Lock()
 	clients := make([]ClientRunner, 0, len(a.clients))
@@ -439,13 +627,6 @@ func (a *Adapter) Close(ctx context.Context) error {
 	var result error
 	for _, client := range clients {
 		result = errors.Join(result, client.Close(ctx))
-	}
-	if runDone != nil {
-		select {
-		case <-runDone:
-		case <-ctx.Done():
-			result = errors.Join(result, ctx.Err())
-		}
 	}
 	return result
 }

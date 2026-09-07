@@ -3,15 +3,21 @@ package ingress
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
+	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
 	openaiserver "trpc.group/trpc-go/trpc-agent-go/server/openai"
 )
 
@@ -29,6 +35,14 @@ const (
 )
 
 var errInvalidRequestIdentity = errors.New("invalid request identity")
+var errOpenAIExecutionFailed = errors.New("execution failed")
+
+type openAIStreamStateKey struct{}
+type openAIStreamRequestKey struct{}
+
+type openAIStreamState struct {
+	terminal atomic.Bool
+}
 
 // NewOpenAIHandler creates the OpenAI-compatible endpoint at
 // /v1/chat/completions. It requires Authorization: Bearer, X-Request-ID,
@@ -49,7 +63,7 @@ func NewOpenAIHandler(authenticator auth.HTTPAPIKeyResolver, queued *gateway.Que
 	if queued == nil {
 		return nil, errors.New("queued runner is required")
 	}
-	server, err := openaiserver.New(openaiserver.WithRunner(queued))
+	server, err := openaiserver.New(openaiserver.WithRunner(openAIQueuedRunner{queued: queued}))
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +98,7 @@ func (h openAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAuthenticationError(w, err)
 		return
 	}
-	message, err := validateQueuedOpenAIRequest(w, r)
+	message, stream, err := validateQueuedOpenAIRequest(w, r)
 	if err != nil {
 		http.Error(w, "unsupported chat request", http.StatusBadRequest)
 		return
@@ -99,7 +113,10 @@ func (h openAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAdmissionError(w, err)
 		return
 	}
-	h.next.ServeHTTP(w, r.WithContext(ctx))
+	state := &openAIStreamState{}
+	ctx = context.WithValue(ctx, openAIStreamStateKey{}, state)
+	ctx = context.WithValue(ctx, openAIStreamRequestKey{}, stream)
+	h.next.ServeHTTP(&openAIResponseWriter{ResponseWriter: w, state: state}, r.WithContext(ctx))
 }
 
 type queuedOpenAIRequest struct {
@@ -122,17 +139,17 @@ type queuedOpenAIRequestMessage struct {
 	Content string `json:"content"`
 }
 
-func validateQueuedOpenAIRequest(w http.ResponseWriter, r *http.Request) (string, error) {
+func validateQueuedOpenAIRequest(w http.ResponseWriter, r *http.Request) (string, bool, error) {
 	if r == nil || r.Body == nil {
-		return "", errors.New("request body is required")
+		return "", false, errors.New("request body is required")
 	}
 	body := http.MaxBytesReader(w, r.Body, maxOpenAIRequestBytes)
 	encoded, err := io.ReadAll(body)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if err := body.Close(); err != nil {
-		return "", err
+		return "", false, err
 	}
 	r.Body = io.NopCloser(bytes.NewReader(encoded))
 
@@ -140,23 +157,164 @@ func validateQueuedOpenAIRequest(w http.ResponseWriter, r *http.Request) (string
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		return "", err
+		return "", false, err
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
-		return "", errors.New("request body contains multiple values")
+		return "", false, errors.New("request body contains multiple values")
 	}
 	if len(request.Messages) != 1 || request.Messages[0].Role != "user" {
-		return "", errors.New("exactly one user message is required")
+		return "", false, errors.New("exactly one user message is required")
 	}
 	if request.Messages[0].Content == "" {
-		return "", errors.New("user message content is required")
+		return "", false, errors.New("user message content is required")
 	}
 	if hasJSONValue(request.Tools) || hasJSONValue(request.ToolChoice) {
-		return "", errors.New("client tools are not supported")
+		return "", false, errors.New("client tools are not supported")
 	}
-	return request.Messages[0].Content, nil
+	return request.Messages[0].Content, request.Stream, nil
 }
+
+type openAIQueuedRunner struct {
+	queued *gateway.QueuedRunner
+}
+
+func (r openAIQueuedRunner) Run(
+	ctx context.Context,
+	userID string,
+	sessionID string,
+	message model.Message,
+	runOpts ...agent.RunOption,
+) (<-chan *event.Event, error) {
+	if r.queued == nil {
+		return nil, errors.New("queued runner is required")
+	}
+	input, err := r.queued.RunWithTerminalErrors(ctx, userID, sessionID, message, runOpts...)
+	if err != nil {
+		return nil, err
+	}
+	state, _ := ctx.Value(openAIStreamStateKey{}).(*openAIStreamState)
+	stream, _ := ctx.Value(openAIStreamRequestKey{}).(bool)
+	if stream {
+		return openAIStreamEvents(ctx, input, state)
+	}
+	return openAINonStreamingEvents(ctx, input, state)
+}
+
+func (r openAIQueuedRunner) Close() error { return nil }
+
+func openAINonStreamingEvents(
+	ctx context.Context,
+	input <-chan *event.Event,
+	state *openAIStreamState,
+) (<-chan *event.Event, error) {
+	events := make([]*event.Event, 0)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case evt, ok := <-input:
+			if !ok {
+				if len(events) == 0 {
+					return nil, errOpenAIExecutionFailed
+				}
+				return eventChannel(ctx, events), nil
+			}
+			if evt != nil && evt.IsTerminalError() {
+				markOpenAIExecutionFailed(state)
+				return nil, errOpenAIExecutionFailed
+			}
+			if evt != nil {
+				events = append(events, evt)
+			}
+		}
+	}
+}
+
+func openAIStreamEvents(
+	ctx context.Context,
+	input <-chan *event.Event,
+	state *openAIStreamState,
+) (<-chan *event.Event, error) {
+	first, ok := <-input
+	if !ok {
+		return nil, errOpenAIExecutionFailed
+	}
+	if first != nil && first.IsTerminalError() {
+		markOpenAIExecutionFailed(state)
+		return nil, errOpenAIExecutionFailed
+	}
+	output := make(chan *event.Event)
+	go func() {
+		defer close(output)
+		select {
+		case output <- first:
+		case <-ctx.Done():
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt, ok := <-input:
+				if !ok {
+					return
+				}
+				if evt != nil && evt.IsTerminalError() {
+					markOpenAIExecutionFailed(state)
+					return
+				}
+				select {
+				case output <- evt:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return output, nil
+}
+
+func eventChannel(ctx context.Context, events []*event.Event) <-chan *event.Event {
+	output := make(chan *event.Event, len(events))
+	for _, evt := range events {
+		select {
+		case output <- evt:
+		case <-ctx.Done():
+			close(output)
+			return output
+		}
+	}
+	close(output)
+	return output
+}
+
+func markOpenAIExecutionFailed(state *openAIStreamState) {
+	if state != nil {
+		state.terminal.Store(true)
+	}
+}
+
+type openAIResponseWriter struct {
+	http.ResponseWriter
+	state *openAIStreamState
+}
+
+func (w *openAIResponseWriter) Write(payload []byte) (int, error) {
+	if w.state != nil && w.state.terminal.Load() &&
+		bytes.Equal(payload, []byte("data: [DONE]\n\n")) {
+		payload = []byte("data: {\"error\":{\"message\":\"execution failed\",\"type\":\"internal_error\"}}\n\n")
+	}
+	return w.ResponseWriter.Write(payload)
+}
+
+func (w *openAIResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+var _ runner.Runner = openAIQueuedRunner{}
 
 func hasJSONValue(value json.RawMessage) bool {
 	return len(value) != 0 && !bytes.Equal(bytes.TrimSpace(value), []byte("null"))

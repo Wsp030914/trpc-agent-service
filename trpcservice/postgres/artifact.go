@@ -173,7 +173,8 @@ SELECT artifact_id, tenant_id, app_id, session_principal_id, session_id,
 FROM platform.artifact
 WHERE tenant_id = $1 AND app_id = $2
   AND session_principal_id = $3 AND session_id = $4
-  AND filename = $5 AND ($6::integer IS NULL OR version = $6)
+  AND filename = $5 AND config_version = $6
+  AND ($7::integer IS NULL OR version = $7)
   AND status = 'AVAILABLE'
 ORDER BY version DESC
 LIMIT 1`,
@@ -182,6 +183,7 @@ LIMIT 1`,
 		access.SessionPrincipalID,
 		access.SessionID,
 		filename,
+		access.ConfigVersion,
 		requestedVersion,
 	).Scan(
 		&record.ID,
@@ -221,13 +223,14 @@ SELECT filename
 FROM platform.artifact
 WHERE tenant_id = $1 AND app_id = $2
   AND session_principal_id = $3 AND session_id = $4
-  AND status = 'AVAILABLE'
+  AND config_version = $5 AND status = 'AVAILABLE'
 GROUP BY filename
 ORDER BY filename`,
 		access.Scope.TenantID,
 		access.Scope.AppID,
 		access.SessionPrincipalID,
 		access.SessionID,
+		access.ConfigVersion,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list artifact metadata keys: %w", err)
@@ -265,13 +268,14 @@ SELECT version
 FROM platform.artifact
 WHERE tenant_id = $1 AND app_id = $2
   AND session_principal_id = $3 AND session_id = $4
-  AND filename = $5 AND status = 'AVAILABLE'
+  AND filename = $5 AND config_version = $6 AND status = 'AVAILABLE'
 ORDER BY version`,
 		access.Scope.TenantID,
 		access.Scope.AppID,
 		access.SessionPrincipalID,
 		access.SessionID,
 		filename,
+		access.ConfigVersion,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list artifact metadata versions: %w", err)
@@ -310,7 +314,7 @@ UPDATE platform.artifact
 SET status = 'DELETED', cleanup_next_attempt_at = clock_timestamp(), updated_at = now()
 WHERE tenant_id = $1 AND app_id = $2
   AND session_principal_id = $3 AND session_id = $4
-  AND filename = $5 AND status = 'AVAILABLE'
+  AND filename = $5 AND config_version = $6 AND status = 'AVAILABLE'
 	RETURNING artifact_id, tenant_id, app_id, session_principal_id, session_id,
           filename, version, object_key, mime_type, size_bytes, status, config_version,
           created_at, updated_at`,
@@ -319,6 +323,7 @@ WHERE tenant_id = $1 AND app_id = $2
 		access.SessionPrincipalID,
 		access.SessionID,
 		filename,
+		access.ConfigVersion,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("mark artifact metadata deleted: %w", err)

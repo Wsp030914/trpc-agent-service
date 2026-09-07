@@ -16,14 +16,20 @@ import (
 )
 
 func controlPlaneAuditEvent(
+	ctx context.Context,
 	tenantID, appID, configVersion, eventType, decision string,
 ) platformaudit.Event {
 	requestID := "control-plane-" + uuid.NewString()
+	actorID, actorRole, ok := platformaudit.ControlPlaneActorFromContext(ctx)
+	if !ok {
+		actorID = "control-plane"
+		actorRole = "system"
+	}
 	return platformaudit.Event{
 		TenantID:      tenantID,
 		AppID:         appID,
-		ActorID:       "control-plane",
-		ActorRole:     "system",
+		ActorID:       actorID,
+		ActorRole:     actorRole,
 		Decision:      decision,
 		TraceID:       requestID,
 		RequestID:     requestID,

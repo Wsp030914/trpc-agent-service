@@ -126,9 +126,32 @@ func NewQueuedRunner(gateway *Gateway, events ExecutionEventSource) (*QueuedRunn
 // RunOption values cannot alter the authenticated request identity.
 func (r *QueuedRunner) Run(
 	ctx context.Context,
+	userID string,
+	sessionID string,
+	message model.Message,
+	runOpts ...agent.RunOption,
+) (<-chan *event.Event, error) {
+	return r.run(ctx, userID, sessionID, message, false, runOpts...)
+}
+
+// RunWithTerminalErrors retains a terminal execution error for a protocol
+// adapter that can represent it safely. It is not a public event projection.
+func (r *QueuedRunner) RunWithTerminalErrors(
+	ctx context.Context,
+	userID string,
+	sessionID string,
+	message model.Message,
+	runOpts ...agent.RunOption,
+) (<-chan *event.Event, error) {
+	return r.run(ctx, userID, sessionID, message, true, runOpts...)
+}
+
+func (r *QueuedRunner) run(
+	ctx context.Context,
 	_ string,
 	_ string,
 	message model.Message,
+	includeTerminalErrors bool,
 	runOpts ...agent.RunOption,
 ) (<-chan *event.Event, error) {
 	if r == nil || r.gateway == nil || r.events == nil {
@@ -166,7 +189,7 @@ func (r *QueuedRunner) Run(
 	if err != nil {
 		return nil, err
 	}
-	return forwardExecutionEvents(ctx, persisted), nil
+	return forwardExecutionEvents(ctx, persisted, includeTerminalErrors), nil
 }
 
 // Admit performs authenticated atomic admission and stores its result in the
@@ -238,6 +261,7 @@ func queuedGatewayMessage(message model.Message) (Message, error) {
 func forwardExecutionEvents(
 	ctx context.Context,
 	persisted <-chan ExecutionEvent,
+	includeTerminalErrors bool,
 ) <-chan *event.Event {
 	forwarded := make(chan *event.Event)
 	go func() {
@@ -253,6 +277,10 @@ func forwardExecutionEvents(
 				if item.Validate() != nil {
 					return
 				}
+				if !clientVisibleExecutionEvent(item.Event) &&
+					!(includeTerminalErrors && item.Event.IsTerminalError()) {
+					continue
+				}
 				select {
 				case <-ctx.Done():
 					return
@@ -262,6 +290,17 @@ func forwardExecutionEvents(
 		}
 	}()
 	return forwarded
+}
+
+func clientVisibleExecutionEvent(evt *event.Event) bool {
+	if evt == nil || evt.IsTerminalError() || evt.IsRunnerCompletion() {
+		return false
+	}
+	if evt.Response == nil || evt.Response.IsToolCallResponse() || evt.Response.IsToolResultResponse() {
+		return false
+	}
+	return evt.Response.Object == model.ObjectTypeChatCompletion ||
+		evt.Response.Object == model.ObjectTypeChatCompletionChunk
 }
 
 type fixedTenantResolver struct {

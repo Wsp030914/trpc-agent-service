@@ -10,8 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -160,6 +163,142 @@ WHERE tenant_id = $1 AND app_id = $2 AND filename = 'expired.txt'`, tenantID, ap
 	}
 }
 
+func TestArtifactAdmissionAndCleanupSerializeOnArtifactRow(t *testing.T) {
+	p := newIM05Fixture(t, newIntegrationTargetProtector(t, "v1"))
+	ctx := p.ctx
+	// The integration database is intentionally reusable between runs. Remove
+	// stale rows from the artifact-focused tests so the global cleanup worker
+	// cannot claim an unrelated candidate before this test's fixture.
+	if _, err := p.pool.Exec(ctx, `
+DELETE FROM platform.artifact
+WHERE tenant_id LIKE 'artifact-reservation-%' OR tenant_id LIKE 'im05-%'`); err != nil {
+		t.Fatalf("clean stale artifact fixtures: %v", err)
+	}
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	credentialSuffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	credentialDigest, err := auth.DigestAPIKey("tas_artifact_admission_key_" + credentialSuffix)
+	if err != nil {
+		t.Fatalf("digest credential: %v", err)
+	}
+	credential := auth.Credential{
+		ID:        "credential-artifact-admission-" + credentialSuffix,
+		TenantID:  p.scope.TenantID,
+		AppID:     p.scope.AppID,
+		KeyPrefix: "tas_art",
+		Status:    auth.CredentialActive,
+	}
+	if err := p.store.CreateCredential(ctx, credentialDigest, credential); err != nil {
+		t.Fatalf("create credential: %v", err)
+	}
+
+	insertArtifact := func(sessionID, filename, objectKey string, createdAt time.Time) {
+		t.Helper()
+		if _, err := p.pool.Exec(ctx, `
+INSERT INTO platform.session_lane (tenant_id, app_id, session_principal_id, session_id)
+VALUES ($1, $2, 'user-1', $3)
+ON CONFLICT DO NOTHING`, p.scope.TenantID, p.scope.AppID, sessionID); err != nil {
+			t.Fatalf("insert session lane %s: %v", sessionID, err)
+		}
+		if _, err := p.pool.Exec(ctx, `
+INSERT INTO platform.artifact (
+    artifact_id, tenant_id, app_id, session_principal_id, session_id,
+    filename, version, object_key, mime_type, size_bytes, status, config_version,
+    created_at, updated_at, cleanup_next_attempt_at
+) VALUES (gen_random_uuid()::text, $1, $2, 'user-1', $3, $4, 0, $5,
+          'text/plain', 1, 'AVAILABLE', 'v1', $6, $6, $6)`,
+			p.scope.TenantID, p.scope.AppID, sessionID, filename, objectKey, createdAt); err != nil {
+			t.Fatalf("insert artifact %s: %v", filename, err)
+		}
+	}
+	insertArtifact("artifact-cleanup-first", "cleanup-first.txt", "objects/cleanup-first", old.Add(-time.Minute))
+	insertArtifact("admission-first", "admission-first.txt", "objects/admission-first", old)
+
+	cleanupFirst, err := p.store.ClaimArtifactCleanup(
+		ctx,
+		"artifact-cleanup-first-worker",
+		time.Now().UTC().Add(-time.Hour),
+		ptrTime(time.Now().UTC().Add(-time.Hour)),
+		time.Minute,
+		1,
+	)
+	if err != nil || len(cleanupFirst) != 1 || cleanupFirst[0].Record.Filename != "cleanup-first.txt" {
+		t.Fatalf("cleanup-first candidates = %#v, err = %v", cleanupFirst, err)
+	}
+	if _, err := p.store.Admit(ctx, artifactAdmissionRequest(
+		p,
+		credential,
+		credentialDigest,
+		"request-cleanup-first",
+		"artifact-cleanup-first",
+		"cleanup-first.txt",
+	)); err == nil {
+		t.Fatal("admission succeeded for an artifact already claimed/deleted by cleanup")
+	}
+
+	admitted, err := p.store.Admit(ctx, artifactAdmissionRequest(
+		p,
+		credential,
+		credentialDigest,
+		"request-admission-first",
+		"admission-first",
+		"admission-first.txt",
+	))
+	if err != nil {
+		t.Fatalf("admission-first request: %v", err)
+	}
+	if admitted.RequestID != "request-admission-first" {
+		t.Fatalf("admitted request id = %q", admitted.RequestID)
+	}
+	cleanupAfterAdmission, err := p.store.ClaimArtifactCleanup(
+		ctx,
+		"admission-after-worker",
+		time.Now().UTC().Add(-time.Hour),
+		ptrTime(time.Now().UTC().Add(-time.Hour)),
+		time.Minute,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("cleanup after admission: %v", err)
+	}
+	for _, candidate := range cleanupAfterAdmission {
+		if candidate.Record.Filename == "admission-first.txt" {
+			t.Fatal("cleanup claimed an artifact referenced by an admitted execution")
+		}
+	}
+}
+
+func artifactAdmissionRequest(
+	p im05Fixture,
+	credential auth.Credential,
+	digest [32]byte,
+	requestID, sessionID, filename string,
+) gateway.AdmissionRequest {
+	return gateway.AdmissionRequest{
+		RequestID:      requestID,
+		IdempotencyKey: requestID,
+		Identity: gateway.AdmissionIdentity{
+			Tenant: tenant.RuntimeContext{
+				TenantID:           p.scope.TenantID,
+				AppID:              p.scope.AppID,
+				ConfigVersion:      "v1",
+				SessionPrincipalID: "user-1",
+				SessionID:          sessionID,
+				UserID:             "user-1",
+				TraceID:            requestID + "-trace",
+			},
+			Source:           gateway.TenantSourceAuthenticatedClaims,
+			SourceID:         credential.ID,
+			CredentialDigest: gateway.CredentialDigest(digest),
+		},
+		Message: gateway.Message{
+			Text:         "use artifact",
+			ArtifactRefs: []string{"artifact://" + filename + "@0"},
+		},
+	}
+}
+
+func ptrTime(value time.Time) *time.Time { return &value }
+
 func TestInboundArtifactCleanupClaimsRetriesAndCompletes(t *testing.T) {
 	pool := openIntegrationPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -255,6 +394,85 @@ WHERE tenant_id = $1 AND app_id = $2 AND binding_id = 'binding-inbound-cleanup'`
 	}
 }
 
+func TestInboundArtifactUploadReservationSurvivesCrashWindow(t *testing.T) {
+	pool := openIntegrationPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	store, err := platformpostgres.New(pool)
+	if err != nil {
+		t.Fatalf("new postgres store: %v", err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	tenantID := fmt.Sprintf("artifact-cleanup-upload-%d", time.Now().UnixNano())
+	appID := "support"
+	config := integrationAppConfig("v1", "cleanup-upload-model")
+	config.TenantID, config.AppID = tenantID, appID
+	if err := store.CreateTenant(ctx, tenant.Tenant{ID: tenantID, Name: tenantID, Status: tenant.StatusActive}); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if err := store.CreateAgentApp(ctx, tenant.AgentApp{
+		TenantID: tenantID, AppID: appID, Name: "Support", ActiveConfigVersion: config.Version, Status: tenant.StatusActive,
+	}, config); err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO platform.channel_binding (
+    tenant_id, app_id, binding_id, channel, external_account, status
+) VALUES ($1, $2, 'binding-upload-crash', 'feishu', 'upload-crash-account', 'ACTIVE')`, tenantID, appID); err != nil {
+		t.Fatalf("create binding: %v", err)
+	}
+	record := platformpostgres.StagedInboundArtifact{
+		TenantID: tenantID, AppID: appID, BindingID: "binding-upload-crash",
+		ExternalMessageID: "message-upload-crash", ItemNo: 0,
+		ArtifactRef: "artifact://inbound/crash-1@0", ConfigVersion: "v1",
+		Filename: "inbound/crash-1", ObjectKey: "objects/inbound-crash-1",
+		MIMEType: "application/octet-stream", Size: 4,
+	}
+	reserved, err := store.ReserveInboundArtifact(ctx, record)
+	if err != nil || !reserved.Created || reserved.Status != "UPLOADING" {
+		t.Fatalf("reserve result = %+v, err = %v", reserved, err)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE platform.inbound_artifact
+SET updated_at = clock_timestamp() - interval '2 hours',
+    cleanup_next_attempt_at = clock_timestamp() - interval '2 hours'
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = 'binding-upload-crash'`, tenantID, appID); err != nil {
+		t.Fatalf("age upload reservation: %v", err)
+	}
+	candidates, err := store.ClaimInboundArtifactCleanup(ctx, "upload-cleanup-1", time.Now().UTC().Add(-time.Minute), time.Minute, 10)
+	if err != nil {
+		t.Fatalf("claim active upload cleanup: %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("active upload was claimed before lease expiry: %#v", candidates)
+	}
+	if _, err := pool.Exec(ctx, `
+UPDATE platform.inbound_artifact
+SET upload_lease_until = clock_timestamp() - interval '1 second'
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = 'binding-upload-crash'`, tenantID, appID); err != nil {
+		t.Fatalf("expire upload reservation lease: %v", err)
+	}
+	candidates, err = store.ClaimInboundArtifactCleanup(ctx, "upload-cleanup-1", time.Now().UTC().Add(-time.Minute), time.Minute, 10)
+	if err != nil || len(candidates) != 1 || candidates[0].ObjectKey != record.ObjectKey {
+		t.Fatalf("upload cleanup candidates = %#v, err = %v", candidates, err)
+	}
+	if _, err := store.FinalizeInboundArtifactUpload(ctx, reserved); err == nil {
+		t.Fatal("stale uploader finalized after cleanup reclaimed its lease")
+	}
+	if err := store.CompleteInboundArtifactCleanup(ctx, candidates[0], "upload-cleanup-1"); err != nil {
+		t.Fatalf("complete upload cleanup: %v", err)
+	}
+	retryRecord := record
+	retryRecord.ArtifactRef = "artifact://inbound/crash-2@0"
+	retryRecord.ObjectKey = "objects/inbound-crash-2"
+	retry, err := store.ReserveInboundArtifact(ctx, retryRecord)
+	if err != nil || !retry.Created || retry.Status != "UPLOADING" {
+		t.Fatalf("retry reservation = %+v, err = %v", retry, err)
+	}
+}
+
 func cleanupArtifactFixtures(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
 	for _, query := range []string{
@@ -263,7 +481,10 @@ func cleanupArtifactFixtures(t *testing.T, ctx context.Context, pool *pgxpool.Po
 		`DELETE FROM platform.execution WHERE tenant_id LIKE 'artifact-cleanup-%'`,
 		`DELETE FROM platform.inbound_artifact WHERE tenant_id LIKE 'artifact-cleanup-%'`,
 		`DELETE FROM platform.channel_binding WHERE tenant_id LIKE 'artifact-cleanup-%'`,
-		`DELETE FROM platform.artifact WHERE tenant_id LIKE 'artifact-cleanup-%'`,
+		`DELETE FROM platform.artifact
+         WHERE tenant_id LIKE 'artifact-cleanup-%'
+            OR tenant_id LIKE 'artifact-reservation-%'
+            OR tenant_id LIKE 'im05-%'`,
 		`DELETE FROM platform.session_lane WHERE tenant_id LIKE 'artifact-cleanup-%'`,
 	} {
 		if _, err := pool.Exec(ctx, query); err != nil {

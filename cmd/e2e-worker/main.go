@@ -140,6 +140,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	runtimeBuilder.SetExecutionLeaseValidator(store)
 	runtimeBuilder.SetObservability(store, store.Metrics())
 	locker, err := platformredis.NewSessionLocker(redisClient, 30*time.Second)
 	if err != nil {
@@ -151,6 +152,7 @@ func run() error {
 	}
 	executor := worker.New(store, runtimeBuilder.BuildRunner, locker, journal, store.IsExecutionCanceled)
 	executor.ModelTimeout = modelTimeout
+	executor.LeaseValidator = store
 	executor.Approvals = store
 	executor.Audit = store
 	executor.Metrics = store.Metrics()

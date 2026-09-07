@@ -122,6 +122,70 @@ WHERE e.tenant_id = $1 AND e.app_id = $2 AND e.request_id = $3`,
 	}
 }
 
+func TestApprovalPauseKeepsExecutionEventStreamOpen(t *testing.T) {
+	p := newIM05Fixture(t, newIntegrationTargetProtector(t, "v1"))
+	claim, exec := claimIM05Execution(t, p, "message-approval-stream", "request-approval-stream")
+
+	journal, err := platformpostgres.NewExecutionEventJournal(p.store)
+	if err != nil {
+		t.Fatalf("new execution event journal: %v", err)
+	}
+	leaseContext, err := worker.ContextWithJobLease(p.ctx, claim.Lease)
+	if err != nil {
+		t.Fatalf("attach execution lease: %v", err)
+	}
+	if err := journal.HandleRunnerEvent(leaseContext, exec, terminalCompletionEvent()); err != nil {
+		t.Fatalf("append approval pause completion: %v", err)
+	}
+	if _, err := p.pool.Exec(p.ctx, `
+UPDATE platform.execution
+SET status = 'WAITING_APPROVAL', lease_owner = NULL, run_token = NULL,
+    lease_until = NULL, updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
+		p.scope.TenantID, p.scope.AppID, claim.Job.RequestID()); err != nil {
+		t.Fatalf("park execution for approval: %v", err)
+	}
+
+	streamCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := journal.SubscribeExecutionEvents(streamCtx, p.scope, claim.Job.RequestID(), 0)
+	if err != nil {
+		t.Fatalf("subscribe execution events: %v", err)
+	}
+	select {
+	case item, ok := <-stream:
+		if !ok || item.Event == nil || !item.Event.IsRunnerCompletion() {
+			t.Fatalf("first approval event = %#v, open=%t", item, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval completion was not streamed")
+	}
+	select {
+	case _, ok := <-stream:
+		if !ok {
+			t.Fatal("execution stream closed while status was WAITING_APPROVAL")
+		}
+		t.Fatal("unexpected event before approval continuation")
+	case <-time.After(450 * time.Millisecond):
+	}
+
+	if _, err := p.pool.Exec(p.ctx, `
+UPDATE platform.execution
+SET status = 'SUCCEEDED', updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
+		p.scope.TenantID, p.scope.AppID, claim.Job.RequestID()); err != nil {
+		t.Fatalf("complete approval continuation: %v", err)
+	}
+	select {
+	case _, ok := <-stream:
+		if ok {
+			t.Fatal("execution stream emitted an event after terminal status")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("execution stream did not close after terminal status")
+	}
+}
+
 func claimIM05Execution(t *testing.T, p im05Fixture, externalMessageID, requestID string) (queue.Claim, worker.Execution) {
 	t.Helper()
 	admitted, err := p.store.Admit(p.ctx, newIM05Request(t, p.route, p.binding, externalMessageID, requestID, channels.MessageTypeText, "terminal"))

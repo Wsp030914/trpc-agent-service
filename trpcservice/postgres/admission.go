@@ -648,17 +648,14 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 	if err != nil {
 		return gateway.AdmissionResult{}, err
 	}
-	if a.request.ChannelInput != nil {
-		if err := attachStagedInboundArtifacts(
-			a.ctx,
-			a.tx,
-			*a.request.ChannelInput,
-			a.configVersion,
-			runtimeContext.SessionPrincipalID,
-			runtimeContext.SessionID,
-		); err != nil {
-			return gateway.AdmissionResult{}, err
-		}
+	if err := lockReferencedArtifacts(
+		a.ctx,
+		a.tx,
+		runtimeContext,
+		a.configVersion,
+		a.request.Message.ArtifactRefs,
+	); err != nil {
+		return gateway.AdmissionResult{}, err
 	}
 	if _, err := a.tx.Exec(
 		a.ctx,
@@ -699,6 +696,22 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 		runtimeContext.TraceState,
 	); err != nil {
 		return gateway.AdmissionResult{}, admissionInsertError("insert execution", err)
+	}
+	if a.request.ChannelInput != nil {
+		// Keep the execution row in the same transaction, but insert it before
+		// attaching staged artifacts. Cleanup can then observe either the
+		// still-PENDING inbox row (which it excludes) or the committed execution
+		// reference; it cannot delete an artifact in the admission gap.
+		if err := attachStagedInboundArtifacts(
+			a.ctx,
+			a.tx,
+			*a.request.ChannelInput,
+			a.configVersion,
+			runtimeContext.SessionPrincipalID,
+			runtimeContext.SessionID,
+		); err != nil {
+			return gateway.AdmissionResult{}, err
+		}
 	}
 	if _, err := a.tx.Exec(
 		a.ctx,
@@ -1040,6 +1053,63 @@ WHERE tenant_id = $1
 		return 0, fmt.Errorf("advance session lane: %w", err)
 	}
 	return nextTurnSeq, nil
+}
+
+// lockReferencedArtifacts serializes ordinary execution admission with
+// artifact cleanup. Cleanup locks the same artifact row before marking it
+// deleted; admission therefore either wins the lock and creates an active
+// execution, or observes the cleanup result and rejects the stale reference.
+func lockReferencedArtifacts(
+	ctx context.Context,
+	tx pgx.Tx,
+	runtimeContext tenant.RuntimeContext,
+	configVersion string,
+	refs []string,
+) error {
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		filename, version, err := gateway.ParseArtifactRef(ref)
+		if err != nil {
+			return fmt.Errorf("lock artifact reference: %w", err)
+		}
+		key := fmt.Sprintf("%s@%d", filename, version)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		var status string
+		err = tx.QueryRow(ctx, `
+SELECT status
+FROM platform.artifact
+WHERE tenant_id = $1
+  AND app_id = $2
+  AND session_principal_id = $3
+  AND session_id = $4
+  AND filename = $5
+  AND version = $6
+  AND config_version = $7
+FOR UPDATE`,
+			runtimeContext.TenantID,
+			runtimeContext.AppID,
+			runtimeContext.SessionPrincipalID,
+			runtimeContext.SessionID,
+			filename,
+			version,
+			configVersion,
+		).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Inbound artifacts are attached later in this same admission
+			// transaction. They have no platform.artifact row to lock yet.
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("lock artifact reference %s: %w", key, err)
+		}
+		if status != "AVAILABLE" {
+			return fmt.Errorf("artifact reference %s is not available", key)
+		}
+	}
+	return nil
 }
 
 type admissionCommand struct {

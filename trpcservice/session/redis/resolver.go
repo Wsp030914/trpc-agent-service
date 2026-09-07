@@ -3,14 +3,17 @@ package redis
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	goredis "github.com/redis/go-redis/v9"
 	frameworksession "trpc.group/trpc-go/trpc-agent-go/session"
 	redisprovider "trpc.group/trpc-go/trpc-agent-go/session/redis"
 )
@@ -68,16 +71,9 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	if service := r.services[key]; service != nil {
 		return service, nil
 	}
-	url := r.defaultURL
-	if ref.SecretRef != (tenant.SecretRef{}) {
-		var err error
-		url, err = r.secrets.ResolveSecret(ctx, exec.Tenant.Scope(), ref.SecretRef)
-		if err != nil {
-			return nil, fmt.Errorf("resolve session url: %w", err)
-		}
-	}
-	if strings.TrimSpace(url) == "" {
-		return nil, errors.New("session redis url is required")
+	url, err := r.resolveURL(ctx, exec)
+	if err != nil {
+		return nil, err
 	}
 	service, err := redisprovider.NewService(redisprovider.WithRedisClientURL(url))
 	if err != nil {
@@ -87,7 +83,166 @@ func (r *SessionResolver) ResolveSession(ctx context.Context, exec worker.Execut
 	return service, nil
 }
 
+// ListSessionKeys inventories both current HashIdx metadata and legacy ZSet
+// session state. The SQL session_lane table is not authoritative for Redis,
+// so migration must inspect Redis itself and fail closed on Redis errors.
+func (r *SessionResolver) ListSessionKeys(ctx context.Context, exec worker.Execution) ([]frameworksession.Key, error) {
+	if r == nil || r.secrets == nil {
+		return nil, errors.New("redis session resolver is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ref := exec.Config.BackendConfig.Session
+	if ref.Kind != tenant.BackendRedis || ref.Provider != "redis" {
+		return nil, fmt.Errorf("session backend %q must use redis provider", ref.Name)
+	}
+	appName, err := exec.Tenant.Scope().Key("runner")
+	if err != nil {
+		return nil, fmt.Errorf("build session app name: %w", err)
+	}
+	url, err := r.resolveURL(ctx, exec)
+	if err != nil {
+		return nil, err
+	}
+	options, err := goredis.ParseURL(url)
+	if err != nil {
+		return nil, fmt.Errorf("parse session redis url: %w", err)
+	}
+	client := goredis.NewClient(options)
+	defer client.Close()
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("ping session redis: %w", err)
+	}
+
+	keys := make(map[frameworksession.Key]struct{})
+	if err := listLegacyZSetSessionKeys(ctx, client, appName, keys); err != nil {
+		return nil, err
+	}
+	if err := listHashIdxSessionKeys(ctx, client, appName, keys); err != nil {
+		return nil, err
+	}
+	result := make([]frameworksession.Key, 0, len(keys))
+	for key := range keys {
+		result = append(result, key)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].AppName != result[j].AppName {
+			return result[i].AppName < result[j].AppName
+		}
+		if result[i].UserID != result[j].UserID {
+			return result[i].UserID < result[j].UserID
+		}
+		return result[i].SessionID < result[j].SessionID
+	})
+	return result, nil
+}
+
+func (r *SessionResolver) resolveURL(ctx context.Context, exec worker.Execution) (string, error) {
+	ref := exec.Config.BackendConfig.Session
+	url := r.defaultURL
+	if ref.SecretRef != (tenant.SecretRef{}) {
+		var err error
+		url, err = r.secrets.ResolveSecret(ctx, exec.Tenant.Scope(), ref.SecretRef)
+		if err != nil {
+			return "", fmt.Errorf("resolve session url: %w", err)
+		}
+	}
+	if strings.TrimSpace(url) == "" {
+		return "", errors.New("session redis url is required")
+	}
+	return strings.TrimSpace(url), nil
+}
+
+func listLegacyZSetSessionKeys(
+	ctx context.Context,
+	client *goredis.Client,
+	appName string,
+	keys map[frameworksession.Key]struct{},
+) error {
+	iter := client.Scan(ctx, 0, "sess:{"+redisMatchLiteral(appName)+"}:*", 100).Iterator()
+	for iter.Next(ctx) {
+		key := iter.Val()
+		const prefix = "sess:{"
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		remainder := key[len(prefix):]
+		closeBrace := strings.Index(remainder, "}:")
+		if closeBrace <= 0 || remainder[:closeBrace] != appName {
+			continue
+		}
+		userID := remainder[closeBrace+2:]
+		if userID == "" {
+			continue
+		}
+		sessionIDs, err := client.HKeys(ctx, key).Result()
+		if err != nil {
+			return fmt.Errorf("list legacy redis sessions: %w", err)
+		}
+		for _, sessionID := range sessionIDs {
+			if sessionID != "" {
+				keys[frameworksession.Key{AppName: appName, UserID: userID, SessionID: sessionID}] = struct{}{}
+			}
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("scan legacy redis sessions: %w", err)
+	}
+	return nil
+}
+
+func listHashIdxSessionKeys(
+	ctx context.Context,
+	client *goredis.Client,
+	appName string,
+	keys map[frameworksession.Key]struct{},
+) error {
+	const prefix = "hashidx:meta:"
+	iter := client.Scan(ctx, 0, prefix+redisMatchLiteral(appName)+":*", 100).Iterator()
+	for iter.Next(ctx) {
+		key := iter.Val()
+		if !strings.HasPrefix(key, prefix+appName+":") {
+			continue
+		}
+		payload, err := client.Get(ctx, key).Bytes()
+		if errors.Is(err, goredis.Nil) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read redis session metadata: %w", err)
+		}
+		var meta struct {
+			ID      string `json:"id"`
+			AppName string `json:"appName"`
+			UserID  string `json:"userID"`
+		}
+		if err := json.Unmarshal(payload, &meta); err != nil {
+			return fmt.Errorf("decode redis session metadata: %w", err)
+		}
+		if meta.AppName != appName || meta.UserID == "" || meta.ID == "" {
+			return errors.New("redis session metadata scope is invalid")
+		}
+		keys[frameworksession.Key{AppName: appName, UserID: meta.UserID, SessionID: meta.ID}] = struct{}{}
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("scan redis session metadata: %w", err)
+	}
+	return nil
+}
+
 // Close closes cached Session services.
+func redisMatchLiteral(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `*`, `\*`)
+	value = strings.ReplaceAll(value, `?`, `\?`)
+	value = strings.ReplaceAll(value, `[`, `\[`)
+	return value
+}
+
 func (r *SessionResolver) Close() error {
 	if r == nil {
 		return nil

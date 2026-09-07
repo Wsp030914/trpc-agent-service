@@ -38,6 +38,13 @@ var ErrExecutionCanceled = errors.New("execution canceled by recall")
 // Recall itself owns the durable state transition; the worker only reads it.
 type CancellationCheck func(context.Context, string, string, string) (bool, error)
 
+// ExecutionLeaseValidator revalidates the durable execution lease at a
+// side-effect boundary. Production implementations must check the current
+// owner, run token, scope, and lease expiry in the authoritative store.
+type ExecutionLeaseValidator interface {
+	ValidateExecutionLease(context.Context, Execution, queue.Lease) error
+}
+
 // Execution is the prepared context for running one tenant-scoped job.
 type Execution struct {
 	RequestID    string
@@ -131,8 +138,11 @@ type Worker struct {
 	// after expiry.
 	ModelTimeout time.Duration
 	Cancellation CancellationCheck
-	Audit        platformaudit.Sink
-	Metrics      *platformmetrics.Recorder
+	// LeaseValidator fences stale workers before Tool and Session side effects.
+	// Production workers must attach the authoritative execution store.
+	LeaseValidator ExecutionLeaseValidator
+	Audit          platformaudit.Sink
+	Metrics        *platformmetrics.Recorder
 	// Approvals is optional for local/test runtimes. Production workers attach
 	// the durable repository; without it review-required tools remain ASK.
 	Approvals platformapproval.Repository
@@ -314,7 +324,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	}()
 	r, err := w.Runner(workerCtx, exec)
 	if err != nil {
-		return result, err
+		return result, classifySessionLeaseFailure(runCtx, result.RunnerStarted, err)
 	}
 	if r == nil {
 		return result, NewPermanentExecutionError(errors.New("runner is required"))
@@ -355,7 +365,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		agent.WithDisableTracing(true),
 	)
 	if err != nil {
-		return result, err
+		return result, classifySessionLeaseFailure(runCtx, result.RunnerStarted, err)
 	}
 	if events == nil {
 		return result, NewSideEffectUncertainError(errors.New("runner event channel is nil"))
@@ -363,6 +373,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	var sinkErr error
 	var runnerErr error
 	sinkTimedOut := false
+	approvalBoundary := false
 	for evt := range events {
 		if evt == nil {
 			continue
@@ -370,6 +381,13 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		result.EventCount++
 		if evt.IsRunnerCompletion() {
 			result.RunnerCompleted = true
+		}
+		// Once a review-required tool has produced its durable tool result,
+		// this attempt is parked. Do not persist any later model completion:
+		// it is not a client-visible result and would be replayed as a false
+		// success while the execution is WAITING_APPROVAL.
+		if approvalBoundary && !evt.IsRunnerCompletion() {
+			continue
 		}
 		if runnerErr == nil && evt.IsTerminalError() {
 			runnerErr = fmt.Errorf("runner event: %w", evt.Error)
@@ -396,9 +414,13 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 				sinkTimedOut = true
 			}
 		}
+		approvalPending, _ = approval.snapshot()
+		if approvalPending && evt.Response != nil && evt.Response.IsToolResultResponse() {
+			approvalBoundary = true
+		}
 	}
 	if err := runnerCtx.Err(); err != nil {
-		return result, err
+		return result, classifySessionLeaseFailure(runCtx, result.RunnerStarted, err)
 	}
 	if sinkErr != nil {
 		// The runner may already have executed a side-effecting tool when event
@@ -410,6 +432,17 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		return result, runnerErr
 	}
 	return result, nil
+}
+
+func classifySessionLeaseFailure(ctx context.Context, runnerStarted bool, err error) error {
+	if err == nil || ctx == nil || !errors.Is(context.Cause(ctx), ErrSessionLeaseLost) {
+		return err
+	}
+	cause := fmt.Errorf("%w: %w", ErrSessionLeaseLost, err)
+	if runnerStarted {
+		return NewSideEffectUncertainError(cause)
+	}
+	return NewRetryableExecutionError(cause)
 }
 
 func (w Worker) modelTimeout() time.Duration {
@@ -451,11 +484,34 @@ func (w Worker) toolPermissionPolicy(exec Execution) frameworktool.PermissionPol
 	return w.toolPermissionPolicyWithState(exec, nil)
 }
 
+func (w Worker) validateExecutionLease(ctx context.Context, exec Execution) error {
+	if w.LeaseValidator == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	lease, ok := JobLeaseFromContext(ctx)
+	if !ok {
+		return fmt.Errorf("execution lease is missing: %w", queue.ErrLeaseLost)
+	}
+	if err := w.LeaseValidator.ValidateExecutionLease(ctx, exec, lease); err != nil {
+		return fmt.Errorf("validate execution lease: %w", err)
+	}
+	return nil
+}
+
 func (w Worker) toolPermissionPolicyWithState(exec Execution, approval *approvalContinuation) frameworktool.PermissionPolicy {
 	return frameworktool.PermissionPolicyFunc(func(
 		ctx context.Context,
 		request *frameworktool.PermissionRequest,
 	) (frameworktool.PermissionDecision, error) {
+		if err := w.validateExecutionLease(ctx, exec); err != nil {
+			return frameworktool.PermissionDecision{}, err
+		}
 		started := time.Now()
 		name := permissionToolName(request)
 		if err := platformtool.AuthorizeExecution(exec.Config.Tools, name); err != nil {

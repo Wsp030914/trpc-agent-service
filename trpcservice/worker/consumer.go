@@ -432,6 +432,11 @@ func (c *Consumer) executeClaim(ctx context.Context, claim queue.Claim) (bool, e
 		}
 		return true, nil
 	}
+	if runErr != nil && errors.Is(runErr, queue.ErrLeaseLost) {
+		// A stale worker must not convert its failed side-effect boundary into a
+		// terminal FAILED state. The current owner will finish the execution.
+		return true, nil
+	}
 	if runErr != nil || !result.RunnerCompleted {
 		failure := runErr
 		if failure == nil {

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 )
 
 // ErrForbidden means an authenticated control-plane principal is outside the
@@ -136,7 +138,8 @@ func validateTenantIDs(values []string, required bool) error {
 type principalContextKey struct{}
 
 func withPrincipal(ctx context.Context, principal AdminPrincipal) context.Context {
-	return context.WithValue(ctx, principalContextKey{}, principal)
+	ctx = context.WithValue(ctx, principalContextKey{}, principal)
+	return platformaudit.WithControlPlaneActor(ctx, principal.ActorID, string(principal.Role))
 }
 
 // PrincipalFromContext returns the authenticated control-plane principal.

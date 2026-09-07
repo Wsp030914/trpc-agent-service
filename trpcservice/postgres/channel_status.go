@@ -60,7 +60,7 @@ WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3`, tenantID, appID, bind
 		eventType = platformaudit.ChannelSuspended
 	}
 	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
-		tenantID, appID, "admin", eventType, string(status),
+		ctx, tenantID, appID, "admin", eventType, string(status),
 	)); err != nil {
 		return channels.Binding{}, err
 	}

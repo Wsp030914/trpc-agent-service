@@ -397,7 +397,7 @@ func (m *fakeMetadata) FindArtifact(context.Context, Access, string, *int) (Reco
 	if m.findErr != nil {
 		return Record{}, m.findErr
 	}
-	return Record{Version: 0}, nil
+	return Record{Version: 0, ConfigVersion: "v1"}, nil
 }
 
 func (m *fakeMetadata) ListArtifactKeys(context.Context, Access) ([]string, error) {
@@ -412,7 +412,7 @@ func (*fakeMetadata) MarkArtifactsDeleted(_ context.Context, access Access, file
 	return []Record{{
 		ID: "deleted-artifact", TenantID: access.Scope.TenantID, AppID: access.Scope.AppID,
 		SessionPrincipalID: access.SessionPrincipalID, SessionID: access.SessionID, Filename: filename,
-		Version: 0, ObjectKey: "object-key", Status: StatusDeleted,
+		Version: 0, ObjectKey: "object-key", ConfigVersion: access.ConfigVersion, Status: StatusDeleted,
 	}}, nil
 }
 

@@ -78,6 +78,188 @@ func TestHandleMessageDuplicateEventUsesGatewayIdempotency(t *testing.T) {
 	}
 }
 
+func TestRunReconcilesNewBindingWhileExistingClientBlocks(t *testing.T) {
+	bindingA := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "secret-a")
+	bindingB := testWeComBinding("tenant-b", "support", "binding-b", "bot-b", "secret-b")
+	source := newMutableWeComBindingSource(bindingA)
+	secrets := testWeComSecrets{
+		key:   bindingA,
+		value: "secret-a",
+		more:  map[string]string{testWeComSecretKey(bindingB): "secret-b"},
+	}
+	started := make(chan channels.BindingSnapshot, 2)
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newWeComRecordingAdmitter()),
+		secrets,
+		WithReconcileInterval(10*time.Millisecond),
+		WithClientFactory(func(binding channels.BindingSnapshot, secret string, _ MessageHandler) (ClientRunner, error) {
+			if secret == "" {
+				return nil, errors.New("empty test secret")
+			}
+			started <- binding
+			return &wecomBlockingRunner{closed: make(chan struct{})}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(runCtx) }()
+	select {
+	case binding := <-started:
+		if binding.BindingID != bindingA.BindingID {
+			t.Fatalf("first binding = %q, want %q", binding.BindingID, bindingA.BindingID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first binding")
+	}
+	source.Set(bindingB)
+	select {
+	case binding := <-started:
+		if binding.BindingID != bindingB.BindingID {
+			t.Fatalf("reconciled binding = %q, want %q", binding.BindingID, bindingB.BindingID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new active WeCom binding waited for unrelated client")
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for adapter shutdown")
+	}
+}
+
+func TestCloseLetsRunOwnActiveClientShutdown(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "secret-a")
+	source := newMutableWeComBindingSource(binding)
+	client := &wecomCloseCountingRunner{
+		started:      make(chan struct{}),
+		closeStarted: make(chan struct{}),
+		closeGate:    make(chan struct{}),
+	}
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newWeComRecordingAdmitter()),
+		testWeComSecrets{key: binding, value: "secret-a"},
+		WithClientFactory(func(channels.BindingSnapshot, string, MessageHandler) (ClientRunner, error) {
+			return client, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(runCtx) }()
+	select {
+	case <-client.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for WeCom client")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- adapter.Close(context.Background()) }()
+	select {
+	case <-client.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("adapter Close did not close the active WeCom client")
+	}
+	close(client.closeGate)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("close adapter: %v", err)
+	}
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v, want context canceled", err)
+	}
+	if got := client.closeCalls.Load(); got != 1 {
+		t.Fatalf("WeCom client close calls = %d, want 1", got)
+	}
+}
+
+func TestRunRebuildsChangedBindingAndStopsSuspendedBinding(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "secret-a")
+	updated := binding
+	updated.BindingRevision = 2
+	updated.Secret = tenant.SecretRef{Name: "secret-b", Version: "v1"}
+	source := newMutableWeComBindingSource(binding)
+	secrets := testWeComSecrets{
+		key:   binding,
+		value: "secret-a",
+		more:  map[string]string{testWeComSecretKey(updated): "secret-b"},
+	}
+	started := make(chan channels.BindingSnapshot, 2)
+	clients := make(chan *wecomBlockingRunner, 2)
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newWeComRecordingAdmitter()),
+		secrets,
+		WithReconcileInterval(10*time.Millisecond),
+		WithClientFactory(func(binding channels.BindingSnapshot, secret string, _ MessageHandler) (ClientRunner, error) {
+			if secret == "" {
+				return nil, errors.New("empty test secret")
+			}
+			client := &wecomBlockingRunner{closed: make(chan struct{})}
+			started <- binding
+			clients <- client
+			return client, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(runCtx) }()
+	first := <-clients
+	firstBinding := <-started
+	if firstBinding.BindingRevision != 1 {
+		t.Fatalf("initial binding revision = %d", firstBinding.BindingRevision)
+	}
+	source.Set(updated)
+	second := <-clients
+	secondBinding := <-started
+	if secondBinding.BindingRevision != 2 || secondBinding.Secret.Name != "secret-b" {
+		t.Fatalf("updated binding = %#v", secondBinding)
+	}
+	if err := adapter.HandleMessage(context.Background(), binding.Snapshot(), Message{
+		MessageID: "stale-message", AIBotID: "bot-a", ChatType: "single",
+		From: MessageFrom{UserID: "user-a"}, MessageType: "text", Text: MessageText{Content: "stale"},
+	}); !errors.Is(err, gateway.ErrChannelBindingSnapshotStale) {
+		t.Fatalf("stale WeCom message error = %v", err)
+	}
+	select {
+	case <-first.closed:
+	case <-time.After(time.Second):
+		t.Fatal("old WeCom client was not closed after revision change")
+	}
+
+	suspended := updated
+	suspended.Status = channels.BindingSuspended
+	source.Set(suspended)
+	select {
+	case <-second.closed:
+	case <-time.After(time.Second):
+		t.Fatal("active WeCom client was not closed after suspension")
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for WeCom shutdown")
+	}
+}
+
 func TestWebSocketClientAuthMessageReplyReconnectAndCancellation(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var connections atomic.Int32
@@ -271,6 +453,57 @@ type recordingWeComSender struct {
 	messageID string
 }
 
+type wecomBlockingRunner struct {
+	closed chan struct{}
+}
+
+type wecomCloseCountingRunner struct {
+	started      chan struct{}
+	closeStarted chan struct{}
+	closeGate    chan struct{}
+	closeCalls   atomic.Int32
+}
+
+func (r *wecomCloseCountingRunner) Run(ctx context.Context) error {
+	close(r.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (r *wecomCloseCountingRunner) Close(ctx context.Context) error {
+	if r.closeCalls.Add(1) == 1 {
+		close(r.closeStarted)
+	}
+	select {
+	case <-r.closeGate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+var _ ClientRunner = (*wecomCloseCountingRunner)(nil)
+
+func (r *wecomBlockingRunner) Run(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.closed:
+		return nil
+	}
+}
+
+func (r *wecomBlockingRunner) Close(context.Context) error {
+	select {
+	case <-r.closed:
+	default:
+		close(r.closed)
+	}
+	return nil
+}
+
+var _ ClientRunner = (*wecomBlockingRunner)(nil)
+
 func (s *recordingWeComSender) SendMessage(_ context.Context, target, text string) (string, error) {
 	s.target = target
 	s.text = text
@@ -324,13 +557,65 @@ func (a *wecomRecordingAdmitter) admittedCount() int {
 type testWeComSecrets struct {
 	key   channels.Binding
 	value string
+	more  map[string]string
 }
 
 func (p testWeComSecrets) ResolveSecret(_ context.Context, scope tenant.Scope, ref tenant.SecretRef) (string, error) {
-	if scope.TenantID == p.key.TenantID && scope.AppID == p.key.AppID && ref.Name == p.key.Secret.Name {
+	key := scope.TenantID + "\x00" + scope.AppID + "\x00" + ref.Name
+	if key == testWeComSecretKey(p.key) {
 		return p.value, nil
 	}
+	if value := p.more[key]; value != "" {
+		return value, nil
+	}
 	return "", errors.New("test WeCom secret not found")
+}
+
+func testWeComSecretKey(binding channels.Binding) string {
+	return binding.TenantID + "\x00" + binding.AppID + "\x00" + binding.Secret.Name
+}
+
+type mutableWeComBindingSource struct {
+	mu       sync.RWMutex
+	bindings map[string]channels.Binding
+}
+
+func newMutableWeComBindingSource(bindings ...channels.Binding) *mutableWeComBindingSource {
+	source := &mutableWeComBindingSource{bindings: make(map[string]channels.Binding)}
+	for _, binding := range bindings {
+		source.bindings[bindingKey(binding.Snapshot())] = binding
+	}
+	return source
+}
+
+func (s *mutableWeComBindingSource) Set(bindings ...channels.Binding) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, binding := range bindings {
+		s.bindings[bindingKey(binding.Snapshot())] = binding
+	}
+}
+
+func (s *mutableWeComBindingSource) ResolveBinding(_ context.Context, tenantID, appID, bindingID string) (channels.Binding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	binding, ok := s.bindings[tenantID+"\x00"+appID+"\x00"+bindingID]
+	if !ok {
+		return channels.Binding{}, errors.New("binding not found")
+	}
+	return binding, nil
+}
+
+func (s *mutableWeComBindingSource) ListActiveChannelBindings(_ context.Context, channel channels.Channel) ([]channels.Binding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]channels.Binding, 0, len(s.bindings))
+	for _, binding := range s.bindings {
+		if binding.Channel == channel && binding.Status == channels.BindingActive {
+			result = append(result, binding)
+		}
+	}
+	return result, nil
 }
 
 func newWeComTestAdapter(

@@ -40,6 +40,33 @@ func NewRetryableError(err error) error {
 	return RetryableError{Err: err}
 }
 
+// PermanentError marks a migration failure that cannot become valid by
+// retrying the same immutable configuration or backend identity.
+type PermanentError struct{ Err error }
+
+func (e PermanentError) Error() string {
+	if e.Err == nil {
+		return "permanent data migration error"
+	}
+	return e.Err.Error()
+}
+
+func (e PermanentError) Unwrap() error { return e.Err }
+
+func (e PermanentError) IsPermanent() bool { return true }
+
+func NewPermanentError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return PermanentError{Err: err}
+}
+
+func IsPermanentError(err error) bool {
+	var marker interface{ IsPermanent() bool }
+	return errors.As(err, &marker) && marker.IsPermanent()
+}
+
 // Status identifies the durable lifecycle of one backend data migration.
 type Status string
 

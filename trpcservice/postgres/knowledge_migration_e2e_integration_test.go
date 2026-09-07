@@ -83,8 +83,8 @@ func TestKnowledgeMigrationAcrossRealWorkerProcesses(t *testing.T) {
 	targetCollection := "knowledge-" + targetProfile + "-" + generation
 	scope := tenant.Scope{TenantID: tenantID, AppID: appID}
 
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cleanupCancel()
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM platform.data_migration WHERE tenant_id = $1 AND app_id = $2`, tenantID, appID)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM platform.knowledge_chunk WHERE tenant_id = $1 AND app_id = $2`, tenantID, appID)

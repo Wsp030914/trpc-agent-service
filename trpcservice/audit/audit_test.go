@@ -1,12 +1,24 @@
 package audit_test
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 )
+
+func TestControlPlaneActorContextCarriesOnlyStableIdentity(t *testing.T) {
+	ctx := audit.WithControlPlaneActor(context.Background(), "admin:operator", "operator")
+	actorID, actorRole, ok := audit.ControlPlaneActorFromContext(ctx)
+	if !ok || actorID != "admin:operator" || actorRole != "operator" {
+		t.Fatalf("control-plane actor = %q/%q ok=%t", actorID, actorRole, ok)
+	}
+	if _, _, ok := audit.ControlPlaneActorFromContext(context.Background()); ok {
+		t.Fatal("missing control-plane actor context was accepted")
+	}
+}
 
 func TestEventValidateRequiresScopedCorrelationMetadata(t *testing.T) {
 	event := audit.Event{

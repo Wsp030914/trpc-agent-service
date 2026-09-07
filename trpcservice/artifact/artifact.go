@@ -238,6 +238,9 @@ func (s *Service) LoadArtifact(
 	if err != nil {
 		return nil, err
 	}
+	if record.ConfigVersion != s.access.ConfigVersion {
+		return nil, errors.New("artifact metadata config version does not match execution")
+	}
 	storageInfo, storageFilename, err := s.storageRequest(filename)
 	if err != nil {
 		return nil, err
@@ -280,6 +283,10 @@ func (s *Service) DeleteArtifact(ctx context.Context, info frameworkartifact.Ses
 	}
 	var failures []error
 	for _, record := range records {
+		if record.ConfigVersion != s.access.ConfigVersion {
+			failures = append(failures, errors.New("artifact metadata config version does not match execution"))
+			continue
+		}
 		var err error
 		if exact, ok := s.storage.(ExactObjectStorage); ok {
 			err = exact.DeleteArtifactObject(ctx, record.ObjectKey)

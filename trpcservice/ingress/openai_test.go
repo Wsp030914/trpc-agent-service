@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
@@ -15,6 +16,56 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
+
+func TestOpenAIHandlerDoesNotProjectTerminalExecutionError(t *testing.T) {
+	handler, _, source, _ := newTestOpenAIHandler(t)
+	secret := "provider-secret-must-not-cross-http"
+	source.events = []gateway.ExecutionEvent{{
+		Sequence: 1,
+		Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+			Object: model.ObjectTypeError,
+			Done:   true,
+			Error:  &model.ResponseError{Type: model.ErrorTypeAPIError, Message: secret},
+		}),
+	}}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, validOpenAIRequest())
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusInternalServerError)
+	}
+	if strings.Contains(response.Body.String(), secret) || strings.Contains(response.Body.String(), "data: [DONE]") {
+		t.Fatalf("terminal execution error leaked or became successful response: %q", response.Body.String())
+	}
+}
+
+func TestOpenAIHandlerStreamsCompletionChunksAndSafeLateError(t *testing.T) {
+	handler, _, source, _ := newTestOpenAIHandler(t)
+	secret := "late-provider-secret"
+	request := validOpenAIRequest()
+	request.Body = io.NopCloser(bytes.NewBufferString(`{"stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	source.events = []gateway.ExecutionEvent{
+		{Sequence: 1, Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+			Object:  model.ObjectTypeChatCompletionChunk,
+			Choices: []model.Choice{{Delta: model.Message{Role: model.RoleAssistant, Content: "part"}}},
+		})},
+		{Sequence: 2, Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+			Object: model.ObjectTypeError,
+			Done:   true,
+			Error:  &model.ResponseError{Type: model.ErrorTypeAPIError, Message: secret},
+		})},
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, `"content":"part"`) {
+		t.Fatalf("stream response = status %d body %q", response.Code, body)
+	}
+	if !strings.Contains(body, `"type":"internal_error"`) || strings.Contains(body, secret) || strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("stream terminal error was not projected safely: %q", body)
+	}
+}
 
 func TestOpenAIHandlerRejectsCallerIdentityHeaders(t *testing.T) {
 	tests := []struct {
@@ -272,6 +323,7 @@ func (a *recordingAdmitter) Admit(
 type recordingEventSource struct {
 	scope     tenant.Scope
 	requestID string
+	events    []gateway.ExecutionEvent
 }
 
 func (s *recordingEventSource) SubscribeExecutionEvents(
@@ -282,16 +334,21 @@ func (s *recordingEventSource) SubscribeExecutionEvents(
 ) (<-chan gateway.ExecutionEvent, error) {
 	s.scope = scope
 	s.requestID = requestID
-	events := make(chan gateway.ExecutionEvent, 1)
-	events <- gateway.ExecutionEvent{
-		Sequence: 1,
-		Event: &event.Event{Response: &model.Response{
-			Choices: []model.Choice{{
-				Message: model.Message{Role: model.RoleAssistant, Content: "accepted"},
+	items := s.events
+	if len(items) == 0 {
+		items = []gateway.ExecutionEvent{{
+			Sequence: 1,
+			Event: &event.Event{Response: &model.Response{
+				Object:  model.ObjectTypeChatCompletion,
+				Choices: []model.Choice{{Message: model.Message{Role: model.RoleAssistant, Content: "accepted"}}},
+				Done:    true,
 			}},
-			Done: true,
-		}},
+		}}
 	}
-	close(events)
-	return events, nil
+	stream := make(chan gateway.ExecutionEvent, len(items))
+	for _, item := range items {
+		stream <- item
+	}
+	close(stream)
+	return stream, nil
 }

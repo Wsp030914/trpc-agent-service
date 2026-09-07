@@ -33,6 +33,56 @@ func TestReplySenderUsesProviderRetryAfter(t *testing.T) {
 	}
 }
 
+func TestReplySenderPersistsKnownFailureAfterShutdown(t *testing.T) {
+	delivery := testReplyDelivery()
+	outbox := &replyOutboxStub{deliveries: []ReplyDelivery{delivery}}
+	sender, err := NewReplySender(
+		outbox,
+		func(context.Context, ReplyDelivery) (string, error) { return "target", nil },
+		func(context.Context, ReplyDelivery) (ReplyProvider, error) {
+			return ReplyProvider{Client: replyClientFunc(func(context.Context, channels.Reply, string) (channels.ProviderReceipt, error) {
+				return channels.ProviderReceipt{}, retryAfterTestError{delay: time.Second}
+			})}, nil
+		},
+		ReplySenderOptions{Owner: "worker-1"},
+	)
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := sender.SendBatch(ctx); err != nil {
+		t.Fatalf("send batch after shutdown: %v", err)
+	}
+	if !outbox.retried || outbox.failed {
+		t.Fatalf("retried=%t failed=%t", outbox.retried, outbox.failed)
+	}
+}
+
+func TestReplySenderMarksCanceledProviderSendUncertain(t *testing.T) {
+	delivery := testReplyDelivery()
+	outbox := &replyOutboxStub{deliveries: []ReplyDelivery{delivery}}
+	sender, err := NewReplySender(
+		outbox,
+		func(context.Context, ReplyDelivery) (string, error) { return "target", nil },
+		func(context.Context, ReplyDelivery) (ReplyProvider, error) {
+			return ReplyProvider{Client: replyClientFunc(func(context.Context, channels.Reply, string) (channels.ProviderReceipt, error) {
+				return channels.ProviderReceipt{}, context.Canceled
+			})}, nil
+		},
+		ReplySenderOptions{Owner: "worker-1"},
+	)
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	if _, err := sender.SendBatch(context.Background()); err != nil {
+		t.Fatalf("send batch: %v", err)
+	}
+	if !outbox.uncertain || outbox.retried || outbox.failed {
+		t.Fatalf("uncertain=%t retried=%t failed=%t", outbox.uncertain, outbox.retried, outbox.failed)
+	}
+}
+
 func TestReplySenderBoundsProviderRetryAfter(t *testing.T) {
 	delivery := testReplyDelivery()
 	outbox := &replyOutboxStub{deliveries: []ReplyDelivery{delivery}}

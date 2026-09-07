@@ -89,7 +89,7 @@ INSERT INTO platform.data_migration (
 		return fmt.Errorf("insert data migration: %w", err)
 	}
 	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
-		record.TenantID, record.AppID, record.SourceConfigVersion,
+		ctx, record.TenantID, record.AppID, record.SourceConfigVersion,
 		platformaudit.MigrationCreated, "created",
 	)); err != nil {
 		return err
@@ -175,7 +175,7 @@ WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3 AND status = 'PENDING
 		return migration.Record{}, fmt.Errorf("started data migration: %w", err)
 	}
 	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
-		record.TenantID, record.AppID, record.SourceConfigVersion,
+		ctx, record.TenantID, record.AppID, record.SourceConfigVersion,
 		platformaudit.MigrationStarted, "started",
 	)); err != nil {
 		return migration.Record{}, err
@@ -254,7 +254,7 @@ WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3 AND status = 'PENDING
 		return migration.Record{}, fmt.Errorf("started data migration: %w", err)
 	}
 	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
-		record.TenantID, record.AppID, record.SourceConfigVersion,
+		ctx, record.TenantID, record.AppID, record.SourceConfigVersion,
 		platformaudit.MigrationStarted, "started",
 	)); err != nil {
 		return migration.Record{}, err
@@ -390,6 +390,34 @@ RETURNING lease_until`,
 	return record, nil
 }
 
+// ReleaseDataMigrationLease gives a transiently unavailable copier back to
+// the takeover queue without waiting for the lease timeout.
+func (s *Store) ReleaseDataMigrationLease(ctx context.Context, record migration.Record) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE platform.data_migration
+SET lease_owner = NULL, lease_until = NULL, run_token = NULL,
+    updated_at = clock_timestamp()
+WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3
+  AND status IN ('DRAINING', 'COPYING', 'VERIFYING')
+  AND lease_owner = $4 AND run_token = $5
+  AND lease_until > clock_timestamp()`,
+		record.ID, record.TenantID, record.AppID, record.LeaseOwner, record.RunToken,
+	)
+	if err != nil {
+		return fmt.Errorf("release data migration lease: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("release data migration lease: %w", migration.ErrLeaseLost)
+	}
+	return nil
+}
+
 // UpdateDataMigrationCheckpoint persists resumable copy/verify progress under
 // the current lease. A stale worker cannot overwrite its successor's progress.
 func (s *Store) UpdateDataMigrationCheckpoint(ctx context.Context, record migration.Record) error {
@@ -511,7 +539,7 @@ WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3
 			decision = "failed"
 		}
 		if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
-			record.TenantID, record.AppID, record.TargetConfigVersion, eventType, decision,
+			ctx, record.TenantID, record.AppID, record.TargetConfigVersion, eventType, decision,
 		)); err != nil {
 			return err
 		}

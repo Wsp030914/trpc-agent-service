@@ -79,7 +79,7 @@ WHERE tenant_id = $1 AND app_id = $2`, tenantID, appID); err != nil {
 	app.CanaryPercentage = 0
 	app.CanaryStatus = tenant.CanaryDisabled
 	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
-		tenantID, appID, target, platformaudit.ConfigCanaryPromoted, "promoted",
+		ctx, tenantID, appID, target, platformaudit.ConfigCanaryPromoted, "promoted",
 	)); err != nil {
 		return tenant.AgentApp{}, err
 	}
@@ -195,7 +195,7 @@ WHERE tenant_id = $1 AND app_id = $2`, tenantID, appID); err != nil {
 			auditVersion = app.ActiveConfigVersion
 		}
 		if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
-			tenantID, appID, auditVersion, eventType, string(status),
+			ctx, tenantID, appID, auditVersion, eventType, string(status),
 		)); err != nil {
 			return tenant.AgentApp{}, err
 		}

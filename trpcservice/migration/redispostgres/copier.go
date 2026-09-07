@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
@@ -35,10 +36,10 @@ func NewCopier(
 	record migration.Record,
 ) (*Copier, error) {
 	if configs == nil || sessions == nil || postgresSessions == nil {
-		return nil, errors.New("data migration copier dependencies are required")
+		return nil, migration.NewPermanentError(errors.New("data migration copier dependencies are required"))
 	}
 	if err := record.Validate(); err != nil {
-		return nil, err
+		return nil, migration.NewPermanentError(err)
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -56,25 +57,25 @@ func NewCopier(
 	}
 	if sourceExec.Config.BackendConfig.Session.Kind != tenant.BackendRedis ||
 		sourceExec.Config.BackendConfig.Session.Provider != "redis" {
-		return nil, errors.New("data migration source session backend must use redis")
+		return nil, migration.NewPermanentError(errors.New("data migration source session backend must use redis"))
 	}
 	if targetExec.Config.BackendConfig.Session.Kind != tenant.BackendSQL ||
 		targetExec.Config.BackendConfig.Session.Provider != "postgres" {
-		return nil, errors.New("data migration target session backend must use postgres")
+		return nil, migration.NewPermanentError(errors.New("data migration target session backend must use postgres"))
 	}
 	source, err := sessions.ResolveSession(ctx, sourceExec)
 	if err != nil {
 		return nil, fmt.Errorf("resolve redis source session: %w", err)
 	}
 	if source == nil {
-		return nil, errors.New("resolved redis source session is required")
+		return nil, migration.NewPermanentError(errors.New("resolved redis source session is required"))
 	}
 	target, err := sessions.ResolveSession(ctx, targetExec)
 	if err != nil {
 		return nil, fmt.Errorf("resolve postgres target session: %w", err)
 	}
 	if target == nil {
-		return nil, errors.New("resolved postgres target session is required")
+		return nil, migration.NewPermanentError(errors.New("resolved postgres target session is required"))
 	}
 	importer, err := postgresSessions.NewSummaryImporter(ctx, targetExec)
 	if err != nil {
@@ -176,9 +177,31 @@ func (s verifiedRedisSource) loadTrackEvents(ctx context.Context, key session.Ke
 // only summary text, not the complete filter-keyed Summary records required
 // for lossless migration.
 func (s verifiedRedisSource) GetSessionSummaries(
-	context.Context,
-	session.Key,
+	ctx context.Context,
+	key session.Key,
 ) (map[string]*session.Summary, error) {
+	if s.Service == nil {
+		return nil, migration.NewPermanentError(errors.New("redis summary source is not initialized"))
+	}
+	value, err := s.Service.GetSession(ctx, key, session.WithEventNum(math.MaxInt))
+	if err != nil {
+		return nil, fmt.Errorf("read redis session for summary inventory: %w", err)
+	}
+	if value == nil {
+		return map[string]*session.Summary{}, nil
+	}
+	if len(value.Summaries) > 0 {
+		return nil, migration.ErrSummaryImportRequired
+	}
+	if len(value.Events) == 0 {
+		// A Redis summary is derived from event history. With complete history
+		// confirmed empty, there is no summary inventory to import; do not use
+		// the provider's boolean text lookup, which also hides backend errors.
+		return map[string]*session.Summary{}, nil
+	}
+	// Redis has no filter-keyed summary enumeration API. For a non-empty
+	// session, the provider's boolean summary API conflates "missing" with a
+	// Redis read failure, so do not silently treat false as an empty inventory.
 	return nil, migration.ErrSummaryImportRequired
 }
 
@@ -210,7 +233,7 @@ func resolveExecution(
 		return worker.Execution{}, err
 	}
 	if cfg.TenantID != record.TenantID || cfg.AppID != record.AppID || cfg.Version != version {
-		return worker.Execution{}, errors.New("resolved app config does not match data migration")
+		return worker.Execution{}, migration.NewPermanentError(errors.New("resolved app config does not match data migration"))
 	}
 	return worker.Execution{Tenant: runtime, Config: cfg}, nil
 }

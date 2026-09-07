@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,8 +36,9 @@ func (o ListOptions) validate(requireApp bool) error {
 	return nil
 }
 
-// AppConfigView is a safe immutable configuration view. It contains only
-// SecretRef metadata, never resolved secret values.
+// AppConfigView is a safe immutable configuration view. Opaque provider
+// options and model parameters are omitted because their values may contain
+// credentials even when their keys do not identify them as secrets.
 type AppConfigView struct {
 	Config    tenant.AppConfig `json:"config"`
 	Status    string           `json:"status"`
@@ -56,9 +58,8 @@ type TenantView struct {
 	UpdatedAt     time.Time          `json:"updated_at"`
 }
 
-// BackendSummary is a safe app-level backend reference. Endpoint options are
-// intentionally omitted; the Backends page reads the already-filtered config
-// view when it needs a non-sensitive endpoint summary.
+// BackendSummary is a safe app-level backend reference. Opaque endpoint
+// options are intentionally omitted.
 type BackendSummary struct {
 	Kind      tenant.BackendKind `json:"kind"`
 	Provider  string             `json:"provider"`
@@ -224,32 +225,71 @@ func (a API) ListAppConfigsForPrincipal(
 
 func sanitizeAppConfig(value tenant.AppConfig) tenant.AppConfig {
 	value = value.Clone()
-	value.Model.Parameters = sanitizeStringMap(value.Model.Parameters)
-	value.BackendConfig.Session.Options = sanitizeStringMap(value.BackendConfig.Session.Options)
-	value.BackendConfig.Memory.Options = sanitizeStringMap(value.BackendConfig.Memory.Options)
-	value.BackendConfig.Knowledge.Options = sanitizeStringMap(value.BackendConfig.Knowledge.Options)
-	value.BackendConfig.Artifact.Options = sanitizeStringMap(value.BackendConfig.Artifact.Options)
+	value.Model.Parameters = sanitizeModelParameters(value.Model.Parameters)
+	value.BackendConfig.Session.Options = sanitizeOptions(value.BackendConfig.Session.Options, "schema")
+	value.BackendConfig.Memory.Options = nil
+	value.BackendConfig.Knowledge.Options = sanitizeOptions(value.BackendConfig.Knowledge.Options,
+		"embedding_model", "embedding_dimensions", "embedding_profile", "index_generation")
+	value.BackendConfig.Artifact.Options = nil
 	return value
 }
 
 func sanitizeStringMap(values map[string]string) map[string]string {
+	return sanitizeOptions(values)
+}
+
+func sanitizeModelParameters(values map[string]string) map[string]string {
 	if len(values) == 0 {
 		return nil
 	}
-	filtered := make(map[string]string, len(values))
-	for key, value := range values {
-		lower := strings.ToLower(key)
-		if strings.Contains(lower, "secret") || strings.Contains(lower, "token") ||
-			strings.Contains(lower, "password") || strings.Contains(lower, "passwd") ||
-			strings.Contains(lower, "credential") || strings.Contains(lower, "authorization") ||
-			strings.Contains(lower, "api_key") || strings.Contains(lower, "api-key") ||
-			strings.Contains(lower, "apikey") || strings.Contains(lower, "key") ||
-			strings.Contains(lower, "dsn") {
-			continue
-		}
-		filtered[key] = value
+	result := make(map[string]string)
+	if baseURL := values["base_url"]; baseURL != "" && safeBaseURL(baseURL) {
+		result["base_url"] = baseURL
 	}
-	return filtered
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func sanitizeOptions(values map[string]string, allowed ...string) map[string]string {
+	if len(values) == 0 || len(allowed) == 0 {
+		return nil
+	}
+	allow := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		allow[key] = struct{}{}
+	}
+	result := make(map[string]string)
+	for key, value := range values {
+		if _, ok := allow[key]; ok && !looksSensitiveOption(key, value) {
+			result[key] = value
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func looksSensitiveOption(key, value string) bool {
+	lowerKey := strings.ToLower(key)
+	for _, marker := range []string{"secret", "token", "password", "passwd", "credential", "authorization", "api_key", "apikey", "dsn"} {
+		if strings.Contains(lowerKey, marker) {
+			return true
+		}
+	}
+	return strings.ContainsAny(value, "\r\n\x00")
+}
+
+func safeBaseURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil &&
+		(strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")) &&
+		parsed.Hostname() != "" &&
+		parsed.User == nil &&
+		parsed.RawQuery == "" &&
+		parsed.Fragment == ""
 }
 
 func (a API) ListChannelBindingsForPrincipal(

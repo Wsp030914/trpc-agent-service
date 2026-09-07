@@ -322,8 +322,10 @@ func hasAssistantReplyText(evt *event.Event) bool {
 }
 
 // SubscribeExecutionEvents streams persisted events after afterSequence. The
-// stream closes after a Runner completion or terminal-error event, or when the
-// caller cancels ctx.
+// stream closes after a terminal execution completion or terminal-error event,
+// or when the caller cancels ctx. A Runner completion that parks an execution
+// in WAITING_APPROVAL is not terminal: keep the durable stream open so the
+// original client can receive the approved continuation.
 func (j *ExecutionEventJournal) SubscribeExecutionEvents(
 	ctx context.Context,
 	scope tenant.Scope,
@@ -386,7 +388,7 @@ func (j *ExecutionEventJournal) streamExecutionEvents(
 			case output <- item:
 			}
 			afterSequence = item.Sequence
-			if item.Event.IsRunnerCompletion() || item.Event.IsTerminalError() {
+			if item.Event.IsTerminalError() {
 				return
 			}
 		}

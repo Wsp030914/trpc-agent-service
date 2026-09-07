@@ -86,12 +86,19 @@ func TestWorkerRuntimeCompletesRedisPostgresMigration(t *testing.T) {
 		t.Fatalf("build session app name: %v", err)
 	}
 	key := session.Key{AppName: appName, UserID: "user-1", SessionID: "session-1"}
-	if _, err := pool.Exec(ctx, `
-INSERT INTO platform.session_lane (tenant_id, app_id, session_principal_id, session_id)
-VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != nil {
-		t.Fatalf("insert session lane: %v", err)
+	var laneCount int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*) FROM platform.session_lane
+WHERE tenant_id = $1 AND app_id = $2`, tenantID, appID).Scan(&laneCount); err != nil {
+		t.Fatalf("check legacy session lane absence: %v", err)
 	}
-	source, err := redisprovider.NewService(redisprovider.WithRedisClientURL(*dataMigrationTestURL))
+	if laneCount != 0 {
+		t.Fatalf("legacy migration fixture unexpectedly has %d session lanes", laneCount)
+	}
+	source, err := redisprovider.NewService(
+		redisprovider.WithRedisClientURL(*dataMigrationTestURL),
+		redisprovider.WithCompatMode(redisprovider.CompatModeTransition),
+	)
 	if err != nil {
 		t.Fatalf("create redis session service: %v", err)
 	}
@@ -209,7 +216,7 @@ WHERE migration_id = $1`, record.ID).Scan(
 	}
 }
 
-func TestWorkerRuntimeFailsMigrationWhenSourceProviderUnavailable(t *testing.T) {
+func TestWorkerRuntimeKeepsMigrationResumableWhenTargetProviderUnavailable(t *testing.T) {
 	if *dataMigrationTestDSN == "" || *dataMigrationTestURL == "" {
 		t.Fatal("TRPC_AGENT_SERVICE_POSTGRES_TEST_DSN and TRPC_AGENT_SERVICE_REDIS_TEST_URL are required")
 	}
@@ -275,11 +282,32 @@ VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != ni
 		t.Fatalf("begin data migration: %v", err)
 	}
 
-	runtime := newDataMigrationTestRuntime(t, ctx, store, seed, tenantID, appID, "worker-copy-failure", "redis://127.0.0.1:1/0")
-	if err := runtime.runDataMigrationPass(ctx); err != nil {
-		t.Fatalf("run data migration pass: %v", err)
+	runtime := newDataMigrationTestRuntime(
+		t, ctx, store, seed, tenantID, appID, "worker-copy-failure",
+		*dataMigrationTestURL,
+		"postgres://trpc:development-only-change-me@127.0.0.1:1/trpc_agent_service_test?sslmode=disable",
+	)
+	if err := runtime.runDataMigrationPass(ctx); err == nil {
+		t.Fatal("run data migration pass succeeded while target provider was unavailable")
 	}
-	assertDataMigrationFailed(t, ctx, pool, store, tenantID, appID, record.ID, v1.Version)
+	var status migration.Status
+	var reason string
+	if err := pool.QueryRow(ctx, `
+SELECT status, COALESCE(failure_reason, '')
+FROM platform.data_migration
+WHERE migration_id = $1`, record.ID).Scan(&status, &reason); err != nil {
+		t.Fatalf("query migration after unavailable target: %v", err)
+	}
+	if status != migration.StatusDraining || reason != "" {
+		t.Fatalf("migration status=%q reason=%q, want resumable draining record", status, reason)
+	}
+	app, err := store.ResolveAgentApp(ctx, tenantID, appID)
+	if err != nil {
+		t.Fatalf("resolve app after unavailable target: %v", err)
+	}
+	if app.ActiveConfigVersion != v1.Version {
+		t.Fatalf("active config after unavailable target = %q, want %q", app.ActiveConfigVersion, v1.Version)
+	}
 }
 
 func TestDataMigrationLeaseTakeoverRejectsPreviousWorker(t *testing.T) {
@@ -439,6 +467,7 @@ func newDataMigrationTestRuntime(
 	appID string,
 	owner string,
 	sessionRedisURL string,
+	postgresDSN string,
 ) *workerRuntime {
 	t.Helper()
 	redisClient, err := platformredis.NewClient(ctx, *dataMigrationTestURL)
@@ -454,7 +483,7 @@ func newDataMigrationTestRuntime(
 		tenantID,
 		appID,
 		sessionRedisURL,
-		*dataMigrationTestDSN,
+		postgresDSN,
 	)
 	artifacts, err := artifactcos.NewResolver(
 		environmentSecretProvider{getenv: getenv},
@@ -487,34 +516,6 @@ func migrationSecretEnvironment(tenantID, appID, redisURL, postgresDSN string) f
 		scopedSecretEnvironmentKey(scope, tenant.SecretRef{Name: "migration-redis-url", Version: "1"}):    redisURL,
 		scopedSecretEnvironmentKey(scope, tenant.SecretRef{Name: "migration-postgres-dsn", Version: "1"}): postgresDSN,
 	})
-}
-
-func assertDataMigrationFailed(
-	t *testing.T,
-	ctx context.Context,
-	pool *pgxpool.Pool,
-	store *postgres.Store,
-	tenantID, appID, migrationID, sourceVersion string,
-) {
-	t.Helper()
-	var status migration.Status
-	var reason string
-	if err := pool.QueryRow(ctx, `
-SELECT status, failure_reason
-FROM platform.data_migration
-WHERE migration_id = $1`, migrationID).Scan(&status, &reason); err != nil {
-		t.Fatalf("query failed migration: %v", err)
-	}
-	if status != migration.StatusFailed || reason == "" {
-		t.Fatalf("failed migration status=%q reason=%q", status, reason)
-	}
-	app, err := store.ResolveAgentApp(ctx, tenantID, appID)
-	if err != nil {
-		t.Fatalf("resolve app after failed migration: %v", err)
-	}
-	if app.ActiveConfigVersion != sourceVersion {
-		t.Fatalf("active config after failed migration = %q, want %q", app.ActiveConfigVersion, sourceVersion)
-	}
 }
 
 func openDataMigrationIntegrationPool(t *testing.T) *pgxpool.Pool {

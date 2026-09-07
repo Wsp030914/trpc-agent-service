@@ -2,9 +2,11 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	"go.opentelemetry.io/otel/attribute"
@@ -20,8 +22,29 @@ import (
 // without exposing messages or state values.
 type tracedSessionService struct {
 	frameworksession.Service
-	exec    worker.Execution
-	metrics *platformmetrics.Recorder
+	exec           worker.Execution
+	metrics        *platformmetrics.Recorder
+	leaseValidator worker.ExecutionLeaseValidator
+}
+
+func (s *tracedSessionService) validateLease(ctx context.Context) error {
+	if s == nil || s.leaseValidator == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	lease, ok := worker.JobLeaseFromContext(ctx)
+	if !ok {
+		return fmt.Errorf("session execution lease is missing: %w", queue.ErrLeaseLost)
+	}
+	if err := s.leaseValidator.ValidateExecutionLease(ctx, s.exec, lease); err != nil {
+		return fmt.Errorf("validate session execution lease: %w", err)
+	}
+	return nil
 }
 
 func (s *tracedSessionService) start(ctx context.Context, method string) (context.Context, trace.Span, time.Time) {
@@ -67,6 +90,9 @@ func (s *tracedSessionService) CreateSession(
 	state frameworksession.StateMap,
 	opts ...frameworksession.Option,
 ) (result *frameworksession.Session, err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return nil, err
+	}
 	opCtx, span, started := s.start(ctx, "create")
 	result, err = s.Service.CreateSession(opCtx, key, state, opts...)
 	s.finish(opCtx, span, started, err)
@@ -100,6 +126,9 @@ func (s *tracedSessionService) DeleteSession(
 	key frameworksession.Key,
 	opts ...frameworksession.Option,
 ) (err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return err
+	}
 	opCtx, span, started := s.start(ctx, "delete")
 	err = s.Service.DeleteSession(opCtx, key, opts...)
 	s.finish(opCtx, span, started, err)
@@ -111,6 +140,9 @@ func (s *tracedSessionService) UpdateAppState(
 	appName string,
 	state frameworksession.StateMap,
 ) (err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return err
+	}
 	opCtx, span, started := s.start(ctx, "update_app_state")
 	err = s.Service.UpdateAppState(opCtx, appName, state)
 	s.finish(opCtx, span, started, err)
@@ -122,6 +154,9 @@ func (s *tracedSessionService) DeleteAppState(
 	appName string,
 	key string,
 ) (err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return err
+	}
 	opCtx, span, started := s.start(ctx, "delete_app_state")
 	err = s.Service.DeleteAppState(opCtx, appName, key)
 	s.finish(opCtx, span, started, err)
@@ -143,6 +178,9 @@ func (s *tracedSessionService) UpdateUserState(
 	key frameworksession.UserKey,
 	state frameworksession.StateMap,
 ) (err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return err
+	}
 	opCtx, span, started := s.start(ctx, "update_user_state")
 	err = s.Service.UpdateUserState(opCtx, key, state)
 	s.finish(opCtx, span, started, err)
@@ -164,6 +202,9 @@ func (s *tracedSessionService) DeleteUserState(
 	key frameworksession.UserKey,
 	stateKey string,
 ) (err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return err
+	}
 	opCtx, span, started := s.start(ctx, "delete_user_state")
 	err = s.Service.DeleteUserState(opCtx, key, stateKey)
 	s.finish(opCtx, span, started, err)
@@ -175,6 +216,9 @@ func (s *tracedSessionService) UpdateSessionState(
 	key frameworksession.Key,
 	state frameworksession.StateMap,
 ) (err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return err
+	}
 	opCtx, span, started := s.start(ctx, "update_session_state")
 	err = s.Service.UpdateSessionState(opCtx, key, state)
 	s.finish(opCtx, span, started, err)
@@ -187,6 +231,9 @@ func (s *tracedSessionService) AppendEvent(
 	evt *event.Event,
 	opts ...frameworksession.Option,
 ) (err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return err
+	}
 	opCtx, span, started := s.start(ctx, "append_event")
 	err = s.Service.AppendEvent(opCtx, sess, evt, opts...)
 	s.finish(opCtx, span, started, err)
@@ -199,6 +246,9 @@ func (s *tracedSessionService) CreateSessionSummary(
 	filterKey string,
 	force bool,
 ) (err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return err
+	}
 	opCtx, span, started := s.start(ctx, "create_summary")
 	err = s.Service.CreateSessionSummary(opCtx, sess, filterKey, force)
 	s.finish(opCtx, span, started, err)
@@ -211,6 +261,9 @@ func (s *tracedSessionService) EnqueueSummaryJob(
 	filterKey string,
 	force bool,
 ) (err error) {
+	if err = s.validateLease(ctx); err != nil {
+		return err
+	}
 	opCtx, span, started := s.start(ctx, "enqueue_summary")
 	err = s.Service.EnqueueSummaryJob(opCtx, sess, filterKey, force)
 	s.finish(opCtx, span, started, err)

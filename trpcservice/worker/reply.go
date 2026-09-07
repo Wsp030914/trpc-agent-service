@@ -259,9 +259,6 @@ func (s *ReplySender) SendBatch(ctx context.Context) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := s.outbox.RecoverReplyLeases(ctx); err != nil {
-		return 0, fmt.Errorf("recover reply leases: %w", err)
-	}
 	// Claim one row at a time. If sending the first provider-attempted row
 	// fails, later rows remain PENDING and therefore retryable; claiming the
 	// whole batch first would incorrectly leave those rows in SENDING.
@@ -367,7 +364,10 @@ func (s *ReplySender) sendOne(ctx context.Context, delivery ReplyDelivery) error
 	}
 	receipt, err := provider.Client.SendOnce(sendCtx, delivery.Reply, providerTarget)
 	if err != nil {
-		if isReplySideEffectUncertain(err) {
+		if isReplySideEffectUncertain(err) || errors.Is(err, context.Canceled) {
+			if errors.Is(err, context.Canceled) {
+				err = fmt.Errorf("reply provider send canceled: %w", err)
+			}
 			return s.recordUncertain(ctx, delivery, "", err, "provider_result_unknown", started, span)
 		}
 		retryable, errorType := classifyReplyError(err)
@@ -431,8 +431,8 @@ func (s *ReplySender) recordFailure(
 	started time.Time,
 	span trace.Span,
 ) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if errorType == "" {
 		errorType = "provider_send"
@@ -454,7 +454,9 @@ func (s *ReplySender) recordFailure(
 		if retryAfter > delay {
 			delay = retryAfter
 		}
-		if err := s.outbox.RetryReply(ctx, delivery, errorType, delay, cause); err != nil {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replyUncertainPersistTimeout)
+		defer cancel()
+		if err := s.outbox.RetryReply(persistCtx, delivery, errorType, delay, cause); err != nil {
 			return fmt.Errorf("retry reply: %w", err)
 		}
 		if s.metrics != nil {
@@ -466,13 +468,18 @@ func (s *ReplySender) recordFailure(
 		}
 		return nil
 	}
-	if err := s.outbox.FailReply(ctx, delivery, errorType, cause); err != nil {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replyUncertainPersistTimeout)
+	defer cancel()
+	if err := s.outbox.FailReply(persistCtx, delivery, errorType, cause); err != nil {
 		return fmt.Errorf("fail reply: %w", err)
 	}
 	return nil
 }
 
 func classifyReplyError(err error) (bool, string) {
+	if errors.Is(err, context.Canceled) {
+		return true, "shutdown_canceled"
+	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
 		return true, "transport_timeout"

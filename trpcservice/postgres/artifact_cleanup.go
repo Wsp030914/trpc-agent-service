@@ -13,9 +13,9 @@ import (
 const maxArtifactCleanupBatchSize = 1000
 
 // ClaimArtifactCleanup leases a bounded set of SQL-authorized object keys.
-// Eligibility and reference checks happen in the same row-locking statement,
-// so concurrent workers cannot delete the same object or race an active
-// execution into a stale cleanup decision.
+// Cleanup locks the artifact row before changing its status. Admission locks
+// referenced artifact rows before inserting an execution, so the two paths
+// serialize instead of relying on an inconsistent active-execution snapshot.
 func (s *Store) ClaimArtifactCleanup(
 	ctx context.Context,
 	owner string,
@@ -49,14 +49,21 @@ func (s *Store) ClaimArtifactCleanup(
 	if retentionBefore != nil {
 		retention = retentionBefore.UTC()
 	}
+	if _, err := s.pool.Exec(ctx, `
+UPDATE platform.artifact
+SET cleanup_last_error = 'artifact cleanup quarantined: config version is missing',
+    cleanup_next_attempt_at = 'infinity'::timestamptz,
+    updated_at = clock_timestamp()
+WHERE object_key <> '' AND config_version = ''
+  AND cleanup_completed_at IS NULL AND cleanup_last_error = ''`); err != nil {
+		return nil, fmt.Errorf("quarantine artifacts without config version: %w", err)
+	}
 	rows, err := s.pool.Query(ctx, `
 WITH candidates AS (
-    SELECT a.artifact_id, app.active_config_version
+    SELECT a.artifact_id
     FROM platform.artifact AS a
-    JOIN platform.agent_app AS app
-      ON app.tenant_id = a.tenant_id
-     AND app.app_id = a.app_id
     WHERE a.object_key <> ''
+      AND a.config_version <> ''
       AND a.cleanup_completed_at IS NULL
       AND a.cleanup_next_attempt_at <= clock_timestamp()
       AND (a.cleanup_owner IS NULL OR a.cleanup_lease_until <= clock_timestamp())
@@ -141,7 +148,7 @@ FROM candidates AS c
 WHERE a.artifact_id = c.artifact_id
 RETURNING a.artifact_id, a.tenant_id, a.app_id, a.session_principal_id,
           a.session_id, a.filename, a.version, a.object_key, a.mime_type,
-          a.size_bytes, a.status, COALESCE(NULLIF(a.config_version, ''), c.active_config_version),
+          a.size_bytes, a.status, a.config_version,
           a.created_at, a.updated_at, a.cleanup_attempts`,
 		owner,
 		intervalLiteral(leaseDuration),
@@ -167,8 +174,8 @@ RETURNING a.artifact_id, a.tenant_id, a.app_id, a.session_principal_id,
 	return candidates, nil
 }
 
-// ClaimInboundArtifactCleanup leases pre-admission objects that were deleted
-// by compensation or left pending beyond the bounded staging age. ATTACHED
+// ClaimInboundArtifactCleanup leases pre-admission objects that were deleted,
+// left pending, or left uploading after the uploader lease expired. ATTACHED
 // rows are excluded by SQL and cannot be reclaimed by this worker.
 func (s *Store) ClaimInboundArtifactCleanup(
 	ctx context.Context,
@@ -201,7 +208,12 @@ WITH candidates AS (
       AND (cleanup_owner IS NULL OR cleanup_lease_until <= clock_timestamp())
       AND (
           status = 'DELETED'
-          OR (status = 'PENDING' AND created_at <= $3)
+          OR (status = 'PENDING' AND updated_at <= $3)
+          OR (
+              status = 'UPLOADING'
+              AND upload_lease_until <= clock_timestamp()
+              AND updated_at <= $3
+          )
       )
     ORDER BY cleanup_next_attempt_at, updated_at, external_message_id, item_no
     FOR UPDATE SKIP LOCKED
@@ -209,6 +221,8 @@ WITH candidates AS (
 )
 UPDATE platform.inbound_artifact AS a
 SET status = 'DELETED',
+    upload_token = NULL,
+    upload_lease_until = NULL,
     cleanup_owner = $1,
     cleanup_lease_until = clock_timestamp() + $2::interval,
     cleanup_attempts = a.cleanup_attempts + 1,

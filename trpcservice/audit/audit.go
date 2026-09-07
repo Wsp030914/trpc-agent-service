@@ -54,6 +54,38 @@ type Sink interface {
 	Record(context.Context, Event) error
 }
 
+// WithControlPlaneActor carries only the stable, non-secret identity of the
+// authenticated administrator through repository calls. Raw credentials must
+// never be placed in this context.
+func WithControlPlaneActor(ctx context.Context, actorID, actorRole string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, controlPlaneActorContextKey{}, controlPlaneActor{
+		ID: actorID, Role: actorRole,
+	})
+}
+
+// ControlPlaneActorFromContext returns the authenticated control-plane actor,
+// if the caller crossed the admin authentication boundary.
+func ControlPlaneActorFromContext(ctx context.Context) (actorID, actorRole string, ok bool) {
+	if ctx == nil {
+		return "", "", false
+	}
+	actor, ok := ctx.Value(controlPlaneActorContextKey{}).(controlPlaneActor)
+	if !ok || actor.ID == "" || actor.Role == "" {
+		return "", "", false
+	}
+	return actor.ID, actor.Role, true
+}
+
+type controlPlaneActorContextKey struct{}
+
+type controlPlaneActor struct {
+	ID   string
+	Role string
+}
+
 // Event is the complete audit record. It deliberately has no raw request,
 // message, tool argument, provider target, secret, or artifact fields.
 type Event struct {

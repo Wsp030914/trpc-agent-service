@@ -44,13 +44,13 @@ func NewMigrationCopier(
 	record migration.Record,
 ) (*MigrationCopier, error) {
 	if configs == nil || secrets == nil || endpoints == nil {
-		return nil, errors.New("knowledge migration dependencies are required")
+		return nil, migration.NewPermanentError(errors.New("knowledge migration dependencies are required"))
 	}
 	if err := record.Validate(); err != nil {
-		return nil, err
+		return nil, migration.NewPermanentError(err)
 	}
 	if record.EffectiveDomain() != migration.DomainKnowledge {
-		return nil, errors.New("knowledge migration domain is required")
+		return nil, migration.NewPermanentError(errors.New("knowledge migration domain is required"))
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -69,17 +69,17 @@ func NewMigrationCopier(
 	}
 	sourceSettings, err := validateBackend(sourceConfig.BackendConfig.Knowledge)
 	if err != nil {
-		return nil, fmt.Errorf("validate source knowledge backend: %w", err)
+		return nil, migration.NewPermanentError(fmt.Errorf("validate source knowledge backend: %w", err))
 	}
 	targetSettings, err := validateBackend(targetConfig.BackendConfig.Knowledge)
 	if err != nil {
-		return nil, fmt.Errorf("validate target knowledge backend: %w", err)
+		return nil, migration.NewPermanentError(fmt.Errorf("validate target knowledge backend: %w", err))
 	}
 	if sourceSettings.embeddingDimensions != targetSettings.embeddingDimensions {
-		return nil, errors.New("knowledge migration source and target dimensions must match")
+		return nil, migration.NewPermanentError(errors.New("knowledge migration source and target dimensions must match"))
 	}
 	if sourceSettings.indexGeneration != targetSettings.indexGeneration {
-		return nil, errors.New("knowledge migration source and target index generations must match")
+		return nil, migration.NewPermanentError(errors.New("knowledge migration source and target index generations must match"))
 	}
 
 	scope := tenant.Scope{TenantID: record.TenantID, AppID: record.AppID}
@@ -88,14 +88,14 @@ func NewMigrationCopier(
 		return nil, fmt.Errorf("resolve source qdrant endpoint: %w", err)
 	}
 	if err := sourceEndpoint.Validate(); err != nil {
-		return nil, fmt.Errorf("validate source qdrant endpoint: %w", err)
+		return nil, migration.NewPermanentError(fmt.Errorf("validate source qdrant endpoint: %w", err))
 	}
 	targetEndpoint, err := endpoints.ResolveQdrantEndpoint(ctx, targetConfig.BackendConfig.Knowledge.Name)
 	if err != nil {
 		return nil, fmt.Errorf("resolve target qdrant endpoint: %w", err)
 	}
 	if err := targetEndpoint.Validate(); err != nil {
-		return nil, fmt.Errorf("validate target qdrant endpoint: %w", err)
+		return nil, migration.NewPermanentError(fmt.Errorf("validate target qdrant endpoint: %w", err))
 	}
 
 	sourceClient, err := newMigrationClient(ctx, secrets, scope, sourceConfig.BackendConfig.Knowledge, sourceEndpoint)
@@ -115,9 +115,12 @@ func NewMigrationCopier(
 		return nil, fmt.Errorf("check source qdrant collection: %w", err)
 	}
 	if !exists {
-		return nil, errors.New("source qdrant collection does not exist")
+		return nil, migration.NewPermanentError(errors.New("source qdrant collection does not exist"))
 	}
 	if err := validateMigrationCollection(ctx, sourceClient, sourceCollection, sourceSettings.embeddingDimensions); err != nil {
+		if errors.Is(err, frameworkqdrant.ErrCollectionMismatch) {
+			return nil, migration.NewPermanentError(fmt.Errorf("validate source qdrant collection: %w", err))
+		}
 		return nil, fmt.Errorf("validate source qdrant collection: %w", err)
 	}
 
@@ -133,6 +136,9 @@ func NewMigrationCopier(
 	}()
 	targetCollection := targetSettings.collectionName()
 	if err := validateMigrationCollection(ctx, targetClient, targetCollection, targetSettings.embeddingDimensions); err != nil {
+		if errors.Is(err, frameworkqdrant.ErrCollectionMismatch) {
+			return nil, migration.NewPermanentError(fmt.Errorf("validate target qdrant collection: %w", err))
+		}
 		return nil, fmt.Errorf("validate target qdrant collection: %w", err)
 	}
 
@@ -164,7 +170,7 @@ func newMigrationClient(
 			return nil, fmt.Errorf("resolve qdrant api key: %w", err)
 		}
 		if apiKey == "" {
-			return nil, errors.New("qdrant api key is required")
+			return nil, migration.NewPermanentError(errors.New("qdrant api key is required"))
 		}
 		options = append(options, qdrantstorage.WithAPIKey(apiKey))
 	}

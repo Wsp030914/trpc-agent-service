@@ -187,6 +187,7 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	if err != nil {
 		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
 	}
+	runtimeBuilder.SetExecutionLeaseValidator(deps.store)
 	metricsRecorder := deps.metrics
 	if metricsRecorder == nil {
 		metricsRecorder = deps.store.Metrics()
@@ -229,6 +230,7 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		deps.store.IsExecutionCanceled,
 	)
 	executor.ModelTimeout = deps.modelTimeout
+	executor.LeaseValidator = deps.store
 	executor.Audit = deps.store
 	executor.Metrics = metricsRecorder
 	executor.Approvals = deps.store
@@ -433,7 +435,7 @@ func (r *workerRuntime) runDataMigration(ctx context.Context, record migration.R
 			closeCopier = copier.Close
 			run = func(executeCtx context.Context) error {
 				return (migration.Executor{
-					Catalog:       r.store,
+					Catalog:       dataMigrationSessionCatalog{store: r.store, sessions: r.sessions},
 					Repository:    r.store,
 					Copier:        copier,
 					AfterCopy:     pauseAfterMigrationCopy(r.pauseAfterMigrationCopy),
@@ -491,7 +493,20 @@ func (r *workerRuntime) runDataMigration(ctx context.Context, record migration.R
 		return nil
 	}
 	if !copierCreated {
-		return r.failDataMigration(ctx, record, fmt.Errorf("create %s migration copier: %w", record.EffectiveDomain(), err))
+		persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer persistCancel()
+		record.LastFailureStage = "initialize"
+		record.FailureReason = platformlog.SafeError(err)
+		if migration.IsPermanentError(err) {
+			if transitionErr := r.store.AdvanceDataMigration(persistCtx, record, migration.StatusFailed); transitionErr != nil {
+				return errors.Join(fmt.Errorf("create %s migration copier: %w", record.EffectiveDomain(), err), fmt.Errorf("persist permanent migration failure: %w", transitionErr))
+			}
+			return nil
+		}
+		if releaseErr := r.store.ReleaseDataMigrationLease(persistCtx, record); releaseErr != nil {
+			return errors.Join(fmt.Errorf("create %s migration copier: %w", record.EffectiveDomain(), err), releaseErr)
+		}
+		return fmt.Errorf("create %s migration copier: %w", record.EffectiveDomain(), err)
 	}
 	log.Printf("data migration %s failed: %s", record.ID, platformlog.SafeError(err))
 	return nil
@@ -542,18 +557,6 @@ func (r *workerRuntime) renewDataMigrationLease(
 		}
 		return err
 	})
-}
-
-func (r *workerRuntime) failDataMigration(ctx context.Context, record migration.Record, cause error) error {
-	record.FailureReason = platformlog.SafeError(cause)
-	if err := r.store.AdvanceDataMigration(context.WithoutCancel(ctx), record, migration.StatusFailed); err != nil {
-		if errors.Is(err, migration.ErrLeaseLost) {
-			return nil
-		}
-		return fmt.Errorf("fail data migration: %w", err)
-	}
-	log.Printf("data migration %s failed: %s", record.ID, platformlog.SafeError(cause))
-	return nil
 }
 
 func renewLease(

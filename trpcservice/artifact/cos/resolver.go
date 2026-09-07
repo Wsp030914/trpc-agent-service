@@ -264,6 +264,18 @@ func (r *Resolver) resolveClient(
 	return client, nil
 }
 
+// ObjectKey returns the scoped key for one pre-admission object. Callers can
+// persist this key before uploading so a crash cannot leave an untracked blob.
+func (s *InboundObjectStore) ObjectKey(objectID string) (string, error) {
+	if s == nil || s.prefix == "" {
+		return "", errors.New("inbound object store is not initialized")
+	}
+	if objectID == "" || strings.ContainsAny(objectID, "/\\:\x00\r\n") {
+		return "", errors.New("inbound object id is invalid")
+	}
+	return s.prefix + ":" + objectID, nil
+}
+
 // Put stores one pre-admission object under an internally generated key.
 func (s *InboundObjectStore) Put(
 	ctx context.Context,
@@ -279,8 +291,11 @@ func (s *InboundObjectStore) Put(
 	if value == nil || len(value.Data) == 0 {
 		return "", errors.New("inbound artifact data is required")
 	}
-	key := s.prefix + ":" + objectID
-	_, err := s.client.Object.Put(ctx, key, bytes.NewReader(value.Data), &cosclient.ObjectPutOptions{
+	key, err := s.ObjectKey(objectID)
+	if err != nil {
+		return "", err
+	}
+	_, err = s.client.Object.Put(ctx, key, bytes.NewReader(value.Data), &cosclient.ObjectPutOptions{
 		ObjectPutHeaderOptions: &cosclient.ObjectPutHeaderOptions{
 			ContentType:        value.MimeType,
 			ContentDisposition: mime.FormatMediaType("attachment", map[string]string{"filename": value.Name}),

@@ -30,8 +30,9 @@ import (
 const productionInboundMediaLimit int64 = 32 << 20
 
 const (
-	wecomMediaRequestTimeout = 30 * time.Second
-	wecomMediaPort           = "443"
+	wecomMediaRequestTimeout           = 30 * time.Second
+	wecomMediaPort                     = "443"
+	inboundArtifactUploadRenewInterval = time.Minute
 )
 
 // NewIngestor creates the production media ingestor. Media is downloaded only
@@ -295,15 +296,11 @@ func (w inboundArtifactWriter) WriteInboundArtifact(
 	objectID := uuid.NewString()
 	artifactName := "inbound/" + objectID
 	artifactRef := "artifact://" + artifactName + "@0"
-	objectKey, err := objectStore.Put(ctx, objectID, &frameworkartifact.Artifact{
-		Data:     input.Data,
-		MimeType: input.MIMEType,
-		Name:     input.Filename,
-	})
+	objectKey, err := objectStore.ObjectKey(objectID)
 	if err != nil {
 		return "", false, err
 	}
-	staged, err := w.store.StageInboundArtifact(ctx, postgres.StagedInboundArtifact{
+	stagedInput := postgres.StagedInboundArtifact{
 		TenantID:          input.TenantID,
 		AppID:             input.AppID,
 		BindingID:         input.BindingID,
@@ -315,24 +312,92 @@ func (w inboundArtifactWriter) WriteInboundArtifact(
 		ObjectKey:         objectKey,
 		MIMEType:          input.MIMEType,
 		Size:              int64(len(input.Data)),
-	})
+	}
+	reserved, err := w.store.ReserveInboundArtifact(ctx, stagedInput)
+	if err != nil {
+		return "", false, err
+	}
+	if !reserved.Created {
+		switch reserved.Status {
+		case "PENDING", "ATTACHED":
+			return reserved.ArtifactRef, false, nil
+		case "UPLOADING":
+			return "", false, errors.New("inbound artifact upload is already in progress")
+		default:
+			return "", false, fmt.Errorf("inbound artifact status %q cannot be reused", reserved.Status)
+		}
+	}
+	objectKey, err = w.putInboundArtifact(ctx, objectStore, objectID, &frameworkartifact.Artifact{
+		Data:     input.Data,
+		MimeType: input.MIMEType,
+		Name:     input.Filename,
+	}, reserved)
+	if err != nil {
+		_, _, cleanupErr := w.store.MarkInboundArtifactDeleted(context.WithoutCancel(ctx), reserved)
+		if objectKey != "" {
+			cleanupErr = errors.Join(cleanupErr, objectStore.Delete(context.WithoutCancel(ctx), objectKey))
+		}
+		return "", false, errors.Join(err, cleanupErr)
+	}
+	if objectKey != reserved.ObjectKey {
+		_, _, cleanupErr := w.store.MarkInboundArtifactDeleted(context.WithoutCancel(ctx), reserved)
+		cleanupErr = errors.Join(cleanupErr, objectStore.Delete(context.WithoutCancel(ctx), objectKey))
+		return "", false, errors.Join(errors.New("inbound object key changed during upload"), cleanupErr)
+	}
+	staged, err := w.store.FinalizeInboundArtifactUpload(ctx, reserved)
 	if err != nil {
 		return "", false, errors.Join(err, objectStore.Delete(context.WithoutCancel(ctx), objectKey))
 	}
-	if !staged.Created {
-		if staged.ObjectKey != objectKey {
-			if deleteErr := objectStore.Delete(context.WithoutCancel(ctx), objectKey); deleteErr != nil {
-				return "", false, errors.Join(errors.New("inbound artifact idempotency object mismatch"), deleteErr)
+	return staged.ArtifactRef, true, nil
+}
+
+// putInboundArtifact keeps the durable upload reservation alive while the
+// object store may be slow. A renewal failure cancels the upload; the caller
+// then compensates the durable reservation without letting an unowned upload
+// reach PENDING.
+func (w inboundArtifactWriter) putInboundArtifact(
+	ctx context.Context,
+	objectStore *artifactcos.InboundObjectStore,
+	objectID string,
+	value *frameworkartifact.Artifact,
+	reserved postgres.StagedInboundArtifact,
+) (string, error) {
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopRenewal := make(chan struct{})
+	renewalResult := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(inboundArtifactUploadRenewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopRenewal:
+				renewalResult <- nil
+				return
+			case <-uploadCtx.Done():
+				renewalResult <- uploadCtx.Err()
+				return
+			case <-ticker.C:
+				if err := w.store.RenewInboundArtifactUpload(uploadCtx, reserved); err != nil {
+					cancel()
+					renewalResult <- err
+					return
+				}
 			}
 		}
-		return staged.ArtifactRef, false, nil
-	}
-	if staged.ObjectKey != objectKey {
-		if deleteErr := objectStore.Delete(context.WithoutCancel(ctx), objectKey); deleteErr != nil {
-			return "", false, errors.Join(errors.New("inbound artifact idempotency object mismatch"), deleteErr)
+	}()
+
+	objectKey, putErr := objectStore.Put(uploadCtx, objectID, value)
+	close(stopRenewal)
+	renewalErr := <-renewalResult
+	if renewalErr != nil {
+		renewalErr = fmt.Errorf("renew inbound artifact upload: %w", renewalErr)
+		if putErr != nil {
+			return objectKey, errors.Join(putErr, renewalErr)
 		}
+		return objectKey, renewalErr
 	}
-	return staged.ArtifactRef, true, nil
+	return objectKey, putErr
 }
 
 // DeleteInboundArtifact compensates a pre-admission upload. The durable stage

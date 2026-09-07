@@ -7,6 +7,11 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
+// ErrSessionLeaseLost means the shared session lock was lost while the
+// execution was running. The caller must not treat the resulting cancellation
+// as an ordinary permanent failure.
+var ErrSessionLeaseLost = errors.New("session lease lost")
+
 // RetryableExecutionError marks a failure that is safe to try again before a
 // runner has started any externally visible work.
 type RetryableExecutionError struct{ Err error }

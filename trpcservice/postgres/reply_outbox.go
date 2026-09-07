@@ -100,12 +100,25 @@ func (s *Store) ClaimReplies(
 	if limit <= 0 {
 		limit = 32
 	}
+	// Recover an expired sender lease inside the same transaction boundary as
+	// claiming. The periodic recovery pass can race with lease expiry, so a
+	// stale SENDING row must never be reclassified as a permanently failed
+	// binding change before it becomes UNCERTAIN.
+	if _, err := s.pool.Exec(ctx, `
+UPDATE platform.reply_outbox
+SET status = 'UNCERTAIN', lease_owner = NULL, lease_until = NULL,
+    last_error_type = 'provider_result_unknown',
+    last_error = 'reply sender lease expired before result was recorded',
+    updated_at = clock_timestamp()
+WHERE status = 'SENDING' AND lease_until <= clock_timestamp()`); err != nil {
+		return nil, fmt.Errorf("recover expired reply leases: %w", err)
+	}
 	if _, err := s.pool.Exec(ctx, `
 UPDATE platform.reply_outbox o
 SET status = 'PERMANENTLY_FAILED', lease_owner = NULL, lease_until = NULL,
     last_error_type = 'binding_changed', last_error = 'binding authorization changed',
     updated_at = clock_timestamp()
-WHERE (o.status = 'PENDING' OR (o.status = 'SENDING' AND o.lease_until <= clock_timestamp()))
+WHERE o.status = 'PENDING'
   AND EXISTS (
       SELECT 1
       FROM platform.channel_binding b

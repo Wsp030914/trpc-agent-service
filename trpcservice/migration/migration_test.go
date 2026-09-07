@@ -1,11 +1,23 @@
 package migration_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration"
 )
+
+func TestPermanentErrorPreservesCauseAndClassification(t *testing.T) {
+	cause := errors.New("invalid backend dimension")
+	err := migration.NewPermanentError(cause)
+	if !migration.IsPermanentError(err) {
+		t.Fatal("permanent error was not classified as permanent")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("permanent error %v does not preserve cause", err)
+	}
+}
 
 func TestRecordTransitionsFollowMigrationLifecycle(t *testing.T) {
 	record := migration.Record{

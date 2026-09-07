@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/liuzengh/trpc-agent-service/internal/e2e"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
 	platformapproval "github.com/liuzengh/trpc-agent-service/trpcservice/approval"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
@@ -165,15 +165,53 @@ func run(parent context.Context) error {
 		return fmt.Errorf("issue data-plane credential: %w", err)
 	}
 	requestID := "admin-ui-e2e-" + runID
-	responseStatus, err := postGatewayRequest(ctx, client, gatewayURL, issued.APIKey, requestID)
-	if err != nil {
-		return fmt.Errorf("submit approval execution: %w", err)
-	}
-	if responseStatus < http.StatusOK || responseStatus >= http.StatusMultipleChoices {
-		return fmt.Errorf("gateway approval request status=%d", responseStatus)
-	}
+	// Approval keeps the original durable HTTP request open until its
+	// continuation completes. The fixture only needs the admission and pending
+	// approval record, so submit it asynchronously and cancel the disposable
+	// client request after the durable state reaches WAITING_APPROVAL.
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	defer cancelRequest()
+	responseCh := make(chan struct {
+		status int
+		body   []byte
+		err    error
+	}, 1)
+	go func() {
+		status, body, requestErr := postGatewayRequest(requestCtx, client, gatewayURL, issued.APIKey, requestID)
+		responseCh <- struct {
+			status int
+			body   []byte
+			err    error
+		}{status: status, body: body, err: requestErr}
+	}()
 	if err := waitExecutionStatus(ctx, pool, tenantID, appID, requestID, "WAITING_APPROVAL"); err != nil {
 		return fmt.Errorf("wait approval execution: %w", err)
+	}
+	cancelRequest()
+	select {
+	case response := <-responseCh:
+		if response.err != nil && !errors.Is(response.err, context.Canceled) {
+			return fmt.Errorf("submit approval execution: %w", response.err)
+		}
+		if response.err == nil {
+			if response.status >= http.StatusOK && response.status < http.StatusMultipleChoices {
+				projection, projectionErr := e2e.DecodeChatCompletion(response.body, true)
+				if projectionErr != nil || projection.Kind != e2e.ProjectionToolCall {
+					if projectionErr == nil {
+						projectionErr = errors.New("response is not an approval tool-call projection")
+					}
+					return fmt.Errorf("gateway approval response projection: %w", projectionErr)
+				}
+			} else if response.status == http.StatusInternalServerError {
+				if err := e2e.DecodeOpenAIError(response.body); err != nil {
+					return fmt.Errorf("gateway approval failure response: %w", err)
+				}
+			} else {
+				return fmt.Errorf("gateway approval request status=%d", response.status)
+			}
+		}
+	case <-time.After(time.Second):
+		return errors.New("approval request did not stop after durable approval wait")
 	}
 	approvalID, err := waitApproval(ctx, store, tenantID, appID, requestID)
 	if err != nil {
@@ -228,7 +266,9 @@ func getStatus(ctx context.Context, client *http.Client, endpoint, token string)
 		return 0, err
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, response.Body)
+	if _, err := e2e.ReadBody(response.Body); err != nil {
+		return 0, err
+	}
 	return response.StatusCode, nil
 }
 
@@ -253,21 +293,21 @@ func postJSONResponse(ctx context.Context, client *http.Client, endpoint, token 
 		return nil, err
 	}
 	defer response.Body.Close()
-	body, readErr := io.ReadAll(response.Body)
+	body, readErr := e2e.ReadBody(response.Body)
 	if readErr != nil {
 		return nil, readErr
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("status=%d body=%s", response.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("status=%d", response.StatusCode)
 	}
 	return body, nil
 }
 
-func postGatewayRequest(ctx context.Context, client *http.Client, gatewayURL, apiKey, requestID string) (int, error) {
+func postGatewayRequest(ctx context.Context, client *http.Client, gatewayURL, apiKey, requestID string) (int, []byte, error) {
 	body := bytes.NewBufferString(`{"model":"ignored","messages":[{"role":"user","content":"admin ui approval"}]}`)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, gatewayURL+"/v1/chat/completions", body)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+apiKey)
 	request.Header.Set("X-Request-ID", requestID)
@@ -275,11 +315,14 @@ func postGatewayRequest(ctx context.Context, client *http.Client, gatewayURL, ap
 	request.Header.Set("X-Session-ID", "admin-ui-session")
 	response, err := client.Do(request)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, response.Body)
-	return response.StatusCode, nil
+	responseBody, err := e2e.ReadBody(response.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return response.StatusCode, responseBody, nil
 }
 
 func waitExecutionStatus(ctx context.Context, pool *pgxpool.Pool, tenantID, appID, requestID, wanted string) error {

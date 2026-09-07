@@ -17,6 +17,10 @@ type Resolver interface {
 	Close() error
 }
 
+type sessionKeyLister interface {
+	ListSessionKeys(context.Context, worker.Execution) ([]frameworksession.Key, error)
+}
+
 // Router selects a Session resolver by backend provider.
 type Router struct {
 	postgres Resolver
@@ -100,6 +104,22 @@ func (r *Router) ResolveSession(ctx context.Context, exec worker.Execution) (fra
 		return nil, fmt.Errorf("session provider %q is not configured", provider)
 	}
 	return resolver.ResolveSession(ctx, exec)
+}
+
+// ListSessionKeys returns the backend-owned inventory needed by migration.
+// Only Redis has a backend key inventory; SQL inventory remains in PostgreSQL.
+func (r *Router) ListSessionKeys(ctx context.Context, exec worker.Execution) ([]frameworksession.Key, error) {
+	if r == nil {
+		return nil, errors.New("session router is not initialized")
+	}
+	if exec.Config.BackendConfig.Session.Provider != redisProvider {
+		return nil, fmt.Errorf("session provider %q does not expose redis inventory", exec.Config.BackendConfig.Session.Provider)
+	}
+	lister, ok := r.redis.(sessionKeyLister)
+	if !ok {
+		return nil, errors.New("redis session provider does not support inventory")
+	}
+	return lister.ListSessionKeys(ctx, exec)
 }
 
 // Close closes all configured providers owned by Router.

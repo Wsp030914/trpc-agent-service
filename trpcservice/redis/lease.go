@@ -51,7 +51,8 @@ func NewSessionLocker(client *Client, ttl time.Duration) (*SessionLocker, error)
 	return &SessionLocker{client: client.client, ttl: ttl}, nil
 }
 
-// Lock waits for one partition's lease. Losing lease renewal cancels Context.
+// Lock waits for one partition's lease. Losing lease renewal cancels Context
+// with worker.ErrSessionLeaseLost as its cause.
 func (l *SessionLocker) Lock(ctx context.Context, partitionKey string) (worker.SessionLock, error) {
 	if l == nil || l.client == nil {
 		return nil, errors.New("redis session locker is not initialized")
@@ -85,7 +86,7 @@ func (l *SessionLocker) Lock(ctx context.Context, partitionKey string) (worker.S
 		case <-timer.C:
 		}
 	}
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancelCause(ctx)
 	lease := &sessionLease{
 		client: l.client,
 		key:    key,
@@ -106,7 +107,7 @@ type sessionLease struct {
 	token  string
 	ttl    time.Duration
 	runCtx context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 	stop   chan struct{}
 	done   chan struct{}
 
@@ -120,7 +121,7 @@ func (l *sessionLease) Release() error {
 	l.once.Do(func() {
 		close(l.stop)
 		<-l.done
-		l.cancel()
+		l.cancel(nil)
 		ctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
 		defer cancel()
 		if _, err := releaseLeaseScript.Run(ctx, l.client, []string{l.key}, l.token).Result(); err != nil {
@@ -147,7 +148,7 @@ func (l *sessionLease) renew() {
 			result, err := renewLeaseScript.Run(ctx, l.client, []string{l.key}, l.token, l.ttl.Milliseconds()).Int()
 			cancel()
 			if err != nil || result != leaseRenewSuccessCode {
-				l.cancel()
+				l.cancel(worker.ErrSessionLeaseLost)
 				return
 			}
 		}

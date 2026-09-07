@@ -182,6 +182,7 @@ type Runtime struct {
 	artifacts *platformartifact.ExecutionResolver
 	knowledge *knowledgeqdrant.Resolver
 	tools     *ToolCatalog
+	lease     worker.ExecutionLeaseValidator
 	audit     platformaudit.Sink
 	metrics   *platformmetrics.Recorder
 }
@@ -194,6 +195,15 @@ func (r *Runtime) SetObservability(auditSink platformaudit.Sink, metricsRecorder
 	}
 	r.audit = auditSink
 	r.metrics = metricsRecorder
+}
+
+// SetExecutionLeaseValidator attaches the authoritative execution fence used
+// by Tool permission checks and Session writes.
+func (r *Runtime) SetExecutionLeaseValidator(validator worker.ExecutionLeaseValidator) {
+	if r == nil {
+		return
+	}
+	r.lease = validator
 }
 
 // NewRuntime creates a runner builder that assembles LLMAgent,
@@ -318,9 +328,10 @@ func (r *Runtime) BuildRunner(
 		)
 	}
 	sessionService = &tracedSessionService{
-		Service: sessionService,
-		exec:    exec,
-		metrics: r.metrics,
+		Service:        sessionService,
+		exec:           exec,
+		metrics:        r.metrics,
+		leaseValidator: r.lease,
 	}
 	agentOptions := []llmagent.Option{
 		llmagent.WithModel(modelRuntime.Model),

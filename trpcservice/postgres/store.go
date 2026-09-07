@@ -294,7 +294,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		return fmt.Errorf("create api credential: %w", err)
 	}
 	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
-		credential.TenantID, credential.AppID, "control-plane",
+		ctx, credential.TenantID, credential.AppID, "control-plane",
 		platformaudit.CredentialIssued, "issued",
 	)); err != nil {
 		return err
@@ -347,7 +347,7 @@ WHERE tenant_id = $1 AND app_id = $2 AND credential_id = $3`,
 		return fmt.Errorf("api credential: %w", ErrNotFound)
 	}
 	if err := recordControlPlaneAuditTx(ctx, tx, controlPlaneAuditEvent(
-		tenantID, appID, "control-plane", platformaudit.CredentialRevoked, "revoked",
+		ctx, tenantID, appID, "control-plane", platformaudit.CredentialRevoked, "revoked",
 	)); err != nil {
 		return err
 	}

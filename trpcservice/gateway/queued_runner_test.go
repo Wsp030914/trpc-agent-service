@@ -36,9 +36,10 @@ func TestQueuedRunnerAdmitsAuthenticatedContextAndForwardsPersistedEvents(t *tes
 	source := &staticExecutionEventSource{events: []gateway.ExecutionEvent{{
 		Sequence: 1,
 		Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
-			ID:     "event-1",
-			Object: model.ObjectTypeRunnerCompletion,
-			Done:   true,
+			ID:      "event-1",
+			Object:  model.ObjectTypeChatCompletion,
+			Done:    true,
+			Choices: []model.Choice{{Message: model.NewAssistantMessage("accepted")}},
 		}),
 	}}}
 	queued, err := gateway.NewQueuedRunner(gateway.New(admitter), source)
@@ -69,6 +70,115 @@ func TestQueuedRunnerAdmitsAuthenticatedContextAndForwardsPersistedEvents(t *tes
 	}
 	if source.scope != identity.Tenant.Scope() || source.requestID != "request-queued-1" || source.after != 0 {
 		t.Fatalf("event subscription = %#v", source)
+	}
+}
+
+func TestQueuedRunnerSkipsInternalEventsWhenReplayingExecution(t *testing.T) {
+	identity := validAdmissionIdentity()
+	ctx, err := gateway.ContextWithAuthenticatedRequest(context.Background(), gateway.AuthenticatedRequest{
+		RequestID:      "request-queued-replay",
+		IdempotencyKey: "idempotency-queued-replay",
+		Tenant: staticTenantResolver{
+			tenant:       identity.Tenant,
+			source:       identity.Source,
+			identity:     identity,
+			withIdentity: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("attach authenticated request: %v", err)
+	}
+	source := &staticExecutionEventSource{events: []gateway.ExecutionEvent{
+		{Sequence: 1, Event: event.New("invocation-1", "assistant")},
+		{Sequence: 2, Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+			Object:  model.ObjectTypeChatCompletion,
+			Done:    true,
+			Choices: []model.Choice{{Message: model.NewAssistantMessage("recovered")}},
+		})},
+		{Sequence: 3, Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+			Object: model.ObjectTypeRunnerCompletion,
+			Done:   true,
+		})},
+	}}
+	queued, err := gateway.NewQueuedRunner(
+		gateway.New(&captureAdmitter{result: gateway.AdmissionResult{
+			RequestID: "request-queued-replay", ConfigVersion: "v1", TurnSeq: 1,
+		}}),
+		source,
+	)
+	if err != nil {
+		t.Fatalf("new queued runner: %v", err)
+	}
+
+	forwarded, err := queued.Run(ctx, "", "", model.NewUserMessage("hello"))
+	if err != nil {
+		t.Fatalf("run queued request: %v", err)
+	}
+	var got []*event.Event
+	for evt := range forwarded {
+		got = append(got, evt)
+	}
+	if len(got) != 1 || got[0].Response == nil ||
+		got[0].Response.Object != model.ObjectTypeChatCompletion {
+		t.Fatalf("forwarded replay events = %#v", got)
+	}
+}
+
+func TestQueuedRunnerProjectsOnlyClientCompletionEvents(t *testing.T) {
+	identity := validAdmissionIdentity()
+	ctx, err := gateway.ContextWithAuthenticatedRequest(context.Background(), gateway.AuthenticatedRequest{
+		RequestID: "request-queued-projection", IdempotencyKey: "idempotency-queued-projection",
+		Tenant: staticTenantResolver{
+			tenant: identity.Tenant, source: identity.Source, identity: identity, withIdentity: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("attach authenticated request: %v", err)
+	}
+	source := &staticExecutionEventSource{events: []gateway.ExecutionEvent{
+		{Sequence: 1, Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+			Object:  model.ObjectTypeChatCompletionChunk,
+			Choices: []model.Choice{{Delta: model.Message{Role: model.RoleAssistant, Content: "part"}}},
+		})},
+		{Sequence: 2, Event: event.NewResponseEvent("invocation-1", "tool", &model.Response{
+			Object:  model.ObjectTypeChatCompletion,
+			Choices: []model.Choice{{Message: model.Message{ToolID: "tool-1"}}},
+		})},
+		{Sequence: 3, Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+			Object: model.ObjectTypeError,
+			Done:   true,
+			Error:  &model.ResponseError{Type: "internal", Message: "internal failure"},
+		})},
+		{Sequence: 4, Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+			Object:  model.ObjectTypeChatCompletion,
+			Done:    true,
+			Choices: []model.Choice{{Message: model.NewAssistantMessage("final")}},
+		})},
+		{Sequence: 5, Event: event.NewResponseEvent("invocation-1", "assistant", &model.Response{
+			Object: model.ObjectTypeRunnerCompletion,
+			Done:   true,
+		})},
+	}}
+	queued, err := gateway.NewQueuedRunner(
+		gateway.New(&captureAdmitter{result: gateway.AdmissionResult{
+			RequestID: "request-queued-projection", ConfigVersion: "v1", TurnSeq: 1,
+		}}),
+		source,
+	)
+	if err != nil {
+		t.Fatalf("new queued runner: %v", err)
+	}
+	forwarded, err := queued.Run(ctx, "", "", model.NewUserMessage("hello"))
+	if err != nil {
+		t.Fatalf("run queued request: %v", err)
+	}
+	var got []*event.Event
+	for evt := range forwarded {
+		got = append(got, evt)
+	}
+	if len(got) != 2 || got[0].Response == nil || got[0].Response.Object != model.ObjectTypeChatCompletionChunk ||
+		got[1].Response == nil || got[1].Response.Object != model.ObjectTypeChatCompletion {
+		t.Fatalf("forwarded projection events = %#v", got)
 	}
 }
 
