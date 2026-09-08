@@ -1,6 +1,6 @@
 # trpc-agent-service 文档
 
-这套文档描述当前工作区中的真实实现，而不是目标架构或历史设计。实现基线包括 Go 源码、PostgreSQL migrations、测试、Compose/Kubernetes 部署文件、GitHub Actions、Admin UI 与脚本。文档中的“已验证”只指仓库内存在可执行的单元/集成/E2E 证据；真实第三方账号、真实生产 Kubernetes 与生产容量若没有仓库证据，会明确标为 `EXTERNAL_VERIFICATION_NOT_INCLUDED`。
+这套文档描述当前工作区中的真实实现，而不是目标架构或历史设计。实现基线包括 Go 源码、PostgreSQL migrations、测试、Compose/Kubernetes 部署文件、GitHub Actions、Admin UI 与脚本。本次工作区还保存了本机真实企业微信/飞书、Compose 和可观测性验收证据；真实生产 Kubernetes、生产容量和未执行的外部场景仍明确标为 `EXTERNAL_VERIFICATION_NOT_INCLUDED`。
 
 ## 阅读顺序
 
@@ -12,6 +12,8 @@
 6. [后端适配](backend-adaptation.md)：核对当前实际可用的 Session、Memory、Knowledge、Artifact、队列和模型后端。
 7. [部署](deployment.md)、[容量](capacity.md)、[风险登记](risk-register.md)：用于落地和运维评审。
 8. [验收矩阵](acceptance.md)：最终查看 Requirement、证据、限制和状态。
+
+本机外部验收截图入口：[`acceptance-status.png`](acceptance-screenshots/acceptance-status.png)。
 
 ## 文档入口索引
 
@@ -46,4 +48,4 @@
 
 ## 状态约定
 
-`IMPLEMENTED` 表示代码/部署路径已经存在，但当前证据不足以把它标成仓库验证；`REPO_VERIFIED` 表示可由仓库内源码、静态检查、单测、集成测试、E2E 测试或 CI Workflow 证据核对；`EXTERNALLY_VERIFIED` 只表示仓库中保存了可复核的真实 Provider、真实 IM、真实 Kubernetes/HA 或容量报告；`EXTERNAL_VERIFICATION_NOT_INCLUDED` 表示实现边界明确，但仓库没有外部运行证据；`NOT_APPLICABLE` 表示该项不是当前实现路径的适用项。
+`IMPLEMENTED` 表示代码/部署路径已经存在，但当前证据不足以把它标成仓库验证；`REPO_VERIFIED` 表示可由仓库内源码、静态检查、单测、集成测试、E2E 测试或 CI Workflow 证据核对；`EXTERNALLY_VERIFIED` 表示仓库中保存了可复核的真实运行证据，括号后缀用于限定是本机 Compose、真实 IM 或其它范围；`EXTERNAL_VERIFICATION_NOT_INCLUDED` 表示实现边界明确，但仓库没有对应外部运行证据；`NOT_APPLICABLE` 表示该项不是当前实现路径的适用项。

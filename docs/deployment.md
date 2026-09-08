@@ -2,7 +2,7 @@
 
 部署事实来自 `Dockerfile`、`compose.yaml`、`compose.*-e2e.yaml`、`deploy/kubernetes`、`deploy/otel`、`admin-ui/Dockerfile` 和 `.github/workflows`。应用角色启动时执行 PostgreSQL schema migration；Kubernetes 发布通过 Kustomize overlay 完成。
 
-验证边界：本文件描述已实现的 Compose/Kustomize 拓扑；仓库中没有真实生产集群、HA backend、SecretProvider、Ingress 或发布恢复报告，因此相关状态为 `IMPLEMENTED` / `EXTERNAL_VERIFICATION_NOT_INCLUDED`，不写成 `EXTERNALLY_VERIFIED`。
+验证边界：本文件描述已实现的 Compose/Kustomize 拓扑。本机 Compose、真实企业微信/飞书文本收发和本地 Jaeger/Prometheus/Grafana 已在 2026-09-09 外部验收；真实生产集群、HA backend、SecretProvider、Ingress 或发布恢复仍未验证。证据见 [`docs/acceptance.md`](acceptance.md) 和 [`acceptance-screenshots`](acceptance-screenshots/acceptance-status.png)。
 
 ## 本地最小运行
 
@@ -20,6 +20,26 @@ docker compose --env-file .env.example up -d --build --wait admin-ui otel-collec
 ```
 
 本地 Compose 实际包含：PostgreSQL 16、Redis 7（AOF）、Qdrant 1.16、OTel Collector 0.111、Jaeger 1.57、Gateway、单一 Channel owner、两个显式 Worker 和 Admin UI。Gateway 端口默认 `127.0.0.1:8080`，Admin UI 默认 `127.0.0.1:4173`；数据库、Redis、Qdrant 和观测端口也绑定 loopback。
+
+## Docker Quick Start Golden Path
+
+验收人 clone 仓库后只需安装 Docker 和 Docker Compose；脚本会把 `cmd/deployment-e2e` 编译到 `Dockerfile.quickstart` 镜像内，不要求本机安装 Go，也不需要真实模型或 IM 凭据：
+
+```bash
+# Linux / macOS / Git Bash
+./scripts/quickstart.sh
+
+# Windows PowerShell
+.\scripts\quickstart.ps1
+```
+
+两个脚本使用同一组 Compose 文件：`compose.yaml`、`compose.deployment-e2e.yaml` 和 `compose.quickstart.yaml`。后者仅增加一次性 `quickstart` runner；依赖启动后，runner 复用现有 `cmd/deployment-e2e` 完成 Tenant/App/Config 创建、临时 Credential 签发、`/v1/chat/completions` 请求和 durable execution `SUCCEEDED` 校验。默认 Worker 使用现有 deterministic E2E model。成功输出为 `Golden Path PASSED`；脚本只清理名为 `trpc-agent-service-quickstart` 的 Compose 项目及其 disposable 卷。
+
+## 本机外部验收结果
+
+本次使用真实企业微信/飞书账号和真实模型完成文本消息收发：两端客户端均收到回复，并保存了客户端截图；对应 execution 为 `SUCCEEDED`，`reply_outbox` 为 `SENT` 且有 Provider receipt。Jaeger Trace、Prometheus target/指标和 Grafana 运行面板也已实测。截图证据集中在 [`acceptance-screenshots`](acceptance-screenshots/acceptance-status.png)。
+
+该结果只覆盖本机 Compose 和本次账号/网络；Kubernetes Pods/HPA、生产 HA、生产容量、重投/撤回和生产 SecretProvider 不在本次验收范围。
 
 ## Compose 拓扑和启动依赖
 
@@ -88,4 +108,4 @@ Kubernetes base：readiness 每 5s、timeout 3s、failure 6 次；liveness 每 1
 
 应用层灰度由 Admin API 的 ConfigVersion canary 完成：按稳定 Session principal/session hash 分流，支持 pause/disable/rollback/promote。Kubernetes overlay 使用普通 RollingUpdate 和不可变 image digest；代码镜像回滚与 Backend 数据回滚分开处理，target Backend 切换后按数据迁移策略完成 authority 对账。Admin UI 的 Jaeger 链接由构建参数 `VITE_JAEGER_URL` 注入；未配置时只显示 Trace ID，不猜测 `localhost` 地址。
 
-部署 Workflow 覆盖可渲染清单、Compose golden path、一次 Worker restart 后继续服务和敏感证据扫描；生产 Kubernetes admission、Ingress、secret 注入、Provider 网络、HA PostgreSQL/Redis/Qdrant 和发布恢复不由这些仓库证据直接证明。Gateway 可多副本；Channel Adapter 是单副本 `Recreate` owner，不能随 Gateway HPA 一起扩展。当前没有 distributed binding lease/leader election/channel sharding；若需要多 Channel owner，需另行设计并验证。
+部署 Workflow 覆盖可渲染清单、Compose golden path、一次 Worker restart 后继续服务和敏感证据扫描；本机 Compose 与真实 IM/观测链路已有外部验收证据。生产 Kubernetes admission、Ingress、secret 注入、Provider 网络、HA PostgreSQL/Redis/Qdrant 和发布恢复仍不由这些证据直接证明。Gateway 可多副本；Channel Adapter 是单副本 `Recreate` owner，不能随 Gateway HPA 一起扩展。当前没有 distributed binding lease/leader election/channel sharding；若需要多 Channel owner，需另行设计并验证。
