@@ -517,6 +517,45 @@ func TestWaitForGatewayShutdownPreservesReplyExit(t *testing.T) {
 	}
 }
 
+func TestWaitForGatewayShutdownIgnoresComponentCancellation(t *testing.T) {
+	tests := []struct {
+		name   string
+		assign func(<-chan error) (<-chan error, <-chan error)
+	}{
+		{
+			name: "relay",
+			assign: func(done <-chan error) (<-chan error, <-chan error) {
+				return done, nil
+			},
+		},
+		{
+			name: "provider",
+			assign: func(done <-chan error) (<-chan error, <-chan error) {
+				return nil, done
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			componentDone := make(chan error, 1)
+			componentDone <- context.Canceled
+			relayDone, providerDone := tt.assign(componentDone)
+			service := &serviceServer{
+				done:      make(chan struct{}),
+				readiness: &readinessState{},
+			}
+
+			result, replyErr, replyStopped := waitForGatewayShutdown(
+				context.Background(), service, time.Second, relayDone, providerDone, nil,
+			)
+			if result != nil || replyErr != nil || replyStopped {
+				t.Fatalf("gateway shutdown = result=%v reply=%v stopped=%t", result, replyErr, replyStopped)
+			}
+		})
+	}
+}
+
 func TestEnvironmentSecretsAreScoped(t *testing.T) {
 	scope := tenant.Scope{TenantID: "tenant-a", AppID: "app-a"}
 	ref := tenant.SecretRef{Name: "model-key", Version: "v1"}

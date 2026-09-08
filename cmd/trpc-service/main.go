@@ -702,10 +702,10 @@ func waitForGatewayShutdown(
 	select {
 	case err := <-relayDone:
 		server.MarkNotReady()
-		return err, nil, false
+		return nonCancellationError(err), nil, false
 	case err := <-providerDone:
 		server.MarkNotReady()
-		return err, nil, false
+		return nonCancellationError(err), nil, false
 	case err := <-replyDone:
 		server.MarkNotReady()
 		return nil, err, true
@@ -765,12 +765,12 @@ func runWorkerUntilShutdown(
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
 		cancelAux()
-		cause = err
+		cause = nonCancellationError(err)
 	case err := <-providerDone:
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
 		cancelAux()
-		cause = err
+		cause = nonCancellationError(err)
 	case err := <-done:
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
