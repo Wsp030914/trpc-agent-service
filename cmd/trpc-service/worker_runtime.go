@@ -10,7 +10,6 @@ import (
 
 	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
 	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
-	channeloutbound "github.com/liuzengh/trpc-agent-service/trpcservice/channels/outbound"
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	memorytencentdb "github.com/liuzengh/trpc-agent-service/trpcservice/memory/tencentdb"
@@ -35,8 +34,6 @@ type workerRuntime struct {
 	postgresSessions            *sessionpostgres.SessionResolver
 	memories                    *memorytencentdb.Resolver
 	knowledge                   *knowledgeqdrant.Resolver
-	replyProviders              *channeloutbound.Resolver
-	replySender                 *worker.ReplySender
 	artifactCleanup             *platformartifact.CleanupWorker
 	store                       *postgres.Store
 	secrets                     platformsecret.SecretProvider
@@ -197,30 +194,9 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	if err != nil {
 		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
 	}
-	replyLimiter, err := platformredis.NewReplyRateLimiter(
-		deps.redisClient,
-		defaultReplyRateLimit,
-		defaultReplyRateLimitWindow,
-	)
-	if err != nil {
-		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
-	}
-	replyProviders, err := channeloutbound.NewResolver(deps.store, secrets, replyLimiter)
-	if err != nil {
-		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
-	}
 	events, err := postgres.NewExecutionEventJournal(deps.store, postgres.WithReplyEventBuilder(worker.BuildReplyEvent))
 	if err != nil {
-		return nil, joinCloseError(err, replyProviders.Close, knowledge.Close, memories.Close, sessionRouter.Close)
-	}
-	replySender, err := worker.NewReplySender(
-		deps.store,
-		deps.store.ResolveReplyTarget,
-		replyProviders.ResolveReplyProvider,
-		worker.ReplySenderOptions{Owner: deps.owner, Metrics: metricsRecorder},
-	)
-	if err != nil {
-		return nil, joinCloseError(err, replyProviders.Close, knowledge.Close, memories.Close, sessionRouter.Close)
+		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
 	}
 	executor := worker.New(
 		deps.store,
@@ -247,7 +223,7 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	}
 	consumer, err := worker.NewConsumerWithOptions(executor, deps.stream, deps.store, deps.owner, consumerOptions)
 	if err != nil {
-		return nil, joinCloseError(err, replyProviders.Close, knowledge.Close, memories.Close, sessionRouter.Close)
+		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
 	}
 	return &workerRuntime{
 		consumer:                    consumer,
@@ -255,8 +231,6 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 		postgresSessions:            sessions,
 		memories:                    memories,
 		knowledge:                   knowledge,
-		replyProviders:              replyProviders,
-		replySender:                 replySender,
 		artifactCleanup:             artifactCleanup,
 		store:                       deps.store,
 		secrets:                     secrets,
@@ -309,7 +283,7 @@ func (r *workerRuntime) close() error {
 	if r == nil {
 		return nil
 	}
-	return errors.Join(r.replyProviders.Close(), r.sessions.Close(), r.memories.Close(), r.knowledge.Close())
+	return errors.Join(r.sessions.Close(), r.memories.Close(), r.knowledge.Close())
 }
 
 func (r *workerRuntime) runDataMigrations(ctx context.Context) error {

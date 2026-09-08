@@ -46,8 +46,10 @@ type serviceServer struct {
 	done      chan struct{}
 	readiness *readinessState
 
-	mu       sync.Mutex
-	serveErr error
+	mu           sync.Mutex
+	serveErr     error
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 func startServiceServer(
@@ -133,11 +135,15 @@ func (s *serviceServer) shutdown(ctx context.Context) error {
 	if s == nil || s.server == nil {
 		return nil
 	}
-	s.MarkNotReady()
-	if err := s.server.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
-	}
-	return s.wait()
+	s.shutdownOnce.Do(func() {
+		s.MarkNotReady()
+		if err := s.server.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.shutdownErr = err
+			return
+		}
+		s.shutdownErr = s.wait()
+	})
+	return s.shutdownErr
 }
 
 func (s *serviceServer) wait() error {

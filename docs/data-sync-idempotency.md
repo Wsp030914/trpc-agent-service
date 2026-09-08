@@ -2,6 +2,8 @@
 
 本系统把“同一请求只创建一个权威 execution”“同一 Session 有序”“外部副作用不被错误重放”分别处理。各层是 at-least-once 或 idempotent 的边界，不把全链路包装成 exactly-once。
 
+Channel ownership 是部署边界，不是队列调度边界：Gateway HTTP 可多副本，Channel Adapter 在独立单副本进程中接收官方 WebSocket/long connection，再调用现有 Gateway Admission。Channel 不发现 Worker、不直接执行 Runner；单 owner 之外没有 binding lease、leader election 或 sharding。
+
 ## 1. Admission 和 Session 顺序
 
 Gateway 不做内存队列后返回成功。PostgreSQL `Store.Admit` 是 Admission 线性化点，在一个事务中完成：
@@ -17,11 +19,11 @@ Gateway 不做内存队列后返回成功。PostgreSQL `Store.Admit` 是 Admissi
 
 Runner 运行时产生 framework event。Worker 不在释放 Session lease 后再异步写这些 event，而是先持续排空 Runner channel，再在 execution fence 有效时写 `execution_event(event_seq, payload)`；terminal 状态可以和最后一批 event 在同一数据库事务中提交。Gateway/HTTP `QueuedRunner` 从 `execution_event` durable source resume，而不是读取 Worker 内存。
 
-framework Session service 仍是 transcript/state/tracks/summary 的 authority。平台 journal 是外部事件投影，两者不应被理解为两份可任意独立修改的 transcript。一个 Runner 持有同一 Session lease，框架 Session 写入和 event journal 在该执行期间按事件顺序发生；如果在外部 backend 写入与进程崩溃之间失去精确原子性，下一次接管依靠 execution fence 和 framework 服务的幂等/已有事件检查，不能凭空声称跨 provider exactly-once。
+framework Session service 仍是 transcript/state/tracks/summary 的 authority。平台 journal 是外部事件投影，两者不应被理解为两份可任意独立修改的 transcript。一个 Runner 持有同一 Session Lease 对应的 Session Lock，框架 Session 写入和 event journal 在该执行期间按事件顺序发生；如果在外部 backend 写入与进程崩溃之间失去精确原子性，下一次接管依靠 execution fence 和 framework 服务的幂等/已有事件检查，不能凭空声称跨 provider exactly-once。
 
 ## 3. Memory 可见性
 
-Memory 只在 immutable ConfigVersion 选择 TencentDB Memory 时装配。Resolver 由 `tenant.Scope`、user 和 session 生成 key，任何 Worker 都能解析同一外部服务；因此成功提交到 TencentDB 后，后续节点有机会读到同一 scope 的记忆。写入是外部服务调用，Admission/Runner 事务不能把它和 PostgreSQL 一起原子提交，故属于外部 at-least-once/Provider 语义；TencentDB 网络和跨节点可见性已通过外部实测，事务边界仍保持不变。
+Memory 只在 immutable ConfigVersion 选择 TencentDB Memory 时装配。Resolver 由 `tenant.Scope`、user 和 session 生成 key，任何 Worker 都能解析同一外部服务；因此成功提交到 TencentDB 后，后续节点有机会读到同一 scope 的记忆。写入是外部服务调用，Admission/Runner 事务不能把它和 PostgreSQL 一起原子提交，故属于外部 at-least-once/Provider 语义；TencentDB 网络和跨节点可见性需要由对应外部环境验证，事务边界仍保持不变。
 
 群聊 transcript 包含多个发送者，而 framework ingestor 得不到逐消息 sender attribution；当前实现对 `SessionPrincipalID != UserID` 的共享 Session 不写 Memory。这个保守选择避免把他人内容写入当前用户的 Memory scope，但也意味着群聊 Memory 不是“所有群成员共享记忆”的实现。
 
@@ -29,7 +31,7 @@ Memory 只在 immutable ConfigVersion 选择 TencentDB Memory 时装配。Resolv
 
 HTTP OpenAI 入口要求唯一 `request_id`、`Idempotency-Key`、`X-Session-ID` 和 Bearer API key。请求 payload 只允许一个 user text message，tenant/app/user/principal/config 不能由 body 覆盖。相同 scope/source/idempotency key 且 payload hash 相同，Admission 返回原 execution 结果；相同 key 配不同 payload 返回 conflict。`request_id` 自身也是 scope 内主键，不能用不同请求复用。
 
-WeCom/Feishu adapter 将 provider external message ID 作为 idempotency key。`channel_inbox` 记录 message type、payload hash、请求 ID、ADMITTED/REJECTED 和加密 reply target。重复消息同 hash 重放原结果；hash 不同是冲突。unsupported、附件拒绝和 IM access denied 也保留 durable rejection，避免 Provider 不断重试造成无界副作用。
+WeCom/Feishu adapter 使用官方 WebSocket/long connection，external message ID 作为 idempotency key。当前模式没有 HTTP webhook URL 或 callback signature verification，因此这些 README 字段对当前接入为 `NOT_APPLICABLE`；WebSocket/SDK 使用 binding external account + scoped secret 完成认证。`channel_inbox` 记录 message type、payload hash、请求 ID、ADMITTED/REJECTED 和加密 reply target。重复消息同 hash 重放原结果；hash 不同是冲突。unsupported、附件拒绝和 IM access denied 也保留 durable rejection，避免 Provider 不断重试造成无界副作用。
 
 用户映射同样幂等：direct 以 binding-scoped external user hash 查稳定 user；group/topic 以 chat hash + thread hash 查稳定 conversation。数据库 `ON CONFLICT DO NOTHING` 后再次读取，避免两个 Adapter 并发创建两个内部主体。
 
@@ -77,7 +79,7 @@ Artifact object 和 SQL metadata 不具备跨系统两阶段提交：可能出�
 
 ## 9. Reply Outbox 和外部副作用
 
-Runner journal 只为客户端可见 event 创建 Reply Outbox projection；Reply Sender 与 Runner 分离，可在 execution 成功后继续投递。Sender claim row、重新验证 binding/revision、使用 Redis 分布式 binding rate limit，再调用 Provider 的一次 `SendOnce`。WeCom/Feishu 对已知 HTTP/provider retryable 错误有限重试；Feishu 的 `uuid=ReplyID` 是 provider 请求幂等提示，但当前代码没有通用的安全结果查询协议。
+Runner journal 只为客户端可见 event 创建 Reply Outbox projection；Channel 角色中的 Reply Sender 与 Runner 分离，可在 execution 成功后继续投递。Sender claim row、重新验证 binding/revision、使用 Redis 分布式 binding rate limit，再调用 Provider 的一次 `SendOnce`。WeCom/Feishu 对已知 HTTP/provider retryable 错误有限重试；Feishu 的 `uuid=ReplyID` 是 provider 请求幂等提示，但当前代码没有通用的安全结果查询协议。
 
 若 transport timeout、context cancellation、receipt 无效、lease 丢失或 completion 更新失败，Provider 是否已经接受消息无法知道，状态写为 `UNCERTAIN`，不自动再次发送。已知 permanent 错误写 `PERMANENTLY_FAILED`；已知 retryable 写回 `PENDING` 并应用 Retry-After/上限；reply attempts 有默认最大值。该分类是“安全防重复”与“可能漏发”的明确取舍。
 

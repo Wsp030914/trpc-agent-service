@@ -97,8 +97,9 @@ type OutboundClient struct {
 }
 
 // NewOutboundClient resolves the binding's WeCom Bot Secret and creates a
-// binding-scoped long-connection sender. The sender reconnects independently
-// and is closed by the outbound resolver lifecycle.
+// binding-scoped long-connection sender. It must be constructed by the single
+// Channel owner; the sender reconnects independently and is closed by the
+// outbound resolver lifecycle.
 func NewOutboundClient(
 	ctx context.Context,
 	secrets platformsecret.SecretProvider,

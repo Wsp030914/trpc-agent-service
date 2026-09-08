@@ -23,6 +23,7 @@ for required in \
   'redis:' \
   'qdrant:' \
   'gateway:' \
+  'channel:' \
   'worker-1:' \
   'worker-2:' \
   'healthcheck:' \
@@ -34,7 +35,7 @@ for required in \
   fi
 done
 
-for service in postgres redis qdrant gateway worker-1 worker-2; do
+for service in postgres redis qdrant gateway channel worker-1 worker-2; do
   if ! awk -v service="$service" '
     $0 == "  " service ":" { in_service=1; next }
     in_service && /^  [^[:space:]][^:]*:/ { in_service=0 }
@@ -97,6 +98,7 @@ production="$render_dir/deploy-kubernetes-overlays-production.yaml"
 for required in \
   'kind: Deployment' \
   'name: trpc-agent-service-gateway' \
+  'name: trpc-agent-service-channel' \
   'name: trpc-agent-service-worker' \
   'kind: Service' \
   'kind: HorizontalPodAutoscaler' \
@@ -135,8 +137,15 @@ if ! grep -Eq 'image: [^[:space:]]+(:[0-9A-Za-z][0-9A-Za-z_.-]*|@sha256:[0-9a-f]
   exit 1
 fi
 
-if [ "$(grep -Fc 'imagePullPolicy: Always' "$production")" -ne 2 ]; then
+if [ "$(grep -Fc 'imagePullPolicy: Always' "$production")" -ne 3 ]; then
   echo 'deployment validation failed: production workloads must always pull the fixed image' >&2
+  exit 1
+fi
+
+if ! grep -Fq 'name: trpc-agent-service-channel' "$production" || \
+  ! grep -Fq 'type: Recreate' "$production" || \
+  ! grep -Fq 'replicas: 1' "$production"; then
+  echo 'deployment validation failed: channel deployment must remain a single Recreate owner' >&2
   exit 1
 fi
 

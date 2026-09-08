@@ -32,7 +32,7 @@ jobs:
       - name: build and start admin topology
         run: |
           docker compose --env-file .env.example -f compose.yaml -f compose.admin-e2e.yaml \
-            up -d --build --wait postgres redis qdrant gateway worker-1 worker-2 admin-ui
+            up -d --build --wait postgres redis qdrant gateway channel worker-1 worker-2 admin-ui
 
       - name: provision real control-plane fixture
         env:
@@ -70,7 +70,7 @@ jobs:
         if: ${{ always() }}
         run: |
           docker compose --env-file .env.example -f compose.yaml -f compose.admin-e2e.yaml \
-            logs --no-color gateway worker-1 worker-2 admin-ui > test-results/compose.log 2>&1 || true
+            logs --no-color gateway channel worker-1 worker-2 admin-ui > test-results/compose.log 2>&1 || true
 
       - name: scan Admin UI evidence
         if: ${{ always() }}

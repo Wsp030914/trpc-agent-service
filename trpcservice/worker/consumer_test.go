@@ -220,8 +220,13 @@ func TestConsumerStopClaimingDrainsActiveExecution(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 	close(executor.finish)
-	if err := <-done; err != nil {
-		t.Fatalf("run = %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cooperative execution did not drain during shutdown")
 	}
 	if store.completed != queue.CompletionSucceeded || stream.acks != 1 {
 		t.Fatalf("completion=%q acks=%d", store.completed, stream.acks)

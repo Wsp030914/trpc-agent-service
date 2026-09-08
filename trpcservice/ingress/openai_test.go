@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -143,6 +144,27 @@ func TestOpenAIHandlerMapsDrainingAdmission(t *testing.T) {
 	}
 }
 
+func TestOpenAIHandlerMapsBackendAdmissionFailure(t *testing.T) {
+	handler, admitter, _, _ := newTestOpenAIHandler(t)
+	admitter.err = errors.New("database unavailable")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, validOpenAIRequest())
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestOpenAIHandlerMapsInvalidArtifactReference(t *testing.T) {
+	response := httptest.NewRecorder()
+	writeAdmissionError(response, fmt.Errorf("message: %w", gateway.ErrInvalidArtifactRef))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+}
+
 func TestOpenAIHandlerDoesNotAdmitOtherRoutes(t *testing.T) {
 	handler, admitter, _, _ := newTestOpenAIHandler(t)
 	request := validOpenAIRequest()
@@ -174,6 +196,45 @@ func TestOpenAIHandlerRejectsUnsupportedToolCallsBeforeAdmission(t *testing.T) {
 	}
 	if admitter.called {
 		t.Fatal("unsupported tool call reached admission")
+	}
+}
+
+func TestOpenAIHandlerRejectsUnsupportedGenerationParameters(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		body  string
+	}{
+		{name: "temperature", field: "temperature", body: `{"temperature":0.2,"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "temperature case variant", field: "temperature", body: `{"Temperature":0.2,"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "max_tokens", field: "max_tokens", body: `{"max_tokens":10,"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "max_tokens case variant", field: "max_tokens", body: `{"MAX_TOKENS":10,"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "top_p", field: "top_p", body: `{"top_p":0.5,"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "top_p case variant", field: "top_p", body: `{"Top_P":0.5,"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "stop", field: "stop", body: `{"stop":["END"],"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "stop case variant", field: "stop", body: `{"Stop":["END"],"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "presence_penalty", field: "presence_penalty", body: `{"presence_penalty":0.1,"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "frequency_penalty", field: "frequency_penalty", body: `{"frequency_penalty":0.1,"messages":[{"role":"user","content":"hello"}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, admitter, _, _ := newTestOpenAIHandler(t)
+			request := validOpenAIRequest()
+			request.Body = io.NopCloser(bytes.NewBufferString(tt.body))
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("response status = %d, want %d", response.Code, http.StatusBadRequest)
+			}
+			if !strings.Contains(response.Body.String(), tt.field) {
+				t.Fatalf("response body = %q, want unsupported field %q", response.Body.String(), tt.field)
+			}
+			if admitter.called {
+				t.Fatal("unsupported generation parameter reached admission")
+			}
+		})
 	}
 }
 

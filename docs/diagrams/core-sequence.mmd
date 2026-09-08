@@ -2,14 +2,16 @@
 sequenceDiagram
   autonumber
   actor User as IM 用户
-  participant IM as WeCom/Feishu Adapter
+  participant IM as Channel Adapter\n(single owner)
   participant Map as Binding + Identity Mapping
   participant GW as Gateway Admission
   participant DB as PostgreSQL Store
   participant Relay as Dispatch Relay
   participant Redis as Redis Stream
   participant C as Worker Consumer
-  participant Lock as Redis Session Lease
+  participant Exec as PostgreSQL Execution Lease
+  participant SLease as Redis Session Lease
+  participant SLock as Session Lock
   participant Run as tRPC-Agent-Go Runner
   participant Model as OpenAI-compatible Model
   participant Tool as ToolCatalog / todo_write
@@ -17,27 +19,32 @@ sequenceDiagram
   participant Mem as TencentDB Memory
   participant Kno as Qdrant Knowledge
   participant Art as COS Artifact
-  participant Reply as Reply Sender
+  participant Reply as Channel Reply Sender
+  participant Rate as Reply Rate Limiter
   participant IMOut as IM Provider
 
+  Note over IM: WeCom/Feishu official WebSocket/long connection. Webhook URL and HTTP callback signature verification are NOT_APPLICABLE.
   User->>IM: message(external_message_id, sender/chat/thread, content)
   IM->>Map: verify binding account/status/revision
   Map->>Map: derive tenant/app, user/conversation, session_id
   Map->>GW: ChannelInput + binding_revision + traceparent
   Note over Map,GW: tenant_id/app_id, request_id, session_id, trace_id
-  GW->>DB: BEGIN; lock binding/app; resolve/pin ConfigVersion
+  GW->>DB: BEGIN, lock binding/app, resolve and pin ConfigVersion
   DB->>DB: channel_inbox dedup + payload_hash
   DB->>DB: session_lane allocate turn_seq
   DB->>DB: insert execution + inbound artifact refs
   DB->>DB: insert dispatch_outbox
   DB-->>GW: COMMIT admitted(request_id, config_version, turn_seq)
-  GW-->>IM: return admission result; no IM reply yet
+  GW-->>IM: admission result, no IM reply yet
   Relay->>DB: claim dispatch_outbox
   Relay->>Redis: XADD Dispatch(request_id, scope, traceparent)
   Redis-->>C: Consumer Group delivery
-  C->>DB: claim execution lease(owner, run_token)
-  C->>Lock: SET NX session partition lease
-  Lock-->>C: session lease granted
+  C->>Exec: claim execution(owner, run_token, lease_until)
+  Exec->>DB: transactionally fence execution row
+  DB-->>Exec: execution lease granted
+  C->>SLease: SET NX session partition lease
+  SLease->>SLock: create renewable lock handle
+  SLock-->>C: session lock granted
   C->>Run: Build Runner(pinned config_version, trusted context)
   Run->>Ses: load session state/events/summary
   Run->>Kno: scoped knowledge query (SQL-authorized)
@@ -53,7 +60,8 @@ sequenceDiagram
   DB-->>C: durable SUCCEEDED/FAILED/UNCERTAIN
   C->>Redis: XACK after durable transition
   Reply->>DB: claim reply_outbox with lease
-  Reply->>Lock: distributed binding rate limit
+  Reply->>Rate: acquire binding rate-limit permit
+  Rate-->>Reply: permit / bounded wait
   Reply->>IMOut: one provider SendOnce attempt(reply_id, target)
   IMOut-->>Reply: receipt, known failure, or uncertain transport
   Reply->>DB: SENT / retry PENDING / PERMANENTLY_FAILED / UNCERTAIN
@@ -61,3 +69,5 @@ sequenceDiagram
 
   Note over GW,Reply: W3C trace context propagates through DB/Redis boundaries
   Note over GW,Reply: raw prompts, tool arguments and provider bodies are not traced.
+  Note over IM,GW: Channel process calls the same Gateway Admission path; it does not discover or call a specific Worker.
+  Note over Exec,SLock: Execution Lease owns PostgreSQL execution fencing, Session Lease/Lock serializes one Session, Reply Rate Limiter only paces IM sends.

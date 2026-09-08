@@ -366,8 +366,51 @@ func TestWorkerRunDrainsEventsAfterSinkError(t *testing.T) {
 	if result.EventCount != 2 {
 		t.Fatalf("event count = %d, want 2", result.EventCount)
 	}
-	if len(sink.events) != 2 {
-		t.Fatalf("sink event count = %d, want 2", len(sink.events))
+	if len(sink.events) != 1 {
+		t.Fatalf("sink event count = %d, want 1 after cancellation", len(sink.events))
+	}
+}
+
+func TestWorkerRunCancelsRunnerAndBoundsEventDrainAfterSinkFailure(t *testing.T) {
+	wantErr := errors.New("sink failed")
+	runner := &nonCooperativeEventRunner{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	defer func() {
+		close(runner.release)
+		select {
+		case <-runner.done:
+		case <-time.After(time.Second):
+			t.Error("non-cooperative runner did not finish after test release")
+		}
+	}()
+	sink := &recordingEventSink{err: wantErr}
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = fixedRunner(runner)
+	w.Events = sink
+	w.EventSinkTimeout = 20 * time.Millisecond
+
+	started := time.Now()
+	result, err := w.Run(context.Background(), testJob("request-sink-failure", "tenant-a", "session-1"))
+	if time.Since(started) > time.Second {
+		t.Fatal("event drain exceeded the bounded shutdown period")
+	}
+	if !errors.Is(err, wantErr) || !worker.IsSideEffectUncertainError(err) {
+		t.Fatalf("run error = %v, want side-effect-uncertain sink error", err)
+	}
+	select {
+	case <-runner.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("runner did not receive context cancellation")
+	}
+	if result.EventCount != 1 || result.RunnerCompleted {
+		t.Fatalf("run result = %#v, want only the first event and no completion", result)
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("sink event count = %d, want 1", len(sink.events))
 	}
 }
 
@@ -657,6 +700,49 @@ func TestWorkerRunModelTimeoutCancelsAndDrainsManagedRunner(t *testing.T) {
 	}
 }
 
+func TestWorkerRunBoundsDrainAfterExternalCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := &nonCooperativeEventRunner{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	defer func() {
+		close(runner.release)
+		select {
+		case <-runner.done:
+		case <-time.After(time.Second):
+			t.Error("non-cooperative runner did not finish after test release")
+		}
+	}()
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = fixedRunner(runner)
+	w.EventSinkTimeout = 20 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.Run(ctx, testJob("request-external-cancel", "tenant-a", "session-1"))
+		done <- err
+	}()
+	<-runner.started
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("external cancellation did not finish bounded event drain")
+	}
+	select {
+	case <-runner.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("runner did not observe context cancellation")
+	}
+}
+
 func TestWorkerRunTimeoutCancelsManagedRunnerBlockedInStart(t *testing.T) {
 	runner := &managedStartBlockingRunner{started: make(chan struct{})}
 	w := testWorker(t, sharedBackendConfig())
@@ -801,6 +887,34 @@ type managedBlockingRunner struct {
 	canceled atomic.Bool
 	closed   atomic.Bool
 }
+
+type nonCooperativeEventRunner struct {
+	started  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+	done     chan struct{}
+}
+
+func (r *nonCooperativeEventRunner) Run(
+	ctx context.Context,
+	_, _ string,
+	_ model.Message,
+	_ ...agent.RunOption,
+) (<-chan *event.Event, error) {
+	close(r.started)
+	events := make(chan *event.Event, 1)
+	events <- event.New("invocation-1", "assistant")
+	go func() {
+		defer close(r.done)
+		<-ctx.Done()
+		close(r.canceled)
+		<-r.release
+		close(events)
+	}()
+	return events, nil
+}
+
+func (*nonCooperativeEventRunner) Close() error { return nil }
 
 func (r *managedBlockingRunner) Run(
 	_ context.Context,

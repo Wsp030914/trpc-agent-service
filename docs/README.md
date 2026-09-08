@@ -1,6 +1,6 @@
 # trpc-agent-service 文档
 
-这套文档描述当前工作区中的真实实现，而不是目标架构或历史设计。实现基线包括 Go 源码、PostgreSQL migrations、测试、Compose/Kubernetes 部署文件、GitHub Actions、Admin UI 与脚本；本次状态还纳入了已完成的真实 Provider、真实部署、故障恢复和容量外部实测。文档只记录当前代码契约与实测结论，不虚构外部报告中没有提供的数值。
+这套文档描述当前工作区中的真实实现，而不是目标架构或历史设计。实现基线包括 Go 源码、PostgreSQL migrations、测试、Compose/Kubernetes 部署文件、GitHub Actions、Admin UI 与脚本。文档中的“已验证”只指仓库内存在可执行的单元/集成/E2E 证据；真实第三方账号、真实生产 Kubernetes 与生产容量若没有仓库证据，会明确标为 `EXTERNAL_VERIFICATION_NOT_INCLUDED`。
 
 ## 阅读顺序
 
@@ -26,7 +26,7 @@
 | [backend-adaptation.md](backend-adaptation.md) | 当前代码真正接入的各类 Backend 及其一致性取舍 |
 | [risk-register.md](risk-register.md) | 生产触发条件、影响、检测、缓解和恢复 |
 | [deployment.md](deployment.md) | Compose、Kubernetes、探针、密钥、发布和回滚 |
-| [capacity.md](capacity.md) | 容量工具、测量口径、规划公式和容量结论 |
+| [capacity.md](capacity.md) | 容量工具、局部测量、规划公式和生产容量证据边界 |
 | [acceptance.md](acceptance.md) | 五大需求、交付物和工程能力的最终验收矩阵 |
 
 ## 图文件
@@ -46,4 +46,4 @@
 
 ## 状态约定
 
-`IMPLEMENTED_AND_VERIFIED` 表示实现、仓库内测试和本次外部实测证据均已覆盖；`PASS` 表示验收通过；`PASS_WITH_LIMITATION` 只描述当前设计边界，不表示验证缺失；`NOT_APPLICABLE` 表示该项不是当前实现路径的适用项。本次需求条目均已闭合。
+`IMPLEMENTED` 表示代码/部署路径已经存在，但当前证据不足以把它标成仓库验证；`REPO_VERIFIED` 表示可由仓库内源码、静态检查、单测、集成测试、E2E 测试或 CI Workflow 证据核对；`EXTERNALLY_VERIFIED` 只表示仓库中保存了可复核的真实 Provider、真实 IM、真实 Kubernetes/HA 或容量报告；`EXTERNAL_VERIFICATION_NOT_INCLUDED` 表示实现边界明确，但仓库没有外部运行证据；`NOT_APPLICABLE` 表示该项不是当前实现路径的适用项。

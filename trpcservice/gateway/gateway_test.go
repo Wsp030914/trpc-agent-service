@@ -185,6 +185,39 @@ func TestGatewayAcceptsValidatedArtifactReference(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsInvalidArtifactReferenceBeforeBackend(t *testing.T) {
+	admitter := &captureAdmitter{
+		result: gateway.AdmissionResult{
+			RequestID:     "request-1",
+			ConfigVersion: "v1",
+			TurnSeq:       1,
+		},
+	}
+	identity := validAdmissionIdentity()
+	request := gateway.Request{
+		RequestID:      "request-1",
+		IdempotencyKey: "client-key-1",
+		Tenant: staticTenantResolver{
+			tenant:       identity.Tenant,
+			source:       identity.Source,
+			identity:     identity,
+			withIdentity: true,
+		},
+		Message: gateway.Message{
+			Text:         "hello",
+			ArtifactRefs: []string{"artifact://file"},
+		},
+	}
+	if _, err := gateway.New(admitter).Handle(context.Background(), request); err == nil {
+		t.Fatal("invalid artifact reference was accepted")
+	} else if !errors.Is(err, gateway.ErrInvalidArtifactRef) {
+		t.Fatalf("invalid artifact reference error = %v", err)
+	}
+	if admitter.request.RequestID != "" {
+		t.Fatal("invalid artifact reference reached backend admission")
+	}
+}
+
 func TestGatewayPinsChannelConfigBeforeAttachmentsAndCompensatesAdmissionFailure(t *testing.T) {
 	binding := testChannelBinding()
 	resolver, err := gateway.NewChannelBindingInputIdentityResolverFromBinding(

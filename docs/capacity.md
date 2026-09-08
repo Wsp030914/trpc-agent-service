@@ -2,7 +2,7 @@
 
 ## 结论先行
 
-当前仓库提供可重复的 disposable Compose 容量工具；本次外部实测已覆盖真实 Provider、数据库、IM、Kubernetes 和故障场景。本文保留工具口径与规划公式，不擅自填入外部报告中的数值；生产容量应以对应实测环境和工作负载为准。
+当前仓库提供可重复的 disposable Compose 容量工具。本文保留工具口径与规划公式；仓库内没有足以推出生产容量上限的真实 Provider、真实 IM、生产 Kubernetes 或生产数据库测量报告，因此生产容量为 `EXTERNAL_VERIFICATION_NOT_INCLUDED`。
 
 ## 工具实际测什么
 
@@ -21,7 +21,7 @@
 | 资源/控制点 | 当前实现 | 对容量的含义 |
 | --- | --- | --- |
 | Worker execution concurrency | `TRPC_AGENT_SERVICE_WORKER_CONCURRENCY`，默认 4；production overlay 为 8 | 粗略上限 `worker replicas × concurrency`；受 execution lease、Session serial lane 和资源影响 |
-| Session | 同一 `(tenant, app, principal, session)` 通过 Redis lease 串行 | 同一 Session 吞吐近似受单次模型/工具耗时限制，增加 Worker 不会并行同一 lane |
+| Session | 同一 `(tenant, app, principal, session)` 通过 Redis Session Lease/Session Lock 串行 | 同一 Session 吞吐近似受单次模型/工具耗时限制，增加 Worker 不会并行同一 lane |
 | Execution retry | PostgreSQL execution 最多 3 次，retry delay 1–30s bounded | 故障时实际后台工作量可能高于入口请求量 |
 | Reply | 默认每 binding 5 次/s、1s window；reply 最多 8 attempts，retry max 1m | IM 回复峰值由 binding 数 × 5/s 近似受限，排队会在 reply outbox 增长 |
 | Dispatch | Redis Stream + SQL dispatch outbox | 每次 Admission、Relay、claim、event/终态都会增加 SQL/Redis 操作；不能用单一 request/s 指标代表负载 |
@@ -53,11 +53,11 @@ estimated cost/request = T_in × P_in + T_out × P_out
 
 | 层 | 当前能说什么 | 状态 |
 | --- | --- | --- |
-| 测试工具能力 | evaluator 可发并发 HTTP 请求；observer 可写资源/队列/SQL delta；参数和报告有单测 | IMPLEMENTED_AND_VERIFIED |
-| 本地 smoke | Workflow 定义了 disposable 2-worker deterministic topology、错误率门槛和报告 artifact | IMPLEMENTED_AND_VERIFIED |
-| 受控 E2E | deployment/runtime/fault/IM workflows 可使用 deterministic model 验证路径、重启、恢复和投影 | IMPLEMENTED_AND_VERIFIED |
-| 生产容量 | 真实模型、真实 IM、真实外部 Memory/Vector/Object、生产数据库、K8s HPA 下的 p95/SLO/安全上限 | IMPLEMENTED_AND_VERIFIED |
+| 测试工具能力 | evaluator 可发并发 HTTP 请求；observer 可写资源/队列/SQL delta；参数和报告有单测 | REPO_VERIFIED |
+| 本地 smoke | Workflow 定义了 disposable 2-worker deterministic topology、错误率门槛和报告 artifact；当前工作树没有该次 run artifact | IMPLEMENTED |
+| 受控 E2E | deployment/runtime/fault/IM workflows 定义 deterministic model 的路径、重启、恢复和投影 | IMPLEMENTED |
+| 生产容量 | 真实模型、真实 IM、真实外部 Memory/Vector/Object、生产数据库、K8s HPA 下的 p95/SLO/安全上限 | EXTERNAL_VERIFICATION_NOT_INCLUDED |
 
-## 外部实测记录口径
+## 实际测量记录口径
 
-容量实测应保留 git SHA、worker/gateway 数、concurrency、请求数/时间、Session 分布、模型/Provider 类型、错误分类、p50/p95/p99、Redis pending/lag/commands、PostgreSQL transactions/writes、CPU/memory 和 reply backlog。本文只记录测量口径；具体扩容和承诺仍以外部实测报告中的环境、工作负载和数值为准。
+有意义的容量测量应保留 git SHA、worker/gateway 数、concurrency、请求数/时间、Session 分布、模型/Provider 类型、错误分类、p50/p95/p99、Redis pending/lag/commands、PostgreSQL transactions/writes、CPU/memory 和 reply backlog。当前工作区只记录测量口径和 disposable 工具；缺少这些环境、工作负载、数值及可定位的运行证据时，结果只能作为 smoke 或容量验证，不能作为生产上限、SLO 或扩容承诺。

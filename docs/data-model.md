@@ -224,6 +224,41 @@ erDiagram
 
 图中的关系分为两类：带 PostgreSQL foreign key 的硬关系，和由 `AppConfig` JSON 引用、framework service 或外部 Provider 形成的逻辑关系。`memory` 和 `summary` 没有平台独立表，这是实现事实，不是遗漏。
 
+## 平台 SQL 实体与逻辑/外部实体
+
+下图把 README 要求的 `Tenant → Agent App → Session → Event → Summary` 关系和 Memory scope 单独画出。实线表示平台 SQL 或平台顺序元数据；虚线表示 framework/external authority 的逻辑关系，不表示新增 SQL 表。
+
+```mermaid
+flowchart LR
+  T["Tenant\nplatform.tenant"] --> A["Agent App\nplatform.agent_app"]
+  A --> L["Session Lane\nplatform.session_lane\nordering metadata"]
+  L -. scoped identity .-> S["Session\nframework Session backend"]
+  S --> E["Event\nframework Session events"]
+  S --> SU["Summary\nframework Session state"]
+  J["execution_event\nplatform journal"] -. resume/audit projection .-> E
+
+  T -. tenant scope .-> MS["Memory scope / entries\nlogical external entity"]
+  A -. app scope .-> MS
+  S -. user/session key .-> MS
+  MB["Memory Backend\nTencentDB resolver"] --> MS
+
+  classDef sql fill:#ecfdf5,stroke:#34d399,color:#065f46
+  classDef logical fill:#fff7ed,stroke:#f59e0b,color:#7c2d12
+  classDef external fill:#eff6ff,stroke:#60a5fa,color:#1e3a8a
+  class T,A,L,J sql
+  class S,E,SU logical
+  class MS,MB external
+```
+
+| Logical entity | Authority | Scope/key relation | Why no platform SQL table |
+| --- | --- | --- | --- |
+| Session | tRPC-Agent-Go framework Session resolver: PostgreSQL, Redis or InMemory | `(tenant_id, app_id, session_principal_id, session_id)`，由 immutable ConfigVersion 选择 backend | 平台只需 `session_lane` 保存顺序/admission 元数据，避免复制 framework transcript |
+| Event | framework Session events/state；平台另有 `execution_event` journal | Event 隶属 framework Session；平台 journal 以 `(tenant, app, request, event_seq)` 做 resume/reply projection | 两者职责不同，不把 journal 伪装成第二份 Session authority |
+| Summary | framework Session state 的 summary | 随 Session key 保存；Redis→PostgreSQL migration 复制并校验 summary | 当前 framework Session 已持有 summary，不需要独立平台表 |
+| Memory / Memory scope | TencentDB Agent Memory（当前实现） | private key 包含 tenant/app/user/session；群聊共享 Session 当前跳过归因写入 | 平台保存 BackendRef/SecretRef，不复制外部 Memory 内容 |
+
+因此，平台 SQL 仍然完整表达 tenant/app、排序 Session lane、execution/event journal、channel binding 和 audit；Session 的内容、Event、Summary 与 Memory 由各自真实 authority 管理。未来若换 Memory provider，只需保持 resolver 的 scope 契约，不以增加一张无用 `memory` 表作为迁移条件。
+
 ## 核心实体和权威性
 
 | 实体 | 作用 | 作用域/authority | 关键状态或约束 |
@@ -259,7 +294,7 @@ framework Session 中的 event/state/tracks/summary 是实际上下文 authority
 
 ## 配置、执行和回复的关系
 
-Admission 将 `config_version` 固化到 execution，并通过 FK 保证该版本仍存在。执行期间模型/工具/Session/Knowledge/Artifact resolver 都从该版本选择。Runner 事件落入 `execution_event` 后，journal 在同一事务里可创建 `reply_outbox`；Reply Sender 只消费持久回复，不重新执行 Runner。这样请求结果、事件 resume 和 IM 发送有清晰 authority，但 Provider 发送本身仍可能是 uncertain。
+Admission 将 `config_version` 固化到 execution，并通过 FK 保证该版本仍存在。执行期间模型/工具/Session/Knowledge/Artifact resolver 都从该版本选择。Runner 事件落入 `execution_event` 后，journal 在同一事务里可创建 `reply_outbox`；Channel 角色中的 Reply Sender 只消费持久回复，不重新执行 Runner。这样请求结果、事件 resume 和 IM 发送有清晰 authority，但 Provider 发送本身仍可能是 uncertain。
 
 ## 约束边界
 

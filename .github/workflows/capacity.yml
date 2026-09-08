@@ -60,14 +60,14 @@ jobs:
         run: |
           set -euo pipefail
           docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml \
-            up -d --build --wait postgres redis qdrant gateway worker-1 worker-2
+            up -d --build --wait postgres redis qdrant gateway channel worker-1 worker-2
           for attempt in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8080/readyz >/dev/null; then
               exit 0
             fi
             if [ "$attempt" = 30 ]; then
               docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml \
-                logs --no-color gateway worker-1 worker-2
+                logs --no-color gateway channel worker-1 worker-2
               exit 1
             fi
             sleep 2
@@ -144,7 +144,7 @@ jobs:
         run: |
           mkdir -p test-results
           docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml \
-            logs --no-color gateway worker-1 worker-2 postgres redis qdrant > test-results/compose.log 2>&1 || true
+            logs --no-color gateway channel worker-1 worker-2 postgres redis qdrant > test-results/compose.log 2>&1 || true
           docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml \
             ps -a > test-results/compose-ps.txt 2>&1 || true
       - name: scan capacity artifacts

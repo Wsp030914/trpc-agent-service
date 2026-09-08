@@ -40,6 +40,46 @@ func TestConfigFromEnvironmentRequiresExplicitWorkerIdentity(t *testing.T) {
 	}
 }
 
+func TestChannelRoleOwnsAdaptersWithoutGatewayCredentials(t *testing.T) {
+	config, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:        string(roleChannel),
+		envPostgresDSN: "postgres://example",
+		envRedisURL:    "redis://example:6379/0",
+	}))
+	if err != nil {
+		t.Fatalf("channel configuration: %v", err)
+	}
+	if !config.Role.runsChannel() || config.Role.runsGateway() || config.Role.runsWorker() {
+		t.Fatalf("channel role ownership = gateway=%t channel=%t worker=%t", config.Role.runsGateway(), config.Role.runsChannel(), config.Role.runsWorker())
+	}
+}
+
+func TestReplySenderOwnershipMatchesChannelRole(t *testing.T) {
+	tests := []struct {
+		role serviceRole
+		want bool
+	}{
+		{role: roleGateway, want: false},
+		{role: roleChannel, want: true},
+		{role: roleWorker, want: false},
+		{role: roleAll, want: true},
+	}
+	for _, test := range tests {
+		if got := test.role.runsChannel(); got != test.want {
+			t.Fatalf("role %q runs channel = %t, want %t", test.role, got, test.want)
+		}
+	}
+}
+
+func TestChannelReplyOwnerUsesStableOwnerWhenWorkerIDIsAbsent(t *testing.T) {
+	if got := channelReplyOwner(serviceConfig{Role: roleChannel}); got != defaultChannelReplyOwner {
+		t.Fatalf("channel reply owner = %q, want %q", got, defaultChannelReplyOwner)
+	}
+	if got := channelReplyOwner(serviceConfig{Role: roleAll, WorkerID: "all-1"}); got != "all-1" {
+		t.Fatalf("combined reply owner = %q, want all-1", got)
+	}
+}
+
 func TestShutdownResourceCloseSkippedAfterShutdownTimeout(t *testing.T) {
 	if !shutdownResourceCloseSkipped(errWorkerShutdownTimeout) {
 		t.Fatal("worker shutdown timeout did not skip shared resource close")
@@ -345,6 +385,51 @@ func TestAwaitWorkerExitReturnsAtShutdownDeadline(t *testing.T) {
 	}
 }
 
+func TestAwaitWorkerExitBoundsNonCooperativeRunner(t *testing.T) {
+	runner := &nonCooperativeShutdownRunner{
+		started:         make(chan struct{}),
+		cancelRequested: make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(runCtx) }()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("non-cooperative runner did not start")
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelShutdown()
+	started := time.Now()
+	err, stopped := awaitWorkerExit(shutdownCtx, done, func() {
+		close(runner.cancelRequested)
+		cancelRun()
+	})
+	if time.Since(started) > time.Second {
+		t.Fatal("shutdown exceeded its timeout boundary")
+	}
+	if stopped || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("await worker exit = %v, %t, want deadline without stop", err, stopped)
+	}
+	select {
+	case <-runner.cancelRequested:
+	default:
+		t.Fatal("shutdown did not request runner cancellation")
+	}
+	if runCtx.Err() == nil {
+		t.Fatal("shutdown did not cancel the runner context")
+	}
+	close(runner.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("released non-cooperative runner did not finish")
+	}
+}
+
 func TestAwaitWorkerExitReturnsWorkerResult(t *testing.T) {
 	done := make(chan error, 1)
 	want := errors.New("worker stopped")
@@ -383,6 +468,52 @@ func TestReplyShutdownTimeoutIsObservable(t *testing.T) {
 	shutdownErr := replyShutdownError(context.DeadlineExceeded, false)
 	if !errors.Is(shutdownErr, errWorkerShutdownTimeout) {
 		t.Fatalf("reply shutdown error = %v, want worker shutdown timeout", shutdownErr)
+	}
+}
+
+func TestServiceServerShutdownIsIdempotent(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	serveErr := errors.New("serve stopped")
+	service := &serviceServer{
+		server:    &http.Server{},
+		done:      done,
+		readiness: &readinessState{},
+		serveErr:  serveErr,
+	}
+
+	if err := service.shutdown(context.Background()); !errors.Is(err, serveErr) {
+		t.Fatalf("first shutdown = %v, want %v", err, serveErr)
+	}
+	second := make(chan error, 1)
+	go func() { second <- service.shutdown(context.Background()) }()
+	select {
+	case err := <-second:
+		if !errors.Is(err, serveErr) {
+			t.Fatalf("second shutdown = %v, want %v", err, serveErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second shutdown blocked")
+	}
+}
+
+func TestWaitForGatewayShutdownPreservesReplyExit(t *testing.T) {
+	wantErr := errors.New("reply sender stopped")
+	replyDone := make(chan error, 1)
+	replyDone <- wantErr
+	service := &serviceServer{
+		done:      make(chan struct{}),
+		readiness: &readinessState{},
+	}
+
+	result, replyErr, replyStopped := waitForGatewayShutdown(
+		context.Background(), service, time.Second, nil, nil, replyDone,
+	)
+	if result != nil || !errors.Is(replyErr, wantErr) || !replyStopped {
+		t.Fatalf("gateway shutdown = result=%v reply=%v stopped=%t", result, replyErr, replyStopped)
+	}
+	if got := replyShutdownError(replyErr, replyStopped); !errors.Is(got, wantErr) {
+		t.Fatalf("reply shutdown error = %v, want %v", got, wantErr)
 	}
 }
 
@@ -437,4 +568,16 @@ func assertHTTPStatus(t *testing.T, handler http.Handler, path string, want int)
 	if response.Code != want {
 		t.Fatalf("GET %s status = %d, want %d", path, response.Code, want)
 	}
+}
+
+type nonCooperativeShutdownRunner struct {
+	started         chan struct{}
+	cancelRequested chan struct{}
+	release         chan struct{}
+}
+
+func (r *nonCooperativeShutdownRunner) Run(context.Context) error {
+	close(r.started)
+	<-r.release
+	return nil
 }

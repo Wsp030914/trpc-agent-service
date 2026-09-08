@@ -139,16 +139,23 @@
 
 ## 快速开始
 
+以下命令启动仓库提供的最小本地拓扑：PostgreSQL、Redis、Qdrant、HTTP Gateway、单一 IM Channel Adapter owner 和两个 Worker。`.env.example` 只用于 disposable/local 环境，Compose 命令显式指定它作为环境变量来源。
+
 ```bash
 git clone https://github.com/liuzengh/trpc-agent-service.git
 cd trpc-agent-service
 
-./build.sh
-./start.sh
+docker compose --env-file .env.example up -d --build --wait \
+  postgres redis qdrant gateway channel worker-1 worker-2
+
+curl -fsS http://127.0.0.1:8080/readyz
+docker compose --env-file .env.example ps
 ```
 
 停止服务：
 
 ```bash
-./stop.sh
+docker compose --env-file .env.example down
 ```
+
+`./build.sh` 只构建 `bin/trpc-service`；`./start.sh`/`./stop.sh` 只管理一个已配置好外部 PostgreSQL/Redis 和 `TRPC_AGENT_SERVICE_*` 环境变量的原生进程，不替代上述完整 Compose Quick Start。需要清除本地数据库、Redis 和 Qdrant 数据时，再显式使用 `docker compose --env-file .env.example down --volumes`。

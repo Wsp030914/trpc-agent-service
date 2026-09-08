@@ -14,29 +14,36 @@ flowchart LR
     OP["Operator / Admin UI"]
   end
 
-  subgraph CH["Channel"]
+  subgraph CH["Channel Adapter Deployment (replicas=1; Recreate)"]
     CI["WeCom + Feishu Adapters / Normalize + Identity"]
-    OUT["Channel Outbound Resolver"]
   end
 
-  subgraph CP["Control Plane / Gateway"]
-    AD["Gateway Admission<br/>OpenAI Ingress / Admin API"]
+  subgraph CHR["Channel Reply Runtime (single owner)"]
+    RES["Reply Sender + Channel Outbound Resolver"]
+  end
+
+  subgraph CP["Gateway Deployment (replicas>=2; HPA)"]
+    API["Gateway HTTP Ingress"]
+    ADMIT["gateway.Gateway<br/>Admission"]
+    ADMIN["Admin API"]
     PG[("PostgreSQL Authority")]
   end
 
   subgraph QC["Queue / Coordination"]
     DS["Dispatch Outbox + Redis Stream"]
-    LEASE["Execution / Session Lease"]
+    EXLEASE["Execution Lease<br/>PostgreSQL owner / run token"]
+    SLEASE["Session Lease<br/>Redis TTL / token"]
+    SLOCK["Session Lock<br/>per-session serialization"]
+    RLIMIT["Reply Rate Limiter<br/>Redis per binding"]
   end
 
   subgraph WR["Worker / Runtime"]
     RT["Worker Consumer + tRPC-Agent-Go Runtime"]
-    RES["Event Journal + Reply Outbox + Reply Sender<br/>Reply Limiter"]
   end
 
   subgraph DATA["Storage / External Provider Backends"]
-    SES[("Session: PostgreSQL / Redis / InMemory")]
-    MEM[("TencentDB Memory")]
+    SES[("Session / Event / Summary\nPostgreSQL / Redis / InMemory")]
+    MEM[("Memory scope / entries\nTencentDB Memory")]
     KNO[("Qdrant Knowledge")]
     ART[("COS Artifact")]
     MODEL["OpenAI-compatible Model"]
@@ -49,24 +56,31 @@ flowchart LR
 
   IMU --> IMP
   IMP --> CI
-  CI --> AD
-  CLIENT --> AD
-  OP --> PG
-  AD --> PG --> DS --> RT --> RES --> OUT --> IMP
-  LEASE -. claim / session serialization .-> RT
+  CI -->|ChannelInput| ADMIT
+  CLIENT --> API --> ADMIT
+  OP --> ADMIN --> PG
+  ADMIT --> PG --> DS --> RT
+  PG -. reply_outbox .-> RES --> IMP
+  PG -. owner / run token .-> EXLEASE
+  EXLEASE -. claim / fence .-> RT
+  SLEASE -. TTL / renewal .-> SLOCK
+  SLOCK -. serialize same session .-> RT
+  RES -. acquire before SendOnce .-> RLIMIT
   RT -. pinned ConfigVersion .-> SES
   RT -. scoped access .-> MEM
   RT -. scoped access .-> KNO
   RT -. scoped access .-> ART
   RT -. model call .-> MODEL
   RT -. authorization .-> TOOL
-  AD -. trace / metrics .-> OBS
+  API -. trace / metrics .-> OBS
+  ADMIN -. audit / metrics .-> OBS
   RT -. trace / metrics .-> OBS
   RES -. trace / metrics .-> OBS
   class IMU,IMP,CLIENT,OP ext
-  class CI,OUT channel
-  class AD,PG control
-  class DS,LEASE queue
-  class RT,RES worker
+  class CI channel
+  class API,ADMIN,PG control
+  class DS,EXLEASE,SLEASE,SLOCK,RLIMIT queue
+  class RT worker
+  class RES channel
   class SES,MEM,KNO,ART,MODEL data
   class TOOL,OBS gov

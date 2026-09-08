@@ -16,6 +16,7 @@ import (
 
 const (
 	dispatchPayloadField = "dispatch"
+	autoClaimPageSize    = 100
 )
 
 // Stream is one Redis Stream Consumer Group used for worker dispatches.
@@ -92,32 +93,51 @@ func (s *Stream) Receive(ctx context.Context, consumer string, block time.Durati
 	if block <= 0 {
 		return queue.Delivery{}, errors.New("redis receive block duration must be positive")
 	}
-	claimed, _, err := s.client.XAutoClaim(ctx, &goredis.XAutoClaimArgs{
-		Stream:   s.name,
-		Group:    s.group,
-		Consumer: consumer,
-		MinIdle:  s.claimMinIdle,
-		Start:    "0-0",
-		Count:    1,
-	}).Result()
-	if err != nil && !errors.Is(err, goredis.Nil) {
-		return queue.Delivery{}, fmt.Errorf("claim pending redis dispatch: %w", err)
-	}
-	if len(claimed) > 0 {
-		delivery, err := decodeDelivery(claimed[0])
+	cursor := "0-0"
+	seenCursors := map[string]struct{}{}
+	for {
+		claimed, nextCursor, err := s.client.XAutoClaim(ctx, &goredis.XAutoClaimArgs{
+			Stream:   s.name,
+			Group:    s.group,
+			Consumer: consumer,
+			MinIdle:  s.claimMinIdle,
+			Start:    cursor,
+			Count:    autoClaimPageSize,
+		}).Result()
+		if errors.Is(err, goredis.Nil) {
+			break
+		}
 		if err != nil {
-			// Preserve the Redis id so the consumer can dead-letter a
-			// permanently malformed payload instead of retrying it forever.
-			return queue.Delivery{ID: claimed[0].ID}, err
+			return queue.Delivery{}, fmt.Errorf("claim pending redis dispatch: %w", err)
 		}
-		if s.isOwnedBy(delivery.ID, consumer) {
-			// XAUTOCLAIM cannot distinguish a crashed consumer from this
-			// process still working on a long-running delivery. Keep the
-			// latter pending and read a fresh message instead.
-			return s.receiveNew(ctx, consumer, block)
+		for _, message := range claimed {
+			delivery, err := decodeDelivery(message)
+			if err != nil {
+				// Preserve the Redis id so the consumer can dead-letter a
+				// permanently malformed payload instead of retrying it forever.
+				return queue.Delivery{ID: message.ID}, err
+			}
+			if s.isOwnedBy(delivery.ID, consumer) {
+				// XAUTOCLAIM cannot distinguish a crashed consumer from this
+				// process still working on a long-running delivery. Keep the
+				// latter pending and continue scanning this page.
+				continue
+			}
+			s.remember(delivery.ID, consumer)
+			return delivery, nil
 		}
-		s.remember(delivery.ID, consumer)
-		return delivery, nil
+
+		// Redis returns 0-0 after the pending-entry cursor has wrapped. A
+		// repeated or unchanged cursor is also an explicit guard against a
+		// server/proxy returning a non-progressing cursor forever.
+		if nextCursor == "0-0" || nextCursor == cursor {
+			break
+		}
+		if _, repeated := seenCursors[nextCursor]; repeated {
+			break
+		}
+		seenCursors[cursor] = struct{}{}
+		cursor = nextCursor
 	}
 	return s.receiveNew(ctx, consumer, block)
 }

@@ -108,6 +108,38 @@ func TestBudgetCallbacksFailClosedWithoutTerminalUsage(t *testing.T) {
 	}
 }
 
+func TestBudgetCallbacksPreserveModelErrorWithoutUsage(t *testing.T) {
+	callbacks := newBudgetCallbacks(tenant.BudgetPolicy{MaxTokensPerExecution: 3})
+	if callbacks == nil {
+		t.Fatal("budget callbacks were not created")
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("model call was rejected: %v", err)
+	}
+	providerErr := errors.New("provider timeout")
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{Error: providerErr}); err != nil {
+		t.Fatalf("after-model callback replaced model error with: %v", err)
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("budget was not released after model error: %v", err)
+	}
+}
+
+func TestBudgetCallbacksPreserveResponseErrorWithoutUsage(t *testing.T) {
+	callbacks := newBudgetCallbacks(tenant.BudgetPolicy{MaxTokensPerExecution: 3})
+	if callbacks == nil {
+		t.Fatal("budget callbacks were not created")
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("model call was rejected: %v", err)
+	}
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{
+		Response: &model.Response{Error: &model.ResponseError{Message: "provider rejected request"}},
+	}); err != nil {
+		t.Fatalf("response error was replaced by budget error: %v", err)
+	}
+}
+
 func TestDefaultEndpointPolicyRejectsNonPublicAddresses(t *testing.T) {
 	policy := DefaultEndpointPolicy{}
 	for _, endpoint := range []string{

@@ -1,6 +1,6 @@
 # 生产风险登记
 
-证据列同时列出代码/测试控制点与本次外部实测覆盖范围；风险描述保留当前实现的运行边界和恢复动作。
+证据列只说明代码/测试中存在相应的控制或观测点；不把测试代码中的 fake 当作真实 Provider，也不把 Workflow 定义当作运行结果。
 
 | Risk | Trigger | Impact | Detection | Mitigation | Recovery | Evidence |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -15,10 +15,10 @@
 | Reply delivery uncertain | Provider SendOnce 后连接断开、receipt 无效、进程退出 | 可能已发而系统不知；自动重试会重复消息 | reply `UNCERTAIN`、last_error_type、Operations reply backlog | Reply Outbox 独立 lease；不把 transport uncertain 当 retryable；binding rate limit | Provider/人工对账后处理；明确 known retryable 才有限重试 | `worker/reply.go`、`postgres/reply_outbox.go`、reply recovery tests |
 | Migration drain/copy/verify failure | active execution 不清空、source/target 后端错误、校验不一致、Worker crash | cutover 延迟或数据不可切换 | migration status、deadline、checkpoint、stuck count | source/target 行为校验；drain gate；lease/run token；checkpoint；verify before cutover | 新 Worker 接管；失败保持 source active；人工修复后重建/重跑 | `migration`、`data_migration.go`、migration E2E |
 | ConfigVersion/binding revision drift | 激活新版本、binding secret/account/status 改变、旧事件晚到 | 旧请求使用错误 backend/target，或消息越权 | execution config_version、stale binding error、channel status | immutable config；Admission pin；binding revision transaction revalidation；reply revalidate | 停用旧 binding/版本，回滚新 Admission；旧 reply 退回 PENDING 或人工处理 | `tenant.go`、`binding_route.go`、canary tests |
-| Multi-Gateway duplicate channel connection | 多个 Gateway 都枚举同一 active binding 并建立官方长连接 | Provider 重复投递、连接争用、消息重复 | binding connection status、IM callback duplicate、Provider console | 当前代码无跨 Gateway binding lease；部署保持单 channel owner；inbox 负责最终重复防护 | suspend binding/缩减 Gateway；清理重复连接；依赖 inbox 防止重复执行 | `cmd/trpc-service/main.go`、WeCom/Feishu adapter、外部多 Gateway/IM 实测 |
+| Channel owner loss or accidental duplicate | Channel owner Pod 退出、错误扩容，或旧/新 owner rollout 重叠 | IM 接入短暂中断、Provider 连接争用、重复投递 | Channel readiness、binding connection status、IM callback duplicate、deployment events | Gateway role 不启动 adapters；Channel 固定单副本 + `Recreate`，不挂 HPA；`channel_inbox` 仍做重复消息幂等。当前无 distributed binding lease/sharding | 恢复单 Channel owner；清理重复连接；等待 lease/sharding 方案后再扩展 owner 数 | `cmd/trpc-service/main.go`、`deploy/kubernetes/base/channel-deployment.yaml`、WeCom/Feishu adapter |
 | Artifact orphan or premature deletion | COS 上传后 Admission rollback/crash；metadata/object 删除不同步 | 孤儿对象、丢失仍被引用对象、存储成本增加 | artifact cleanup backlog、attempt/error、object/metadata reconciliation | scoped object key；PENDING/ATTACHED/DELETED；exact candidate lease；共享对象不补偿删除 | cleanup retry；按 metadata 重建/人工 reconcile；不删除 active reference | `artifact/cleanup.go`、`artifact_cleanup_integration_test.go` |
-| Qdrant/TencentDB/COS provider outage | 外部数据 backend unavailable、credential/endpoint invalid | 检索、记忆、媒体输入或 artifact 读写失败 | backend span/metrics、resolver error、Operations backend status | endpoint 只由 operator map；scope authorization；失败不伪造空成功 | 依赖恢复后重试可重入步骤；Knowledge/Artifact 按 checkpoint/cleanup 恢复 | resolver tests、provider integration tests、外部 Provider 故障实测 |
+| Qdrant/TencentDB/COS provider outage | 外部数据 backend unavailable、credential/endpoint invalid | 检索、记忆、媒体输入或 artifact 读写失败 | backend span/metrics、resolver error、Operations backend status | endpoint 只由 operator map；scope authorization；失败不伪造空成功 | 依赖恢复后重试可重入步骤；Knowledge/Artifact 按 checkpoint/cleanup 恢复 | resolver tests、provider integration tests |
 | Queue backlog / IM rate limit | 模型变慢、Worker 不足、每 binding 回复超过默认 5/s | queue lag、回复延迟、Provider throttling | queue lag/pending、worker utilization、reply backlog、rate-limit metrics | Worker HPA；bounded retry；Redis distributed reply limiter；reply outbox | 扩 Worker/分 binding；消费 backlog；确认 uncertain reply | `metrics.go`、`reply_limiter.go`、Grafana dashboard |
 | Secret or sensitive evidence leakage | 日志、trace、audit、E2E report 或 Admin API 输出原始 key/body | 凭据泄露、合规事故 | security Workflow/gitleaks/artifact scan；redaction tests | SecretRef + scoped env provider；API key digest；AEAD target；raw payload tracing disabled | revoke/rotate credential/key；删除暴露 artifact；审计 incident | `secret/target.go`、`audit.go`、security Workflow |
 
-以上风险已结合仓库测试和外部实测完成验证；其中多 Gateway 长连接 ownership 仍是当前部署约束，不能由水平扩展自动解决，运维需保持单 channel owner。
+以上风险均对应当前代码中的控制点、观测点和恢复动作；Gateway HTTP 水平扩展与 Channel single-owner 约束分离，不能把 Channel Adapter 随 Gateway HPA 扩展。

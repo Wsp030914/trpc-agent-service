@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,7 @@ const (
 	defaultReconnectInitial  = time.Second
 	defaultReconnectMax      = 30 * time.Second
 	defaultReconcileInterval = time.Second
+	clientCloseTimeout       = 5 * time.Second
 )
 
 var errAttachmentIngestorRequired = errors.New("attachment ingestor is required")
@@ -119,6 +121,7 @@ type Adapter struct {
 	now                func() time.Time
 	metrics            *platformmetrics.Recorder
 	clientFactory      ClientFactory
+	waitReconnect      func(context.Context, time.Duration) error
 	reconnectInitial   time.Duration
 	reconnectMax       time.Duration
 	reconcileInterval  time.Duration
@@ -126,7 +129,6 @@ type Adapter struct {
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
 	runDone   chan struct{}
-	stopMu    sync.Mutex
 	clientsMu sync.Mutex
 	clients   map[string]ClientRunner
 	runsMu    sync.Mutex
@@ -136,7 +138,8 @@ type Adapter struct {
 type wecomBindingRun struct {
 	snapshot channels.Binding
 	cancel   context.CancelFunc
-	done     chan error
+	done     chan struct{}
+	stopping atomic.Bool
 	clientMu sync.Mutex
 	client   *wecomClientHandle
 }
@@ -186,6 +189,7 @@ func NewAdapter(
 		secrets:           secrets,
 		now:               time.Now,
 		clientFactory:     defaultClientFactory,
+		waitReconnect:     waitReconnect,
 		reconnectInitial:  defaultReconnectInitial,
 		reconnectMax:      defaultReconnectMax,
 		reconcileInterval: defaultReconcileInterval,
@@ -262,7 +266,9 @@ func (a *Adapter) Run(ctx context.Context) error {
 		}
 		select {
 		case <-runCtx.Done():
-			a.stopAllBindings(context.Background())
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), clientCloseTimeout)
+			a.stopAllBindings(stopCtx)
+			stopCancel()
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -315,7 +321,7 @@ func (a *Adapter) reconcileBindings(
 			continue
 		}
 		bindingCtx, cancel := context.WithCancel(ctx)
-		run = &wecomBindingRun{snapshot: binding, cancel: cancel, done: make(chan error, 1)}
+		run = &wecomBindingRun{snapshot: binding, cancel: cancel, done: make(chan struct{})}
 		a.runsMu.Lock()
 		if existing := a.runs[key]; existing != nil {
 			a.runsMu.Unlock()
@@ -326,7 +332,10 @@ func (a *Adapter) reconcileBindings(
 		a.runsMu.Unlock()
 		go func(key string, run *wecomBindingRun, binding channels.Binding, bindingCtx context.Context) {
 			err := a.runBinding(bindingCtx, binding, run)
-			run.done <- err
+			close(run.done)
+			if run.stopping.Load() {
+				a.finishBindingRun(wecomBindingRunResult{key: key, run: run, err: err})
+			}
 			select {
 			case results <- wecomBindingRunResult{key: key, run: run, err: err}:
 			case <-bindingCtx.Done():
@@ -352,51 +361,58 @@ func (a *Adapter) finishBindingRun(result wecomBindingRunResult) {
 }
 
 func (a *Adapter) stopAllBindings(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	a.runsMu.Lock()
 	current := make(map[string]*wecomBindingRun, len(a.runs))
 	for key, run := range a.runs {
 		current[key] = run
 	}
 	a.runsMu.Unlock()
+	var wg sync.WaitGroup
 	for key, run := range current {
-		a.stopBinding(ctx, key, run)
+		wg.Add(1)
+		go func(key string, run *wecomBindingRun) {
+			defer wg.Done()
+			a.stopBinding(ctx, key, run)
+		}(key, run)
 	}
+	wg.Wait()
 }
 
 func (a *Adapter) stopBinding(ctx context.Context, key string, run *wecomBindingRun) {
 	if run == nil {
 		return
 	}
-	a.stopMu.Lock()
-	defer a.stopMu.Unlock()
+	stopCtx, stopCancel := boundedStopContext(ctx)
+	defer stopCancel()
 	a.runsMu.Lock()
 	if current := a.runs[key]; current != run {
 		a.runsMu.Unlock()
 		return
 	}
 	a.runsMu.Unlock()
+	run.stopping.Store(true)
 	run.clientMu.Lock()
 	client := run.client
 	run.clientMu.Unlock()
 	run.cancel()
 	if client != nil {
-		closeWeComClient(ctx, client)
+		closeWeComClient(stopCtx, client)
 	}
 	select {
 	case <-run.done:
-	case <-time.After(5 * time.Second):
+		a.finishBindingRun(wecomBindingRunResult{key: key, run: run})
+	case <-stopCtx.Done():
 	}
-	a.runsMu.Lock()
-	if current := a.runs[key]; current == run {
-		delete(a.runs, key)
-	}
-	a.runsMu.Unlock()
 }
 
 func (a *Adapter) runBinding(ctx context.Context, binding channels.Binding, run *wecomBindingRun) error {
 	if err := binding.Validate(); err != nil {
 		return fmt.Errorf("wecom binding: %w", err)
 	}
+	reconnectDelay := a.reconnectInitial
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -456,10 +472,17 @@ func (a *Adapter) runBinding(ctx context.Context, binding channels.Binding, run 
 		}
 		if runErr != nil {
 			a.recordConnection(ctx, snapshot, channels.ConnectionDegraded, runErr)
+		} else {
+			reconnectDelay = a.reconnectInitial
 		}
-		if err := waitReconnect(ctx, a.reconnectInitial, a.reconnectMax); err != nil {
+		wait := a.waitReconnect
+		if wait == nil {
+			wait = waitReconnect
+		}
+		if err := wait(ctx, reconnectDelay); err != nil {
 			return err
 		}
+		reconnectDelay = nextBackoff(reconnectDelay, a.reconnectMax)
 	}
 }
 
@@ -467,7 +490,10 @@ func closeWeComClient(ctx context.Context, handle *wecomClientHandle) {
 	if handle == nil {
 		return
 	}
-	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	closeCtx, cancel := context.WithTimeout(ctx, clientCloseTimeout)
 	defer cancel()
 	_ = handle.close(closeCtx)
 }
@@ -608,14 +634,16 @@ func (a *Adapter) Close(ctx context.Context) error {
 	runCancel := a.runCancel
 	runDone := a.runDone
 	a.runMu.Unlock()
+	stopCtx, stopCancel := boundedStopContext(ctx)
+	defer stopCancel()
 	if runCancel != nil {
 		runCancel()
-		a.stopAllBindings(context.WithoutCancel(ctx))
+		a.stopAllBindings(stopCtx)
 		select {
 		case <-runDone:
 			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-stopCtx.Done():
+			return stopCtx.Err()
 		}
 	}
 	a.clientsMu.Lock()
@@ -626,7 +654,7 @@ func (a *Adapter) Close(ctx context.Context) error {
 	a.clientsMu.Unlock()
 	var result error
 	for _, client := range clients {
-		result = errors.Join(result, client.Close(ctx))
+		result = errors.Join(result, client.Close(stopCtx))
 	}
 	return result
 }
@@ -649,12 +677,19 @@ func bindingKey(binding channels.BindingSnapshot) string {
 	return binding.TenantID + "\x00" + binding.AppID + "\x00" + binding.BindingID
 }
 
-func waitReconnect(ctx context.Context, initial, maximum time.Duration) error {
+func boundedStopContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, clientCloseTimeout)
+}
+
+func waitReconnect(ctx context.Context, initial time.Duration) error {
 	if initial <= 0 {
 		initial = defaultReconnectInitial
-	}
-	if maximum < initial {
-		maximum = initial
 	}
 	timer := time.NewTimer(initial)
 	defer timer.Stop()

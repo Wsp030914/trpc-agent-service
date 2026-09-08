@@ -183,6 +183,145 @@ func TestCloseLetsRunOwnActiveClientShutdown(t *testing.T) {
 	}
 }
 
+func TestCloseBoundsNonCooperativeBindingShutdown(t *testing.T) {
+	bindings := []channels.Binding{
+		testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "secret-a"),
+		testWeComBinding("tenant-b", "support", "binding-b", "bot-b", "secret-b"),
+		testWeComBinding("tenant-c", "support", "binding-c", "bot-c", "secret-c"),
+	}
+	source := newMutableWeComBindingSource(bindings...)
+	secrets := testWeComSecrets{key: bindings[0], value: "secret-a", more: map[string]string{}}
+	for _, binding := range bindings[1:] {
+		secrets.more[testWeComSecretKey(binding)] = "secret-" + string(binding.BindingID[len(binding.BindingID)-1])
+	}
+	started := make(chan struct{}, len(bindings))
+	release := make(chan struct{})
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newWeComRecordingAdmitter()),
+		secrets,
+		WithClientFactory(func(channels.BindingSnapshot, string, MessageHandler) (ClientRunner, error) {
+			return &wecomNonCooperativeRunner{started: started, release: release}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(runCtx) }()
+	for range bindings {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for non-cooperative binding")
+		}
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	startedAt := time.Now()
+	err = adapter.Close(shutdownCtx)
+	cancelShutdown()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("close elapsed = %s, want one bounded grace period", elapsed)
+	}
+
+	close(release)
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("adapter run did not finish after releasing non-cooperative clients")
+	}
+}
+
+func TestTimedOutBindingRunRemainsUntilFinished(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "secret-a")
+	adapter := newWeComTestAdapter(t, newMutableWeComBindingSource(binding), newWeComRecordingAdmitter(), testWeComSecrets{key: binding, value: "secret-a"})
+	key := bindingKey(binding.Snapshot())
+	_, cancelRun := context.WithCancel(context.Background())
+	run := &wecomBindingRun{snapshot: binding, cancel: cancelRun, done: make(chan struct{})}
+	adapter.runsMu.Lock()
+	adapter.runs[key] = run
+	adapter.runsMu.Unlock()
+
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	adapter.stopBinding(stopCtx, key, run)
+	cancelStop()
+	adapter.runsMu.Lock()
+	_, stillPresent := adapter.runs[key]
+	adapter.runsMu.Unlock()
+	if !stillPresent {
+		t.Fatal("timed-out binding run was removed before it finished")
+	}
+
+	var factoryCalls atomic.Int32
+	adapter.clientFactory = func(channels.BindingSnapshot, string, MessageHandler) (ClientRunner, error) {
+		factoryCalls.Add(1)
+		return &wecomFailingRunner{}, nil
+	}
+	if err := adapter.reconcileBindings(context.Background(), []channels.Binding{binding}, make(chan wecomBindingRunResult, 1)); err != nil {
+		t.Fatalf("reconcile binding: %v", err)
+	}
+	if got := factoryCalls.Load(); got != 0 {
+		t.Fatalf("replacement client factory calls = %d, want 0", got)
+	}
+
+	close(run.done)
+	adapter.finishBindingRun(wecomBindingRunResult{key: key, run: run})
+}
+
+func TestRunUsesCappedReconnectBackoff(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "secret-a")
+	source, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newWeComRecordingAdmitter()),
+		testWeComSecrets{key: binding, value: "secret-a"},
+		WithReconnectDelay(5*time.Millisecond, 20*time.Millisecond),
+		WithClientFactory(func(channels.BindingSnapshot, string, MessageHandler) (ClientRunner, error) {
+			return &wecomFailingRunner{}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopErr := errors.New("stop reconnect test")
+	var delays []time.Duration
+	adapter.waitReconnect = func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		if len(delays) == 4 {
+			return stopErr
+		}
+		return nil
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(context.Background()) }()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, stopErr) {
+			t.Fatalf("run error = %v, want reconnect test stop error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconnect test did not finish")
+	}
+	expected := []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond}
+	if len(delays) != len(expected) {
+		t.Fatalf("reconnect delays = %v, want %v", delays, expected)
+	}
+	for i := range expected {
+		if delays[i] != expected[i] {
+			t.Fatalf("reconnect delay[%d] = %s, want %s", i, delays[i], expected[i])
+		}
+	}
+}
+
 func TestRunRebuildsChangedBindingAndStopsSuspendedBinding(t *testing.T) {
 	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "secret-a")
 	updated := binding
@@ -463,6 +602,28 @@ type wecomCloseCountingRunner struct {
 	closeGate    chan struct{}
 	closeCalls   atomic.Int32
 }
+
+type wecomNonCooperativeRunner struct {
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+type wecomFailingRunner struct{}
+
+func (r *wecomNonCooperativeRunner) Run(ctx context.Context) error {
+	r.started <- struct{}{}
+	<-r.release
+	return ctx.Err()
+}
+
+func (*wecomNonCooperativeRunner) Close(context.Context) error { return nil }
+
+func (*wecomFailingRunner) Run(context.Context) error { return errors.New("fake client stopped") }
+
+func (*wecomFailingRunner) Close(context.Context) error { return nil }
+
+var _ ClientRunner = (*wecomNonCooperativeRunner)(nil)
+var _ ClientRunner = (*wecomFailingRunner)(nil)
 
 func (r *wecomCloseCountingRunner) Run(ctx context.Context) error {
 	close(r.started)

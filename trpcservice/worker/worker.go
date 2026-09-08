@@ -372,9 +372,40 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	}
 	var sinkErr error
 	var runnerErr error
-	sinkTimedOut := false
 	approvalBoundary := false
-	for evt := range events {
+	var drainTimer *time.Timer
+	var drainDone <-chan time.Time
+	runnerDone := runnerCtx.Done()
+	beginDrain := func() {
+		if drainTimer != nil {
+			return
+		}
+		drainTimer = time.NewTimer(w.eventSinkTimeout())
+		drainDone = drainTimer.C
+	}
+	defer func() {
+		if drainTimer != nil {
+			drainTimer.Stop()
+		}
+	}()
+drainLoop:
+	for {
+		var evt *event.Event
+		var ok bool
+		select {
+		case <-drainDone:
+			break drainLoop
+		case <-runnerDone:
+			// Any runner cancellation can leave an event channel open when
+			// the underlying model or tool does not cooperate. Drain only
+			// for the same bounded interval used after sink failure.
+			runnerDone = nil
+			beginDrain()
+		case evt, ok = <-events:
+			if !ok {
+				break drainLoop
+			}
+		}
 		if evt == nil {
 			continue
 		}
@@ -393,7 +424,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 			runnerErr = fmt.Errorf("runner event: %w", evt.Error)
 		}
 		w.accumulateUsage(&result, evt)
-		if w.Events == nil || sinkTimedOut || runnerCtx.Err() != nil {
+		if w.Events == nil || sinkErr != nil || runnerCtx.Err() != nil {
 			continue
 		}
 		eventExec := exec
@@ -409,9 +440,11 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		if err := w.handleRunnerEvent(runnerCtx, eventExec, evt); err != nil {
 			if sinkErr == nil {
 				sinkErr = err
-			}
-			if errors.Is(err, context.DeadlineExceeded) {
-				sinkTimedOut = true
+				// Event persistence is part of the execution safety boundary.
+				// Stop the runner before it can issue another model or tool call,
+				// then drain already-produced events for a bounded period.
+				cancelModel()
+				beginDrain()
 			}
 		}
 		approvalPending, _ = approval.snapshot()
@@ -419,14 +452,14 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 			approvalBoundary = true
 		}
 	}
-	if err := runnerCtx.Err(); err != nil {
-		return result, classifySessionLeaseFailure(runCtx, result.RunnerStarted, err)
-	}
 	if sinkErr != nil {
 		// The runner may already have executed a side-effecting tool when event
 		// persistence failed. Do not let Consumer turn a projection failure into
 		// a false FAILED result or blindly replay the whole execution.
 		return result, NewSideEffectUncertainError(sinkErr)
+	}
+	if err := runnerCtx.Err(); err != nil {
+		return result, classifySessionLeaseFailure(runCtx, result.RunnerStarted, err)
 	}
 	if runnerErr != nil {
 		return result, runnerErr

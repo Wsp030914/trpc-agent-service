@@ -51,6 +51,10 @@ var (
 	// ErrChannelBindingSnapshotStale means a channel binding snapshot no longer
 	// matches the authoritative Binding row.
 	ErrChannelBindingSnapshotStale = errors.New("channel binding snapshot is stale")
+	// ErrInvalidArtifactRef means a client supplied an invalid pinned artifact
+	// reference. It is distinct from admission backend failures so protocol
+	// adapters can return a client error instead of a server error.
+	ErrInvalidArtifactRef = errors.New("invalid artifact ref")
 )
 
 // Message is the normalized user input passed from gateway to workers.
@@ -92,18 +96,11 @@ func (m Message) Validate() error {
 		return errors.New("message text is not valid utf-8")
 	}
 	for index, ref := range m.ArtifactRefs {
-		if !validArtifactRef(ref) {
-			return fmt.Errorf("artifact ref %d is invalid", index)
+		if _, _, err := ParseArtifactRef(ref); err != nil {
+			return fmt.Errorf("%w %d: %w", ErrInvalidArtifactRef, index, err)
 		}
 	}
 	return nil
-}
-
-func validArtifactRef(ref string) bool {
-	return strings.HasPrefix(ref, "artifact://") &&
-		strings.TrimSpace(strings.TrimPrefix(ref, "artifact://")) != "" &&
-		utf8.ValidString(ref) &&
-		!strings.ContainsAny(ref, "\r\n\t")
 }
 
 // TenantResolver supplies tenant routing from an authentication or verification boundary.

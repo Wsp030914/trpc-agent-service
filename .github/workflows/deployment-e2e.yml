@@ -33,9 +33,9 @@ jobs:
         run: |
           set -euo pipefail
           docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml \
-            up -d --build --wait postgres redis qdrant otel-collector jaeger prometheus grafana gateway worker-1 worker-2
+            up -d --build --wait postgres redis qdrant otel-collector jaeger prometheus grafana gateway channel worker-1 worker-2
           dc() { docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml "$@"; }
-          for service in postgres redis qdrant otel-collector jaeger prometheus grafana gateway worker-1 worker-2; do
+          for service in postgres redis qdrant otel-collector jaeger prometheus grafana gateway channel worker-1 worker-2; do
             dc ps --status running --services | grep -Fx "$service"
           done
           curl -fsS http://127.0.0.1:8080/readyz >/dev/null
@@ -59,7 +59,7 @@ jobs:
               break
             fi
             if [ "$attempt" = 30 ]; then
-              dc logs --no-color gateway worker-1 worker-2
+              dc logs --no-color gateway channel worker-1 worker-2
               exit 1
             fi
             sleep 2
@@ -77,7 +77,7 @@ jobs:
           set -euo pipefail
           mkdir -p test-results
           docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml \
-            logs --no-color postgres redis qdrant otel-collector jaeger prometheus grafana gateway worker-1 worker-2 \
+            logs --no-color postgres redis qdrant otel-collector jaeger prometheus grafana gateway channel worker-1 worker-2 \
             > test-results/compose.log 2>&1 || true
           docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml \
             ps -a > test-results/compose-ps.txt 2>&1 || true

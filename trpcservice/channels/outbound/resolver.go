@@ -32,8 +32,9 @@ type replyBindingKey struct {
 	bindingRevision int64
 }
 
-// NewResolver creates an IM outbound resolver. Provider clients remain
-// single-call values; the durable outbox owns retries and ordering.
+// NewResolver creates an IM outbound resolver for the single Channel owner.
+// Provider clients remain binding-scoped values; the durable outbox owns
+// retries and ordering.
 func NewResolver(
 	store *postgres.Store,
 	secrets platformsecret.SecretProvider,
@@ -50,8 +51,8 @@ func NewResolver(
 	}, nil
 }
 
-// ResolveReplyProvider revalidates the binding revision before creating one
-// provider client for the delivery.
+// ResolveReplyProvider revalidates the binding revision before returning the
+// binding-scoped provider client used by the Channel reply sender.
 func (r *Resolver) ResolveReplyProvider(
 	ctx context.Context,
 	delivery worker.ReplyDelivery,

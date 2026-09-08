@@ -22,26 +22,26 @@
 - API key、模型 key、数据库 DSN、IM secret 均通过 scoped `SecretProvider` 解析。平台数据库保存引用、digest 或加密 envelope，不保存原始凭据。日志、audit 和 trace 不包含 prompt、tool arguments、provider body；错误和 audit metadata 还会做 PII/credential redaction。
 - 审计查询由 Admin principal 的 role 和 tenant allowlist 决定；Operator/Auditor 不能靠请求参数扩大作用域。Control Plane 与 data-plane bearer token 分离。
 
-这套机制同时通过了代码级和外部部署级租户隔离实测；跨组织权限审计仍由部署环境的 IAM/审计系统负责，平台只提供 scope、secret 和 audit 边界。
+这套机制定义了代码级租户隔离契约；真实生产集群、SecretProvider 和跨组织权限审计属于部署环境边界，不由仓库内测试单独证明。
 
 ## 3. Gateway / Worker 节点化架构
 
-一个 `trpc-service` 进程可运行 `gateway`、`worker` 或 `all` 角色。推荐将两者分开：
+一个 `trpc-service` 进程可运行 `gateway`、`channel`、`worker` 或 `all` 角色。推荐将三类运行职责分开：
 
-- Gateway 暴露 `/v1/chat/completions`、`/admin/v1/*`，执行身份解析、配置 pin、附件预处理、原子 Admission，并运行 dispatch Relay。它不运行真正的 Agent Runner。
-- Channel Adapter 在 Gateway 进程内运行。当前是 WeCom Bot WebSocket 和 Feishu/Lark WebSocket，每个 active binding 在一个进程内拥有连接句柄、重连和 connection status。它们把 provider event 规范化后送入同一个 Gateway Admission；不会绕过队列直接调用 Runner。
-- Worker 消费 Redis Stream，向 PostgreSQL claim execution，并用 Redis Session lease 串行化同一 partition。随后按 execution 的精确 ConfigVersion 构造 tRPC-Agent-Go `LLMAgent`/`Runner`，执行模型、工具、Session、Memory、Knowledge 和 Artifact；它还负责 Reply Sender、迁移 worker、artifact cleanup 和 heartbeat。
-- PostgreSQL 是控制面、execution、event、outbox、approval、migration、audit 和 channel metadata 的权威库；Redis 是 dispatch transport、consumer pending、execution/session lease、分布式 reply limiter，以及可选的 Session 数据后端。Qdrant、COS、TencentDB 是各自领域的外部数据面，不能替代平台 SQL catalog 和执行状态。
+- Gateway 暴露 `/v1/chat/completions`、`/admin/v1/*`，执行身份解析、配置 pin、附件预处理、原子 Admission，并运行 dispatch Relay。它不运行真正的 Agent Runner，也不启动任何 IM 长连接，因此可以多副本和 HPA 扩展。
+- Channel Adapter 运行在独立的 `channel` 角色进程中。当前是 WeCom Bot WebSocket 和 Feishu/Lark WebSocket，每个 active binding 在这个单 owner 进程内拥有连接句柄、重连和 connection status。Adapter 在本进程构造同一个 `gateway.Gateway` Admission 组件，把 provider event 规范化后提交到同一 PostgreSQL Admission/outbox 链路；不会绕过队列直接调用 Runner，也不发现具体 Worker。当前没有 binding lease、leader election 或 channel sharding，所以该角色在 Compose/Kubernetes 中固定单副本。
+- Worker 消费 Redis Stream，向 PostgreSQL claim execution lease，并用 Redis Session Lease/Session Lock 串行化同一 partition。随后按 execution 的精确 ConfigVersion 构造 tRPC-Agent-Go `LLMAgent`/`Runner`，执行模型、工具、Session、Memory、Knowledge 和 Artifact；它还负责迁移 worker、artifact cleanup 和 heartbeat。Worker 本身没有需要复制的业务状态，可独立水平扩展。Reply Sender 与 WeCom/Feishu outbound resolver 只在单 owner 的 Channel 角色中运行，避免 Worker HPA 为同一 binding 建立重复长连接。
+- PostgreSQL 是控制面、execution lease/fence、event、outbox、approval、migration、audit 和 channel metadata 的权威库；Redis 是 dispatch transport、consumer pending、Session Lease/Session Lock、Channel 角色使用的分布式 Reply Rate Limiter，以及可选的 Session 数据后端。Qdrant、COS、TencentDB 是各自领域的外部数据面，不能替代平台 SQL catalog 和执行状态。
 
 HTTP Gateway 和 Worker 都不依赖本地业务 Session 才能正确运行，所以可以横向扩展。真正的分发不是“把请求粘到某台机器”，而是 PostgreSQL 的 durable execution + Redis Stream Consumer Group；Redis message 被重复投递时，数据库 claim 和 run token 决定谁有权转移状态。Worker 本身没有需要复制的业务状态。
 
-HTTP Admission 是无状态路径；IM 长连接由 Gateway 进程按 active binding 建立并维护，消息进入 `channel_inbox` 后由数据库幂等约束吸收重复投递。外部实测确认跨 Gateway 的连接归属必须由部署保持单一 channel owner；这属于 IM 长连接的部署约束，不应混同为 HTTP 路由粘性。
+HTTP Admission 是无状态路径；Channel Adapter 进程按 active binding 建立并维护 IM 长连接，消息进入 `channel_inbox` 后由数据库幂等约束吸收重复投递。Gateway 副本数不会再改变 IM connection ownership；Channel Deployment 的单副本和 `Recreate` rollout 是当前明确的 ownership 约束。`all` 仅用于本地或单进程部署，不能作为多副本 Channel owner。
 
 ## 4. 消息路由与 Sticky Session
 
 HTTP 请求的 session 由认证 service principal + `X-Session-ID` 组成，Channel direct 消息由稳定映射的 user ID + `default` Session ID 组成；group/topic 消息由 binding-scoped conversation 生成稳定 `conversation_id`/`session_principal_id` + `default` Session ID 组成。跨 tenant、app 或 binding 的同名外部 ID 不会复用内部主体。
 
-Gateway 在一个 PostgreSQL 事务中锁定必要的 app/binding 行，校验 active/canary config 和迁移 gate，给 Session lane 分配 `turn_seq`，插入 execution、入站 artifact 关联和 dispatch outbox。`session_lane` 的 unique `(tenant, app, session_principal, session_id, turn_seq)` 是顺序的持久证据。Worker 使用 `Scope.Key("session", principal, session)` 取得 Redis lease；同一 partition 在任意节点同一时刻只有一个 Runner 能执行。
+Gateway 在一个 PostgreSQL 事务中锁定必要的 app/binding 行，校验 active/canary config 和迁移 gate，给 Session lane 分配 `turn_seq`，插入 execution、入站 artifact 关联和 dispatch outbox。`session_lane` 的 unique `(tenant, app, session_principal, session_id, turn_seq)` 是顺序的持久证据。Worker 使用 `Scope.Key("session", principal, session)` 取得 Redis Session Lease 并持有 Session Lock；同一 partition 在任意节点同一时刻只有一个 Runner 能执行。
 
 因此当前选择“不依赖网络层 sticky session”。sticky 会把路由正确性绑定到负载均衡器和连接生命周期，而当前实现已经把顺序、状态和 ownership 放到共享后端。Sticky 仍可能作为性能优化，但不是正确性条件；任何节点都可以接收 Admission，任何 Worker 都可以接管过期 delivery/lease。
 
@@ -67,9 +67,11 @@ Admission 的线性化点是 PostgreSQL 事务提交：幂等记录、Session tu
 
 ## 8. IM 接入
 
-当前代码装配的 Channel 是两类长连接：WeCom AI Bot WebSocket 使用 Bot ID（`external_account`）和 Bot Secret；Feishu 使用 Lark WebSocket SDK、App ID 和 App Secret。Adapter 校验当前 binding 的 account/status/revision，规范化 text/image/file/mixed/card/event/unsupported，映射 direct/group/topic，建立 `channel_identity`/`channel_conversation`，然后携带 provider-neutral `ChannelInput` 进入 Gateway。
+当前代码装配的 Channel 是两类官方长连接：WeCom AI Bot WebSocket 使用 Bot ID（`external_account`）和 Bot Secret；Feishu 使用 Lark WebSocket SDK、App ID 和 App Secret。连接建立前，Adapter 通过 scoped `SecretProvider` 解析 binding secret，并校验当前 binding 的 account/status/revision；SDK/WebSocket protocol 完成 provider 认证。当前模式不提供 HTTP webhook URL，因此 README 中的 webhook URL 与 HTTP callback signature verification 对这两条接入路径均为 `NOT_APPLICABLE`，不能写成“Webhook 验签已实现”。
 
-外部 message ID 是 binding-scoped channel idempotency key；同一 ID 同一 payload 重放已有结果，不同 payload 冲突。媒体下载经过 HTTPS/public-IP/大小校验并写 COS，绑定在 pinned ConfigVersion 下。Agent durable event 在 Gateway 的 `QueuedRunner` 中投影为 OpenAI-compatible stream/non-stream；IM reply 则由 `reply_outbox` 和 Reply Sender 异步发送。当前 WeCom/Feishu 的 IM 回复投影为文本；Agent event 到 IM 的完整卡片或流式卡片映射沿当前 Provider 适配边界处理。Feishu 支持 recall inbox；WeCom/Feishu 都有 provider-specific 长度、重连、限流和错误分类。
+Adapter 规范化 text/image/file/mixed/card/event/unsupported，映射 direct/group/topic，建立 `channel_identity`/`channel_conversation`，然后携带 provider-neutral `ChannelInput` 进入 Gateway Admission。binding 的 tenant/app scope 和 revision 在连接前、入站消息和 Admission 事务中重复校验；external message ID 做去重；external user/chat/thread 通过 binding-scoped HMAC 映射到内部 identity/conversation，direct 使用 user principal，group/topic 使用 conversation principal，从而隔离 tenant/app/binding 及不同会话。
+
+外部 message ID 是 binding-scoped channel idempotency key；同一 ID 同一 payload 重放已有结果，不同 payload 冲突。媒体下载经过 HTTPS/public-IP/大小校验并写 COS，绑定在 pinned ConfigVersion 下。Agent durable event 在 Gateway 的 `QueuedRunner` 中投影为 OpenAI-compatible stream/non-stream；IM reply 则由 Channel 角色中的 `reply_outbox` 和 Reply Sender 异步发送。当前 WeCom/Feishu 的 IM 回复投影为文本；Agent event 到 IM 的完整卡片或流式卡片映射沿当前 Provider 适配边界处理。Feishu 支持 recall inbox；WeCom/Feishu 都有 provider-specific 长度、重连、限流和错误分类。
 
 当前通道组合选择 WeCom Bot WebSocket 与 Feishu/Lark WebSocket。绑定、Secret、协议校验、消息去重、身份映射、媒体 staging 和异步文本回复均沿这两条官方长连接路径实现；`public_route_id` 仅作为历史绑定字段，不参与当前通道入口。
 
@@ -77,11 +79,11 @@ Admission 的线性化点是 PostgreSQL 事务提交：幂等记录、Session tu
 
 平台把 tRPC-Agent-Go 的 tool declaration/execution/callback 作为运行时能力，把 tenant `ToolPolicy`、secret scope、execution fence、审批和审计作为平台责任。Worker 在模型提出工具调用时检查 execution lease、工具是否 executable；review-required 工具建立唯一 pending `tool_approval`，execution 进入 `WAITING_APPROVAL`，批准后继续原 execution，拒绝/过期不产生成功工具完成。
 
-预算 callback 以 execution 为单位保留 token budget，缺少可计量 usage 时 fail closed；可选的 operator model pricing 只用于成本估算。当前治理链路由 Callbacks、ToolPolicy、Budget、Approval、Secret scope 和 audit 组成；Plugin、Guardrail、MCP、Skill 在平台设计中对应 Runtime 扩展边界，实际运行以当前 ConfigVersion 固化的治理策略为准。
+预算 callback 当前只执行 tenant-app scoped 的 per-execution token limit，缺少可计量 usage 时 fail closed；可选的 operator model pricing 只用于该 execution 的成本估算。当前没有 daily tenant budget、monthly tenant budget 或 aggregate cost quota/账单系统，不能把这条能力描述成完整租户计费预算。当前治理链路由 Callbacks、ToolPolicy、Budget、Approval、Secret scope 和 audit 组成；Plugin、Guardrail、MCP、Skill 在平台设计中对应 Runtime 扩展边界，实际运行以当前 ConfigVersion 固化的治理策略为准。
 
 ## 10. Telemetry、Audit 和 Secret
 
-入口抽取 W3C `traceparent`/`tracestate`，缺省 trace identity 与 request context 关联；dispatch payload 保存 trace parent/state，Worker 和 Reply Sender 继续建立 span。span 覆盖 channel event、gateway admit、worker execute、runner/model/tool、Session、Memory、Knowledge、reply send；raw LLM request/response、消息正文、工具参数不进入 payload tracing。Telemetry 初始化或 exporter 故障不阻断核心路径，退化为 noop；这保证可用性，但意味着 trace 完整性是可选依赖。
+入口抽取 W3C `traceparent`/`tracestate`，缺省 trace identity 与 request context 关联；dispatch payload 保存 trace parent/state，Worker 和 Channel 角色中的 Reply Sender 继续建立 span。span 覆盖 channel event、gateway admit、worker execute、runner/model/tool、Session、Memory、Knowledge、reply send；raw LLM request/response、消息正文、工具参数不进入 payload tracing。Telemetry 初始化或 exporter 故障不阻断核心路径，退化为 noop；这保证可用性，但意味着 trace 完整性是可选依赖。
 
 Audit 是 metadata-only 的 PostgreSQL sink，包含 README 要求的 tenant/channel/user/session/agent/tool/decision/latency/error/cost/trace/request/config 字段，并支持控制面 actor、scope 和 query digest。记录是 best-effort，持久化失败由 metric/operation signal 暴露，不把敏感 payload 作为补偿写入。SecretProvider 的真实值只在需要的 resolver/provider 调用时出现；外部 ID 用 HMAC digest 做查找，回复 target 用 AEAD envelope 保护。
 
@@ -93,22 +95,22 @@ Audit 是 metadata-only 的 PostgreSQL sink，包含 README 要求的 tenant/cha
 
 Worker crash 后，Redis pending delivery 可被 XAUTOCLAIM；PostgreSQL execution lease 过期后可被另一 Worker claim。run token 和 execution fence 防止旧 Worker 在 lease 丢失后写终态、事件、Session 或工具权限。Redis session lease 丢失会取消 context；若 Runner 尚未启动可重试，已启动则按可能副作用处理为 uncertain。模型超时和明确的基础设施失败是 bounded retry；Side-effect unknown 不自动重试。
 
-Reply Sender 独立于 Runner：reply outbox 可以在 Agent 已成功后继续投递。已知 retryable Provider error 按 bounded delay 重试；transport/取消/receipt 缺失/lease 丢失会将 reply 标为 `UNCERTAIN`，避免不知道 Provider 是否已经发送时重复发消息。IM recall 通过 inbox 去重并取消尚未完成的 execution。
+Reply Sender 独立于 Runner，且归 Channel 角色所有：reply outbox 可以在 Agent 已成功后继续投递。已知 retryable Provider error 按 bounded delay 重试；transport/取消/receipt 缺失/lease 丢失会将 reply 标为 `UNCERTAIN`，避免不知道 Provider 是否已经发送时重复发消息。IM recall 通过 inbox 去重并取消尚未完成的 execution。
 
 Go 生命周期也属于正确性：shutdown 先 readiness false，再停止 claim；in-flight consumer 在 grace deadline 内排空；Worker 在释放 Session lease 前持续排空 Runner event channel；模型、Runner、reply、migration、heartbeat 和 adapter goroutine 都等待或受 context/timeout 约束。若 grace deadline 内无法停止，进程将错误暴露，而不是伪装成功。
 
 ## 13. 部署和容量设计
 
-最小本地拓扑是 PostgreSQL、Redis、Qdrant、一个 Gateway、两个 Worker；Compose 另提供 COS/Memory endpoint 配置和 OTel/Jaeger/Prometheus/Grafana。推荐 K8s 使用独立 Gateway/Worker Deployment、ClusterIP Service、HPA、PDB 和 `/healthz`/`/readyz`；Gateway 与 Worker 可独立扩缩，外部 PostgreSQL/Redis/Qdrant/COS/TencentDB 由运维提供。当前 Admin UI 随 Compose 的 Nginx 容器部署；Kubernetes 发布入口是 Kustomize overlay。
+最小本地拓扑是 PostgreSQL、Redis、Qdrant、一个 Gateway、一个单 owner Channel Adapter 和两个 Worker；Compose 另提供 COS/Memory endpoint 配置和 OTel/Jaeger/Prometheus/Grafana。推荐 K8s 使用独立 Gateway/Channel/Worker Deployment：Gateway 有 ClusterIP Service、HPA、PDB，可多副本；Channel 只有单副本 `Recreate` Deployment，不挂 HPA，避免 rollout 重叠连接；Worker 有独立 Service、HPA、PDB，可独立扩缩。外部 PostgreSQL/Redis/Qdrant/COS/TencentDB 由运维提供。当前 Admin UI 随 Compose 的 Nginx 容器部署；Kubernetes 发布入口是 Kustomize overlay。
 
 并发上限的第一近似是 `Worker 副本数 × TRPC_AGENT_SERVICE_WORKER_CONCURRENCY`，但同一 Session 始终串行，实际吞吐还受模型延迟、PostgreSQL event/outbox 写入、Redis Stream、Qdrant/Memory/COS、每 binding reply limit 影响。`capacity-evaluate` 和 `capacity-observe.py` 能在 disposable Compose 中测请求、延迟、Redis/PostgreSQL delta、容器 CPU/内存；它们不能给真实 Provider、生产网络或生产数据库推出安全上限。容量推导和限制见[容量文档](capacity.md)。
 
 ## 14. tRPC-Agent-Go 复用能力与平台新增能力
 
-当前实际复用：`llmagent`、`runner.Runner`、Session service、Memory ingestor、Knowledge、Artifact 和 externalization、model/openai、tool declaration/callback，以及 OpenAI server projection。平台新增：tenant/app/config/version/canary、API credential 认证、Channel binding/identity/conversation、原子 Admission、execution/turn/outbox/journal、Redis dispatch/lease、Worker claim/fence/retry、Approval、数据迁移、Artifact cleanup、审计/低基数 metrics、Secret scope/protection、WeCom/Feishu adapter 和 Admin API。
+当前实际复用：`llmagent`、`runner.Runner`、Session service、Memory ingestor、Knowledge、Artifact 和 externalization、model/openai、tool declaration/callback，以及 OpenAI server projection。平台新增：tenant/app/config/version/canary、API credential 认证、Channel binding/identity/conversation、原子 Admission、execution/turn/outbox/journal、Redis dispatch、Session Lease/Lock、Reply Rate Limiter、Worker claim/fence/retry、Approval、数据迁移、Artifact cleanup、审计/低基数 metrics、Secret scope/protection、WeCom/Feishu adapter 和 Admin API。
 
 框架提供 Graph/Chain/Parallel/Cycle、Plugin/Guardrail、MCP/Skill、AG-UI/A2A/OpenClaw 等可复用能力；当前平台 Runtime 选用 `assistant` LLMAgent、`runner.Runner`、Session/Memory/Knowledge/Artifact、tool callback 和 OpenAI projection，租户策略由平台层补充。
 
 ## 15. 当前实现边界
 
-当前实现组合形成一条可持久、可恢复、可验证的 OpenAI-compatible/WeCom/Feishu 主链路，并包含 Redis→PostgreSQL Session 与 Qdrant→Qdrant Knowledge 迁移。本文其余章节按这些真实组件、状态、仓库测试和外部实测说明设计；生产容量数值不在本文擅自展开。
+当前实现组合形成一条可持久、可恢复、可验证的 OpenAI-compatible/WeCom/Feishu 主链路，并包含 Redis→PostgreSQL Session 与 Qdrant→Qdrant Knowledge 迁移。本文其余章节按这些真实组件、状态和仓库测试证据说明设计；真实第三方账号、生产基础设施和生产容量结论见[验收矩阵](acceptance.md)的证据边界。

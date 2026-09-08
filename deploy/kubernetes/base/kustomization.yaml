@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - configmap.yaml
   - gateway-deployment.yaml
+  - channel-deployment.yaml
   - worker-deployment.yaml
   - service.yaml
   - hpa.yaml

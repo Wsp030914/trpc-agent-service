@@ -56,6 +56,14 @@ func newBudgetCallbacks(policy tenant.BudgetPolicy) *model.Callbacks {
 		if isStreamingModelResponse(args) {
 			return nil, nil
 		}
+		// Preserve the model/provider failure. A failed call without usage is
+		// not the same as a successful call whose usage cannot be trusted.
+		if args != nil && (args.Error != nil || (args.Response != nil && args.Response.Error != nil)) {
+			budget.mu.Lock()
+			budget.reserved = 0
+			budget.mu.Unlock()
+			return nil, nil
+		}
 		total, metered := modelResponseUsage(args)
 		budget.mu.Lock()
 		budget.reserved = 0

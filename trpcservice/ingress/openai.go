@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -100,7 +101,7 @@ func (h openAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	message, stream, err := validateQueuedOpenAIRequest(w, r)
 	if err != nil {
-		http.Error(w, "unsupported chat request", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	ctx, err := gateway.ContextWithAuthenticatedRequest(r.Context(), request)
@@ -171,6 +172,26 @@ func validateQueuedOpenAIRequest(w http.ResponseWriter, r *http.Request) (string
 	}
 	if hasJSONValue(request.Tools) || hasJSONValue(request.ToolChoice) {
 		return "", false, errors.New("client tools are not supported")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return "", false, err
+	}
+	normalizedFields := make(map[string]json.RawMessage, len(fields))
+	for field, value := range fields {
+		normalizedFields[strings.ToLower(field)] = value
+	}
+	for _, field := range []string{
+		"temperature",
+		"max_tokens",
+		"top_p",
+		"stop",
+		"presence_penalty",
+		"frequency_penalty",
+	} {
+		if _, provided := normalizedFields[field]; provided {
+			return "", false, fmt.Errorf("unsupported OpenAI field %q", field)
+		}
 	}
 	return request.Messages[0].Content, request.Stream, nil
 }
@@ -406,6 +427,8 @@ func writeAuthenticationError(w http.ResponseWriter, err error) {
 
 func writeAdmissionError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, gateway.ErrInvalidArtifactRef):
+		http.Error(w, "invalid artifact reference", http.StatusBadRequest)
 	case errors.Is(err, gateway.ErrAdmissionDraining):
 		w.Header().Set("Retry-After", retryAfterSeconds)
 		http.Error(w, "request admission is draining", http.StatusServiceUnavailable)

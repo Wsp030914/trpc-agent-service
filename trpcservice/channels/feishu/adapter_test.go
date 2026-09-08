@@ -236,6 +236,104 @@ func TestCloseLetsRunOwnActiveClientShutdown(t *testing.T) {
 	}
 }
 
+func TestCloseBoundsNonCooperativeBindingShutdown(t *testing.T) {
+	bindings := []channels.Binding{
+		testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "secret-a"),
+		testFeishuBinding("tenant-b", "support", "binding-b", "app-b", "secret-b"),
+		testFeishuBinding("tenant-c", "support", "binding-c", "app-c", "secret-c"),
+	}
+	source, err := config.NewStaticBindingResolver(bindings...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets := testFeishuSecrets{key: bindings[0], value: "secret-a", more: map[string]string{}}
+	for _, binding := range bindings[1:] {
+		secrets.more[testFeishuSecretKey(binding)] = "secret-" + string(binding.BindingID[len(binding.BindingID)-1])
+	}
+	started := make(chan struct{}, len(bindings))
+	release := make(chan struct{})
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newFeishuRecordingAdmitter()),
+		secrets,
+		WithClientFactory(func(channels.BindingSnapshot, string, *larkdispatcher.EventDispatcher) Client {
+			return &feishuNonCooperativeClient{started: started, release: release}
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(runCtx) }()
+	for range bindings {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for non-cooperative binding")
+		}
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	startedAt := time.Now()
+	err = adapter.Close(shutdownCtx)
+	cancelShutdown()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("close elapsed = %s, want one bounded grace period", elapsed)
+	}
+
+	close(release)
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("adapter run did not finish after releasing non-cooperative clients")
+	}
+}
+
+func TestTimedOutBindingRunRemainsUntilFinished(t *testing.T) {
+	binding := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "secret-a")
+	source, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := newFeishuTestAdapter(t, source, newFeishuRecordingAdmitter(), testFeishuSecrets{key: binding, value: "secret-a"})
+	key := bindingKey(binding.Snapshot())
+	_, cancelRun := context.WithCancel(context.Background())
+	run := &feishuBindingRun{snapshot: binding, cancel: cancelRun, done: make(chan struct{})}
+	adapter.runsMu.Lock()
+	adapter.runs[key] = run
+	adapter.runsMu.Unlock()
+
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	adapter.stopBinding(stopCtx, key, run)
+	cancelStop()
+	adapter.runsMu.Lock()
+	_, stillPresent := adapter.runs[key]
+	adapter.runsMu.Unlock()
+	if !stillPresent {
+		t.Fatal("timed-out binding run was removed before it finished")
+	}
+
+	var factoryCalls atomic.Int32
+	adapter.clientFactory = func(channels.BindingSnapshot, string, *larkdispatcher.EventDispatcher) Client {
+		factoryCalls.Add(1)
+		return &feishuFailingClient{}
+	}
+	if err := adapter.reconcileBindings(context.Background(), []channels.Binding{binding}, make(chan feishuBindingRunResult, 1)); err != nil {
+		t.Fatalf("reconcile binding: %v", err)
+	}
+	if got := factoryCalls.Load(); got != 0 {
+		t.Fatalf("replacement client factory calls = %d, want 0", got)
+	}
+
+	close(run.done)
+	adapter.finishBindingRun(feishuBindingRunResult{key: key, run: run})
+}
+
 func TestRunRebuildsChangedBindingAndStopsSuspendedBinding(t *testing.T) {
 	binding := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "secret-a")
 	updated := binding
@@ -361,6 +459,54 @@ func TestRunReconnectsAfterClientCloseWithBoundedDelay(t *testing.T) {
 	}
 }
 
+func TestRunUsesCappedReconnectBackoff(t *testing.T) {
+	binding := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "secret-a")
+	source, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(newFeishuRecordingAdmitter()),
+		testFeishuSecrets{key: binding, value: "secret-a"},
+		WithReconnectDelay(5*time.Millisecond, 20*time.Millisecond),
+		WithClientFactory(func(channels.BindingSnapshot, string, *larkdispatcher.EventDispatcher) Client {
+			return &feishuFailingClient{}
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopErr := errors.New("stop reconnect test")
+	var delays []time.Duration
+	adapter.waitReconnect = func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		if len(delays) == 4 {
+			return stopErr
+		}
+		return nil
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(context.Background()) }()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, stopErr) {
+			t.Fatalf("run error = %v, want reconnect test stop error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconnect test did not finish")
+	}
+	expected := []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond}
+	if len(delays) != len(expected) {
+		t.Fatalf("reconnect delays = %v, want %v", delays, expected)
+	}
+	for i := range expected {
+		if delays[i] != expected[i] {
+			t.Fatalf("reconnect delay[%d] = %s, want %s", i, delays[i], expected[i])
+		}
+	}
+}
+
 type feishuFakeClientInfo struct {
 	binding channels.BindingSnapshot
 	secret  string
@@ -376,6 +522,11 @@ type feishuCloseCountingClient struct {
 	closeStarted chan struct{}
 	closeGate    chan struct{}
 	closeCalls   atomic.Int32
+}
+
+type feishuNonCooperativeClient struct {
+	started chan<- struct{}
+	release <-chan struct{}
 }
 
 func (c *feishuCloseCountingClient) Start(ctx context.Context) error {
@@ -399,6 +550,16 @@ func (c *feishuCloseCountingClient) CloseAndWait(ctx context.Context) error {
 var _ Client = (*feishuCloseCountingClient)(nil)
 
 type feishuFailingClient struct{}
+
+func (c *feishuNonCooperativeClient) Start(ctx context.Context) error {
+	c.started <- struct{}{}
+	<-c.release
+	return ctx.Err()
+}
+
+func (*feishuNonCooperativeClient) CloseAndWait(context.Context) error { return nil }
+
+var _ Client = (*feishuNonCooperativeClient)(nil)
 
 type mutableFeishuBindingSource struct {
 	mu       sync.RWMutex

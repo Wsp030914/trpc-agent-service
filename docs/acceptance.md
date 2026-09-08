@@ -1,43 +1,56 @@
 # 最终验收矩阵
 
-状态依据当前代码、仓库测试、Workflow、本次文档审查和已完成的外部实测。外部实测覆盖真实 Provider、IM 账号与网络、生产部署、故障恢复和容量场景；本文不擅自补写外部报告中的数值。
+本文只根据当前工作树中的源码、部署清单、测试和 Workflow 定义判断。Workflow 定义不等于已经发生的 CI run；deterministic/stub Provider 不等于真实第三方 Provider。当前工作树没有保存可复核的外部报告、run number 或 artifact URL，因此不写 `EXTERNALLY_VERIFIED`。
 
-| Item | Requirement | Validation | Evidence | Status | Limitation |
-| --- | --- | --- | --- | --- | --- |
-| R1 tenant model | tenant/app/config/model/tool/IM/backend/audit 可表达且按 scope 校验 | 单测 + schema 约束 | `tenant_test.go`、`config_test.go`、migrations 000001–000010 | PASS | 真实组织权限系统不在范围 |
-| R1 node topology | Gateway/Worker/Channel/Admin/Telemetry 真实装配 | 构建、Compose/K8s 清单、部署 Workflow、外部部署实测 | `cmd/trpc-service/main.go`、`compose.yaml`、`deploy/kubernetes` | PASS_WITH_LIMITATION | 多 Gateway 长连接 ownership 是当前部署约束，需保持单 channel owner |
-| R1 no sticky | 任意 Worker 可消费，Session 由共享 backend/lease 串行 | multi-consumer/fence/runtime tests、外部 HA 与网络实测 | `redis/lease.go`、`postgres/execution.go`、相关 integration/E2E | PASS | — |
-| R1 isolation | tenant/app scope、tool policy、secret/log 隔离 | security/unit/integration tests、外部部署与权限实测 | `worker/security_test.go`、`secret/target_test.go`、admin read test | PASS_WITH_LIMITATION | 跨组织 IAM 由部署环境负责，平台提供 scope 和审计边界 |
-| R2 backend choice | 租户 config 选择 Backend 并由 resolver 组装 | resolver tests + runtime tests | `session/router_test.go`、各 resolver | PASS_WITH_LIMITATION | 按当前实际 resolver 组合运行；具体一致性取舍见后端适配文档 |
-| R2 Session/event/state/summary | Session 内容可持久，platform event 可 resume，summary 可迁移 | Session/migration tests | `migration/session_test.go`、`execution_event_integration_test.go` | PASS_WITH_LIMITATION | framework Session 与 SQL journal 非跨库原子 |
-| R2 Memory visibility | private Memory key scope；跨 Worker resolver | resolver test；外部 integration path | `memory/tencentdb/resolver_test.go`、外部 Memory 实测 | PASS_WITH_LIMITATION | 群聊跳过归因写入；private Memory 按 scoped key 跨节点可见 |
-| R2 Redis→SQL Session migration | drain/copy/verify/checkpoint/cutover | migration E2E Workflow、外部迁移实测 | `migration_e2e_integration_test.go`、`data_migration.go` | PASS | 当前 Session 迁移路径为 Redis→PostgreSQL |
-| R2 Knowledge migration | Knowledge 后端迁移策略 | migration tests + E2E Workflow、外部迁移实测 | Qdrant→Qdrant，SQL catalog 授权、point verify、checkpoint、ConfigVersion cutover | PASS | 当前 Knowledge 迁移路径为 Qdrant→Qdrant |
-| R2 IM idempotency | duplicate/replay/hash conflict | channel inbox integration + adapter tests、真实 Provider 重投实测 | `channel_inbox_integration_test.go`、WeCom/Feishu tests | PASS | — |
-| R3 two IM | 至少两类且含企业微信 | deterministic IM E2E path、真实账号与网络实测 | WeCom + Feishu adapter、`im-e2e.yml` | PASS | — |
-| R3 IM normalization/reply | 输入规范化、Runner event/reply projection | protocol/adapter/reply tests、真实 IM 回复实测 | `channels/*/protocol.go`、`worker/reply.go` | PASS_WITH_LIMITATION | OpenAI ingress 支持 stream/non-stream；WeCom/Feishu 当前通过 Reply Outbox 发送文本 |
-| R3 binding/auth/mapping | binding revision、secret、identity/conversation、去重 | channel/secret/inbox tests、真实 IM 绑定与鉴权实测 | `channel_identity.go`、`target.go`、migrations | PASS | 当前通道采用官方长连接 |
-| R4 governance | tool whitelist、budget、approval、IM access | governance E2E + unit tests、外部治理实测 | `governance_e2e_integration_test.go`、`approval_test.go` | PASS | 当前治理由 Callbacks、ToolPolicy、Budget 和 Approval 组合承担 |
-| R4 telemetry | trace context 跨 callback/Runner/Tool/Session/Memory/reply | telemetry/runtime tests、外部 Collector 链路实测 | `telemetry_test.go`、`runtime/observability_test.go` | PASS_WITH_LIMITATION | exporter 失败时按代码设计 noop |
-| R4 audit/security | 最低字段、脱敏、secret 不进报告 | audit/log/secret tests + security Workflow、外部密钥与日志实测 | `audit.go`、`log_test.go`、`.github/workflows/governance-security.yml` | PASS_WITH_LIMITATION | secret rotation/runbook 由 operator 负责 |
-| R5 worker/node recovery | crash/reclaim/fence/shutdown | fault E2E path + worker/main tests、外部生产故障实测 | `fault_e2e_integration_test.go`、`consumer_test.go` | PASS | — |
-| R5 reply recovery | retryable/permanent/uncertain 分类 | deterministic reply fault tests、外部 Provider 回复故障实测 | `im_deterministic_e2e_integration_test.go`、`reply_recovery_test.go` | PASS_WITH_LIMITATION | Provider 是否支持安全 query/idempotency 未统一 |
-| R5 gray/rollback | ConfigVersion canary、pause/rollback/promote、migration guard | canary/admin tests、外部发布与回滚实测 | `canary_test.go`、`admin/http_test.go` | PASS_WITH_LIMITATION | 外部 Backend 数据回滚仍需按 checkpoint 人工对账 |
-| R5 deployment | Compose + Kustomize base/overlay、probe/HPA/PDB/secret | render/Golden Path Workflow、外部生产部署实测 | `validate-deployment.sh`、`deployment-e2e.yml` | PASS | — |
-| R5 capacity | evaluator + observer + error gate | capacity unit/Workflow definition、外部容量实测 | `cmd/capacity-evaluate`、`scripts/capacity-observe.py`、`capacity.yml` | PASS | 本文不代填外部报告中的具体容量数字 |
-| Deliverable docs | 固定目录的文档和图 | file tree + cross-doc review | `docs/` 本文档集 | PASS | SVG 为 checked-in static mirror；Mermaid source 是可编辑事实源 |
-| GitHub implementation code | 需求对应的实现代码 | source/build/test/Workflow inspection、外部端到端实测 | `cmd/`、`trpcservice/`、`.github/workflows/` | PASS | 本文按当前 Go、部署和 Admin UI 实现路径记录 |
+状态含义：
 
-## 外部实测结论
+- `IMPLEMENTED`：实现路径存在，但当前证据不足以标成仓库验证。
+- `REPO_VERIFIED`：可由仓库源码、静态检查、单测、集成/E2E 测试或 CI Workflow 证据核对。
+- `EXTERNALLY_VERIFIED`：仓库中保存了真实 Provider、真实 IM、真实 Kubernetes/HA 或容量报告，可由评审复核。
+- `EXTERNAL_VERIFICATION_NOT_INCLUDED`：实现边界已明确，但当前仓库没有外部运行证据。
+- `NOT_APPLICABLE`：不适用于当前实现路径。
 
-本次外部实测覆盖真实 OpenAI-compatible Provider 与模型、WeCom/Feishu 账号和网络、TencentDB/Qdrant/COS、生产 Kubernetes、PostgreSQL/Redis HA、故障恢复、发布回滚及容量场景。对应 R1–R5 条目已更新为 `IMPLEMENTED_AND_VERIFIED` 或带有明确实现边界的 `PASS_WITH_LIMITATION`。
+## R1–R5
 
-## 当前实现范围
+| Item | Requirement | Implementation / evidence | Status | External boundary |
+| --- | --- | --- | --- | --- |
+| R1 tenant model | tenant/app/config/model/tool/IM/backend/audit 可表达并按 scope 校验 | `trpcservice/tenant`、PostgreSQL migrations、Admin/config tests | REPO_VERIFIED | 真实组织 IAM 不在仓库范围 |
+| R1 node topology | Gateway、Channel Adapter、Worker、Admin、Telemetry 真实分工 | `cmd/trpc-service/main.go`；`gateway`/`channel`/`worker` roles；Compose/Kustomize | REPO_VERIFIED | 生产 Kubernetes admission、网络和 SecretProvider 未外部验证 |
+| R1 scaling/no sticky | Gateway 可多副本；Worker pull/claim 可扩；不依赖 sticky Session | Redis Stream Consumer Group、PostgreSQL execution lease/fence、Redis Session Lease/Lock、multi-consumer/fault tests | REPO_VERIFIED | 生产 HA backend 未外部验证 |
+| R1 channel ownership | Gateway 多副本不拥有 IM 长连接；Channel 单 owner | Channel role、Compose `channel`、K8s `replicas: 1` + `Recreate`、deployment validation | REPO_VERIFIED | 尚无 distributed binding lease/leader election/channel sharding |
+| R1 isolation | tenant/app/session/tool/secret/log/audit 隔离 | scoped keys、SQL scope predicates、ToolPolicy、SecretProvider、redaction/security tests | REPO_VERIFIED | 真实跨组织 IAM/RBAC 未外部验证 |
+| R2 backend choice | Session/Memory/Knowledge/Artifact/Queue 等按 ConfigVersion 选择 | Session Router、TencentDB/Qdrant/COS resolvers、Redis/PostgreSQL store tests | REPO_VERIFIED | 外部服务 SLA/容量未外部验证 |
+| R2 ordering and migration | Session lane、event/state/summary 顺序、Redis→SQL 与 Qdrant→Qdrant 迁移 | `session_lane`、leases/fencing、migration executor/copy/verify tests/workflows | REPO_VERIFIED | 没有外部迁移报告 |
+| R2 Memory visibility | private Memory scope 跨 Worker 可解析；群聊保守跳过归因写入 | TencentDB resolver and runtime scope tests | IMPLEMENTED | 真实 TencentDB 可见性未外部验证 |
+| R2 IM idempotency | duplicate/replay/hash conflict 可持久判定 | `channel_inbox`、adapter/integration tests | REPO_VERIFIED | 真实 Provider 重投行为未外部验证 |
+| R3 two IM | 至少两类 IM，含企业微信 | WeCom Bot WebSocket + Feishu/Lark WebSocket adapters and deterministic IM workflow | REPO_VERIFIED | 无真实第三方账号/网络报告 |
+| R3 protocol/auth | 官方 WebSocket/long connection 认证、binding revision、secret scope；webhook URL/HTTP callback signature 对当前模式 N/A | adapter protocol tests、binding/secret tests、`architecture-design.md` IM section | REPO_VERIFIED | 不把 WebSocket authentication 写成 webhook 验签 |
+| R3 mapping/session/reply | normalize、direct/group/topic isolation、identity mapping、async text reply、dedupe/retry | `ChannelInput`、identity/conversation、Reply Outbox、IM deterministic tests | REPO_VERIFIED | provider-specific receipt/limit 真实行为未外部验证 |
+| R4 governance | tool whitelist、executable/review-required、approval、IM access、per-execution budget | ToolCatalog、Approval、Budget callbacks、governance E2E/unit tests | REPO_VERIFIED | 当前不是 daily/monthly/aggregate tenant billing quota |
+| R4 telemetry/audit/security | trace propagation、metrics、audit fields、redaction、secret isolation | telemetry/runtime/audit/log/secret tests、security Workflow | REPO_VERIFIED | 真实 Collector/KMS/log pipeline 未外部验证 |
+| R5 recovery | node/queue/DB/Redis/model/tool/cancel/reply failure classification and recovery | lease/fence, XAUTOCLAIM, retry/uncertain, shutdown, fault/reply tests/workflows | REPO_VERIFIED | 无生产故障演练记录 |
+| R5 canary/rollback | immutable ConfigVersion、pause/rollback/promote、migration gate | canary/Admin tests and migration guards | REPO_VERIFIED | 无生产流量编排报告 |
+| R5 deployment | Compose、Kustomize、probe、HPA/PDB、single-owner Channel | `compose.yaml`、`deploy/kubernetes`、`scripts/validate-deployment.sh`、deployment Workflow | IMPLEMENTED | 本工作树未执行真实 Kubernetes admission/HA 发布 |
+| R5 capacity | evaluator、observer、error gate、规划公式 | `cmd/capacity-evaluate`、`scripts/capacity-observe.py`、capacity Workflow | IMPLEMENTED | 没有真实 Provider/IM/生产数据库容量报告 |
+| R5 external operations | 生产 HA、RTO/RPO、真实 Provider/IM、生产容量 | 当前仅有受控测试进程和部署清单 | EXTERNAL_VERIFICATION_NOT_INCLUDED | 不把清单或 Workflow 定义写成生产验证 |
 
-- IM 主链路为 WeCom + Feishu，满足 README 的“两类且包含微信/企业微信”要求。
-- 数据迁移路径为 Session Redis→PostgreSQL 与 Knowledge Qdrant→Qdrant。
-- 当前治理路径由 Callbacks、ToolPolicy、Budget、Approval、Secret scope 和 audit 组成。
+## 交付物
 
-## 交付结论
+| ID | Deliverable | Evidence | Status |
+| --- | --- | --- | --- |
+| D1 | 架构设计文档 | `docs/architecture-design.md` | REPO_VERIFIED |
+| D2 | 系统架构图 | `docs/diagrams/system-architecture.mmd/.svg`、`system-architecture.md` | REPO_VERIFIED |
+| D3 | 核心时序图 | `docs/diagrams/core-sequence.mmd/.svg`、`core-sequence.md` | REPO_VERIFIED |
+| D4 | 数据模型 | `data-model.md`、migrations、logical/external Memory/Summary model | REPO_VERIFIED |
+| D5 | 数据同步和幂等策略 | `data-sync-idempotency.md`、Admission/lease/outbox/migration code | REPO_VERIFIED |
+| D6 | 多后端适配方案 | `backend-adaptation.md`、Session/Memory/Knowledge/Artifact resolvers | REPO_VERIFIED |
+| D7 | 至少 8 个生产风险 | `risk-register.md`，当前 16 项 | REPO_VERIFIED |
+| D8 | 基于设计的 GitHub 实现代码 | `cmd/`、`trpcservice/`、部署文件、Workflows | REPO_VERIFIED |
 
-文档、架构图、核心时序、数据模型、同步幂等、Backend 适配和 16 项风险已形成固定入口；当前验收对象是 WeCom/Feishu + OpenAI-compatible/Redis/PostgreSQL/Qdrant/COS/TencentDB 路径，均有代码、仓库测试和外部实测证据。README 中列举的其它通道或 Backend 属于可选示例，不改变当前要求的两类 IM、Session/Knowledge 迁移和多后端能力验收结论。
+## 明确未包含的外部证据
+
+- 真实 OpenAI-compatible Provider/model 的 token、费用、限流和网络行为。
+- 真实 WeCom/Feishu 账号、网络、重投、撤回、回执和第三方连接 ownership。
+- 真实 TencentDB/Qdrant/COS 的 SLA、容量、跨节点可见性和故障恢复。
+- 生产 Kubernetes、HPA/PDB、HA PostgreSQL/Redis、备份恢复以及 RTO/RPO。
+- 生产容量、SLO、IM 峰值、Session 并发上限和租户级成本。

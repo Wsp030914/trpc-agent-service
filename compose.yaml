@@ -151,6 +151,35 @@ services:
       retries: 12
       start_period: 5s
 
+  # Single IM long-connection owner. Do not scale this service until a
+  # binding lease or sharding strategy is introduced.
+  channel:
+    build: .
+    stop_grace_period: ${TRPC_AGENT_SERVICE_COMPOSE_STOP_GRACE_PERIOD:-45s}
+    environment:
+      TRPC_AGENT_SERVICE_ROLE: channel
+      TRPC_AGENT_SERVICE_POSTGRES_DSN: ${TRPC_AGENT_SERVICE_POSTGRES_DSN:?set TRPC_AGENT_SERVICE_POSTGRES_DSN in .env}
+      TRPC_AGENT_SERVICE_REDIS_URL: ${TRPC_AGENT_SERVICE_REDIS_URL:?set TRPC_AGENT_SERVICE_REDIS_URL in .env}
+      TRPC_AGENT_SERVICE_REDIS_STREAM: ${TRPC_AGENT_SERVICE_REDIS_STREAM:-trpc-agent-service:dispatch}
+      TRPC_AGENT_SERVICE_REDIS_GROUP: ${TRPC_AGENT_SERVICE_REDIS_GROUP:-workers}
+      TRPC_AGENT_SERVICE_OTEL_PROTOCOL: ${TRPC_AGENT_SERVICE_OTEL_PROTOCOL:-grpc}
+      TRPC_AGENT_SERVICE_OTEL_TRACES_ENDPOINT: ${TRPC_AGENT_SERVICE_OTEL_TRACES_ENDPOINT:-otel-collector:4317}
+      TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT: ${TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT:-otel-collector:4317}
+      TRPC_AGENT_SERVICE_COS_ENDPOINTS: '${TRPC_AGENT_SERVICE_COS_ENDPOINTS:-{}}'
+      TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS: '${TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS:-{}}'
+      TRPC_AGENT_SERVICE_HTTP_ADDR: :8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
   admin-ui:
     build: ./admin-ui
     depends_on:

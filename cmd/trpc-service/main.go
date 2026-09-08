@@ -30,6 +30,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/relay"
 	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
 
 const (
@@ -82,6 +83,7 @@ type serviceRole string
 
 const (
 	roleGateway serviceRole = "gateway"
+	roleChannel serviceRole = "channel"
 	roleWorker  serviceRole = "worker"
 	roleAll     serviceRole = "all"
 )
@@ -113,6 +115,7 @@ type serviceConfig struct {
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
 		fmt.Fprintf(os.Stderr, "usage: %s\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "roles: gateway (HTTP/Admin/relay), channel (single IM owner), worker, all (local combined)")
 		fmt.Fprintln(os.Stderr, "required: TRPC_AGENT_SERVICE_ROLE, TRPC_AGENT_SERVICE_POSTGRES_DSN, TRPC_AGENT_SERVICE_REDIS_URL")
 		fmt.Fprintln(os.Stderr, "worker role also requires TRPC_AGENT_SERVICE_WORKER_ID")
 		return
@@ -158,8 +161,8 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 			MetricEndpoint: getenv(envOTELMetricsEndpoint),
 		},
 	}
-	if config.Role != roleGateway && config.Role != roleWorker && config.Role != roleAll {
-		return serviceConfig{}, fmt.Errorf("%s must be gateway, worker, or all", envRole)
+	if config.Role != roleGateway && config.Role != roleChannel && config.Role != roleWorker && config.Role != roleAll {
+		return serviceConfig{}, fmt.Errorf("%s must be gateway, channel, worker, or all", envRole)
 	}
 	if config.PostgresDSN == "" {
 		return serviceConfig{}, fmt.Errorf("%s is required", envPostgresDSN)
@@ -259,6 +262,10 @@ func (r serviceRole) runsGateway() bool {
 	return r == roleGateway || r == roleAll
 }
 
+func (r serviceRole) runsChannel() bool {
+	return r == roleChannel || r == roleAll
+}
+
 func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -343,17 +350,23 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	var ingressHandler, adminHandler http.Handler
 	var wecomAdapter *wecom.Adapter
 	var feishuAdapter *feishu.Adapter
-	if config.Role.runsGateway() {
-		ingressHandler, wecomAdapter, feishuAdapter, err = newGatewayHandler(store, artifacts)
-		if err != nil {
-			return err
+	if config.Role.runsGateway() || config.Role.runsChannel() {
+		gatewayHandler, wecom, feishu, handlerErr := newGatewayHandler(store, artifacts)
+		if handlerErr != nil {
+			return handlerErr
 		}
-		adminHandler, err = newAdminHandler(store, config.AdminToken, serviceOperationsReader{
-			store: store, redis: redisClient,
-			jaegerURL: config.JaegerURL, prometheusURL: config.PrometheusURL, grafanaURL: config.GrafanaURL,
-		})
-		if err != nil {
-			return err
+		wecomAdapter, feishuAdapter = wecom, feishu
+		if config.Role.runsGateway() {
+			ingressHandler = gatewayHandler
+		}
+		if config.Role.runsGateway() {
+			adminHandler, err = newAdminHandler(store, config.AdminToken, serviceOperationsReader{
+				store: store, redis: redisClient,
+				jaegerURL: config.JaegerURL, prometheusURL: config.PrometheusURL, grafanaURL: config.GrafanaURL,
+			})
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -381,6 +394,19 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		defer cancel()
 		serviceErr = errors.Join(serviceErr, server.shutdown(shutdownCtx))
 	}()
+
+	var replies *replyRuntime
+	if config.Role.runsChannel() {
+		replies, err = newReplyRuntime(store, redisClient, channelReplyOwner(config), os.Getenv, metricsRecorder)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if !shutdownResourceCloseSkipped(serviceErr) {
+				serviceErr = errors.Join(serviceErr, replies.close())
+			}
+		}()
+	}
 
 	var runtime *workerRuntime
 	var dispatchRelay *relay.Relay
@@ -427,7 +453,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		relayDone = done
 	}
 	var providerDone <-chan error
-	if wecomAdapter != nil || feishuAdapter != nil {
+	if config.Role.runsChannel() && (wecomAdapter != nil || feishuAdapter != nil) {
 		done := make(chan error, 1)
 		go func() {
 			defer close(done)
@@ -435,14 +461,29 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 		}()
 		providerDone = done
 	}
+	var replyDone <-chan error
+	if replies != nil && runtime == nil {
+		done := make(chan error, 1)
+		go func() { done <- replies.sender.Run(componentCtx) }()
+		replyDone = done
+	}
 	log.Printf("trpc-agent-service %s role=%s http=%s", trpcservice.Version, config.Role, config.HTTPAddr)
 	if runtime == nil {
 		server.MarkReady()
-		result := waitForGatewayShutdown(componentCtx, server, config.ShutdownTimeout, relayDone, providerDone)
+		result, replyErr, replyStopped := waitForGatewayShutdown(componentCtx, server, config.ShutdownTimeout, relayDone, providerDone, replyDone)
 		cancelComponents()
-		return errors.Join(result, awaitProviderExit(providerDone, config.ShutdownTimeout))
+		if !replyStopped {
+			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+			replyErr, replyStopped = awaitReplyExit(shutdownCtx, replyDone, cancelComponents)
+			cancelShutdown()
+		}
+		return errors.Join(result, awaitProviderExit(providerDone, config.ShutdownTimeout), replyShutdownError(replyErr, replyStopped))
 	}
-	result := runWorkerUntilShutdown(componentCtx, runtime, server, config.ShutdownTimeout, relayDone, providerDone)
+	var replySender *worker.ReplySender
+	if replies != nil {
+		replySender = replies.sender
+	}
+	result := runWorkerUntilShutdown(componentCtx, runtime, replySender, server, config.ShutdownTimeout, relayDone, providerDone)
 	cancelComponents()
 	return errors.Join(result, awaitProviderExit(providerDone, config.ShutdownTimeout))
 }
@@ -655,28 +696,33 @@ func waitForGatewayShutdown(
 	shutdownTimeout time.Duration,
 	relayDone <-chan error,
 	providerDone <-chan error,
-) error {
+	replyDone <-chan error,
+) (error, error, bool) {
 	defer server.MarkNotReady()
 	select {
 	case err := <-relayDone:
 		server.MarkNotReady()
-		return err
+		return err, nil, false
 	case err := <-providerDone:
 		server.MarkNotReady()
-		return err
+		return err, nil, false
+	case err := <-replyDone:
+		server.MarkNotReady()
+		return nil, err, true
 	case <-ctx.Done():
 		server.MarkNotReady()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		return server.shutdown(shutdownCtx)
+		return server.shutdown(shutdownCtx), nil, false
 	case <-server.done:
-		return server.wait()
+		return server.wait(), nil, false
 	}
 }
 
 func runWorkerUntilShutdown(
 	ctx context.Context,
 	runtime *workerRuntime,
+	replySender *worker.ReplySender,
 	server *serviceServer,
 	shutdownTimeout time.Duration,
 	relayDone <-chan error,
@@ -703,15 +749,17 @@ func runWorkerUntilShutdown(
 		migrationDone <- runtime.runDataMigrations(auxCtx)
 	}()
 	var replyDone <-chan error
-	if runtime.replySender != nil {
+	if replySender != nil {
 		done := make(chan error, 1)
-		go func() { done <- runtime.replySender.Run(auxCtx) }()
+		go func() { done <- replySender.Run(auxCtx) }()
 		replyDone = done
 	}
 	server.MarkReady()
 
 	var cause error
 	serverStopped := false
+	var replyErr error
+	replyStopped := false
 	select {
 	case err := <-relayDone:
 		server.MarkNotReady()
@@ -732,7 +780,8 @@ func runWorkerUntilShutdown(
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
 		cancelAux()
-		cause = err
+		replyErr = err
+		replyStopped = true
 	case err := <-migrationDone:
 		server.MarkNotReady()
 		runtime.consumer.StopClaiming()
@@ -761,7 +810,9 @@ func runWorkerUntilShutdown(
 	}
 	workerErr, workerStopped := awaitWorkerExit(shutdownCtx, done, cancelRun)
 	migrationErr, migrationStopped := awaitDataMigrationExit(shutdownCtx, migrationDone)
-	replyErr, replyStopped := awaitReplyExit(shutdownCtx, replyDone, cancelRun)
+	if !replyStopped {
+		replyErr, replyStopped = awaitReplyExit(shutdownCtx, replyDone, cancelRun)
+	}
 	heartbeatStopped := awaitHeartbeatExit(shutdownCtx, heartbeatDone)
 	return dataMigrationShutdownResult(
 		workerShutdownResult(
