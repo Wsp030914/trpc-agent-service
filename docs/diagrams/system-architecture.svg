@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1040" viewBox="0 0 1800 1040" role="img" aria-labelledby="title desc">
+  <title id="title">trpc-agent-service system architecture</title>
+  <desc id="desc">A compact layered architecture with one primary path from IM and API clients through Channel normalization, Gateway Admission, PostgreSQL, Redis dispatch, Worker runtime, durable reply handling and the Channel outbound resolver.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="11" markerHeight="11" refX="10" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L11,3.5 L0,7 z" fill="#475569"/></marker>
+    <marker id="darrow" markerWidth="11" markerHeight="11" refX="10" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L11,3.5 L0,7 z" fill="#64748b"/></marker>
+    <style>
+      .bg{fill:#f8fafc}.title{font:700 28px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;fill:#172b4d}.subtitle{font:14px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;fill:#52606d}.group{stroke-width:2;rx:16}.group-title{font:700 16px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}.node{stroke:#64748b;stroke-width:1.4;rx:10}.node-title{font:600 14px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;fill:#172b4d;text-anchor:middle}.node-sub{font:12px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;fill:#52606d;text-anchor:middle}.edge{stroke:#475569;stroke-width:2;fill:none;marker-end:url(#arrow)}.support{stroke:#64748b;stroke-width:1.6;stroke-dasharray:7 5;fill:none;marker-end:url(#darrow)}.edge-label{font:12px -apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif;fill:#475569}.footer{font:13px -apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif;fill:#52606d}
+    </style>
+  </defs>
+  <rect class="bg" width="1800" height="1040"/>
+  <text class="title" x="50" y="42">trpc-agent-service 系统架构</text>
+  <text class="subtitle" x="50" y="70">单行主链路先回答“请求如何通过系统”；下方只放运行时依赖，右侧回线表示异步 IM 回包。</text>
+
+  <rect class="group" x="30" y="100" width="1740" height="135" fill="#fff7ed" stroke="#f59e0b"/>
+  <text class="group-title" x="55" y="130" fill="#9a3412">External Systems</text>
+  <rect class="node" x="100" y="135" width="170" height="55" fill="#ffedd5"/><text class="node-title" x="185" y="166">IM 用户</text><text class="node-sub" x="185" y="184">actor</text>
+  <rect class="node" x="330" y="135" width="300" height="55" fill="#ffedd5"/><text class="node-title" x="480" y="166">WeCom / Feishu 平台</text><text class="node-sub" x="480" y="184">WebSocket / Open API</text>
+  <rect class="node" x="850" y="135" width="240" height="55" fill="#ffedd5"/><text class="node-title" x="970" y="166">OpenAI-compatible Client</text><text class="node-sub" x="970" y="184">HTTP / chat completions</text>
+  <rect class="node" x="1190" y="135" width="260" height="55" fill="#ffedd5"/><text class="node-title" x="1320" y="166">Operator / Admin UI</text><text class="node-sub" x="1320" y="184">control-plane entry</text>
+
+  <rect class="group" x="30" y="275" width="260" height="305" fill="#eff6ff" stroke="#60a5fa"/>
+  <text class="group-title" x="50" y="305" fill="#1d4ed8">Channel</text>
+  <rect class="node" x="55" y="350" width="210" height="85" fill="#dbeafe"/><text class="node-title" x="160" y="380">WeCom + Feishu</text><text class="node-title" x="160" y="399">Adapters / Normalize</text><text class="node-sub" x="160" y="422">trusted identity + scope</text>
+  <rect class="node" x="55" y="490" width="210" height="60" fill="#dbeafe"/><text class="node-title" x="160" y="518">Channel Outbound</text><text class="node-sub" x="160" y="538">binding-scoped SendOnce</text>
+
+  <rect class="group" x="310" y="275" width="390" height="305" fill="#ecfdf5" stroke="#34d399"/>
+  <text class="group-title" x="330" y="305" fill="#047857">Control Plane / Gateway</text>
+  <rect class="node" x="335" y="350" width="180" height="85" fill="#d1fae5"/><text class="node-title" x="425" y="380">Gateway Admission</text><text class="node-sub" x="425" y="403">OpenAI Ingress / Admin API</text><text class="node-sub" x="425" y="421">auth + ConfigVersion pin</text>
+  <rect class="node" x="535" y="350" width="135" height="85" fill="#bbf7d0"/><text class="node-title" x="602" y="380">PostgreSQL</text><text class="node-title" x="602" y="399">Authority</text><text class="node-sub" x="602" y="421">execution / event / outbox</text>
+
+  <rect class="group" x="720" y="275" width="300" height="305" fill="#f5f3ff" stroke="#a78bfa"/>
+  <text class="group-title" x="740" y="305" fill="#6d28d9">Queue / Coordination</text>
+  <rect class="node" x="745" y="350" width="250" height="85" fill="#ede9fe"/><text class="node-title" x="870" y="380">Dispatch Outbox + Redis</text><text class="node-title" x="870" y="399">Stream Group</text><text class="node-sub" x="870" y="421">durable relay / at-least-once</text>
+  <rect class="node" x="745" y="490" width="250" height="60" fill="#ede9fe"/><text class="node-title" x="870" y="518">Execution / Session Lease</text><text class="node-sub" x="870" y="538">owner / token / TTL</text>
+
+  <rect class="group" x="1040" y="275" width="730" height="305" fill="#f0fdfa" stroke="#2dd4bf"/>
+  <text class="group-title" x="1060" y="305" fill="#0f766e">Worker / Runtime</text>
+  <rect class="node" x="1065" y="350" width="220" height="85" fill="#ccfbf1"/><text class="node-title" x="1175" y="380">Worker Consumer +</text><text class="node-title" x="1175" y="399">tRPC-Agent-Go Runtime</text><text class="node-sub" x="1175" y="421">claim / fence / Runner</text>
+  <rect class="node" x="1305" y="350" width="210" height="85" fill="#ccfbf1"/><text class="node-title" x="1410" y="380">Event Journal +</text><text class="node-title" x="1410" y="399">Reply Outbox</text><text class="node-sub" x="1410" y="421">event_seq / durable result</text>
+  <rect class="node" x="1535" y="350" width="210" height="85" fill="#ccfbf1"/><text class="node-title" x="1640" y="380">Reply Sender</text><text class="node-sub" x="1640" y="403">limiter + provider send</text><text class="node-sub" x="1640" y="421">retry / permanent / uncertain</text>
+
+  <rect class="group" x="30" y="640" width="1740" height="170" fill="#f8fafc" stroke="#94a3b8"/>
+  <text class="group-title" x="55" y="670" fill="#334e68">Storage / External Provider Backends</text>
+  <rect class="node" x="60" y="700" width="250" height="65" fill="#e2e8f0"/><text class="node-title" x="185" y="728">Session</text><text class="node-sub" x="185" y="750">PostgreSQL / Redis / InMemory</text>
+  <rect class="node" x="380" y="700" width="250" height="65" fill="#e2e8f0"/><text class="node-title" x="505" y="728">TencentDB Memory</text><text class="node-sub" x="505" y="750">private memory provider</text>
+  <rect class="node" x="700" y="700" width="250" height="65" fill="#e2e8f0"/><text class="node-title" x="825" y="728">Qdrant Knowledge</text><text class="node-sub" x="825" y="750">scoped vector retrieval</text>
+  <rect class="node" x="1020" y="700" width="250" height="65" fill="#e2e8f0"/><text class="node-title" x="1145" y="728">COS Artifact</text><text class="node-sub" x="1145" y="750">pinned object staging</text>
+  <rect class="node" x="1340" y="700" width="300" height="65" fill="#e2e8f0"/><text class="node-title" x="1490" y="728">OpenAI-compatible Model</text><text class="node-sub" x="1490" y="750">model provider</text>
+
+  <rect class="group" x="30" y="840" width="1740" height="105" fill="#fff1f2" stroke="#fb7185"/>
+  <text class="group-title" x="55" y="870" fill="#be123c">Governance / Observability</text>
+  <rect class="node" x="200" y="880" width="500" height="45" fill="#ffe4e6"/><text class="node-title" x="450" y="908">ToolCatalog + Approval + Audit</text>
+  <rect class="node" x="1050" y="880" width="550" height="45" fill="#ffe4e6"/><text class="node-title" x="1325" y="908">OTel SDK / Collector → Jaeger / Prometheus / Grafana</text>
+
+  <path class="edge" d="M270 162 H330"/><text class="edge-label" x="274" y="154">inbound</text>
+  <path class="support" d="M330 178 H270"/><text class="edge-label" x="274" y="204">reply</text>
+  <path class="edge" d="M480 190 V250 H160 V350"/>
+  <path class="edge" d="M970 190 V250 H425 V350"/><text class="edge-label" x="440" y="242">HTTP</text>
+  <path class="edge" d="M1320 190 V250 H602 V350"/><text class="edge-label" x="1100" y="242">admin</text>
+  <path class="edge" d="M265 392 H335"/>
+  <path class="edge" d="M515 392 H535"/>
+  <path class="edge" d="M670 392 H745"/>
+  <path class="edge" d="M995 392 H1065"/>
+  <path class="edge" d="M1285 392 H1305"/>
+  <path class="edge" d="M1515 392 H1535"/>
+  <path class="support" d="M870 490 V465 H1025 V435 H1175"/>
+  <text class="edge-label" x="900" y="458">claim / fence</text>
+  <path class="support" d="M1175 435 V670 H185 V700"/>
+  <path class="support" d="M1175 435 V670 H505 V700"/>
+  <path class="support" d="M1175 435 V700 H825"/>
+  <path class="support" d="M1175 435 V670 H1145 V700"/>
+  <path class="support" d="M1175 435 V670 H1490 V700"/>
+  <text class="edge-label" x="1185" y="660">pinned ConfigVersion / scoped access</text>
+  <path class="edge" d="M1640 435 V600 H265 V520"/>
+  <text class="edge-label" x="1510" y="592">durable reply</text>
+  <path class="edge" d="M265 520 V620 H1780 V80 H480 V135"/>
+  <text class="edge-label" x="1510" y="612">provider SendOnce</text>
+  <path class="support" d="M1285 435 H1665 V820 H450 V880"/>
+  <path class="support" d="M1745 435 V820 H1325 V880"/>
+  <text class="edge-label" x="1480" y="812">policy / audit / telemetry</text>
+  <text class="footer" x="55" y="985">实线：主业务/控制流　·　虚线：运行时依赖、治理或观测关联　·　PostgreSQL 是平台权威状态，Redis 负责传输、租约和限流协调。</text>
+</svg>

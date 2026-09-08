@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1540" viewBox="0 0 2200 1540" role="img" aria-labelledby="title desc">
+  <title id="title">trpc-agent-service core sequence</title>
+  <desc id="desc">An IM message is authenticated, admitted transactionally, dispatched through Redis, executed by a Worker, journaled and sent through the reply outbox.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L10,3 L0,6 z" fill="#475569"/></marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 26px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; fill: #172b4d; }
+      .sub { font: 14px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; fill: #52606d; }
+      .head { fill: #dbeafe; stroke: #60a5fa; stroke-width: 1.5; rx: 8; }
+      .headtext { font: 600 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; fill: #172b4d; text-anchor: middle; }
+      .life { stroke: #94a3b8; stroke-width: 1.2; stroke-dasharray: 6 5; }
+      .msg { stroke: #475569; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+      .msgtext { font: 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; fill: #334e68; }
+      .note { fill: #fffbeb; stroke: #f59e0b; stroke-width: 1.3; rx: 8; }
+      .notetext { font: 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; fill: #78350f; }
+      .phase { font: 700 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; fill: #1e3a8a; }
+    </style>
+  </defs>
+  <rect class="bg" width="2200" height="1540"/>
+  <text class="title" x="35" y="40">核心消息时序：IM → Gateway → Agent → Tool/Session/Memory → IM</text>
+  <text class="sub" x="35" y="67">上下文：tenant_id/app_id · request_id · session_id · config_version · trace_id（W3C traceparent/tracestate）</text>
+
+  <g>
+    <rect class="head" x="20" y="100" width="105" height="56"/><text class="headtext" x="72" y="124">IM 用户</text><text class="headtext" x="72" y="143">actor</text>
+    <rect class="head" x="150" y="100" width="120" height="56"/><text class="headtext" x="210" y="124">IM Adapter</text><text class="headtext" x="210" y="143">WeCom/Feishu</text>
+    <rect class="head" x="295" y="100" width="125" height="56"/><text class="headtext" x="357" y="124">Binding/Map</text><text class="headtext" x="357" y="143">scope + session</text>
+    <rect class="head" x="445" y="100" width="125" height="56"/><text class="headtext" x="507" y="124">Gateway</text><text class="headtext" x="507" y="143">Admission</text>
+    <rect class="head" x="595" y="100" width="125" height="56"/><text class="headtext" x="657" y="124">PostgreSQL</text><text class="headtext" x="657" y="143">authority</text>
+    <rect class="head" x="745" y="100" width="125" height="56"/><text class="headtext" x="807" y="124">Dispatch</text><text class="headtext" x="807" y="143">Relay</text>
+    <rect class="head" x="895" y="100" width="125" height="56"/><text class="headtext" x="957" y="124">Redis Stream</text><text class="headtext" x="957" y="143">group</text>
+    <rect class="head" x="1045" y="100" width="125" height="56"/><text class="headtext" x="1107" y="124">Worker</text><text class="headtext" x="1107" y="143">Consumer</text>
+    <rect class="head" x="1195" y="100" width="125" height="56"/><text class="headtext" x="1257" y="124">Session</text><text class="headtext" x="1257" y="143">Lease</text>
+    <rect class="head" x="1345" y="100" width="125" height="56"/><text class="headtext" x="1407" y="124">Runner</text><text class="headtext" x="1407" y="143">Runtime</text>
+    <rect class="head" x="1495" y="100" width="125" height="56"/><text class="headtext" x="1557" y="124">Model</text><text class="headtext" x="1557" y="143">Provider</text>
+    <rect class="head" x="1645" y="100" width="125" height="56"/><text class="headtext" x="1707" y="124">Tool</text><text class="headtext" x="1707" y="143">todo_write</text>
+    <rect class="head" x="1795" y="100" width="125" height="56"/><text class="headtext" x="1857" y="124">Event/Reply</text><text class="headtext" x="1857" y="143">Outbox</text>
+    <rect class="head" x="1945" y="100" width="125" height="56"/><text class="headtext" x="2007" y="124">IM Provider</text><text class="headtext" x="2007" y="143">SendOnce</text>
+  </g>
+  <g class="life">
+    <line x1="72" y1="156" x2="72" y2="1420"/><line x1="210" y1="156" x2="210" y2="1420"/><line x1="357" y1="156" x2="357" y2="1420"/><line x1="507" y1="156" x2="507" y2="1420"/><line x1="657" y1="156" x2="657" y2="1420"/><line x1="807" y1="156" x2="807" y2="1420"/><line x1="957" y1="156" x2="957" y2="1420"/><line x1="1107" y1="156" x2="1107" y2="1420"/><line x1="1257" y1="156" x2="1257" y2="1420"/><line x1="1407" y1="156" x2="1407" y2="1420"/><line x1="1557" y1="156" x2="1557" y2="1420"/><line x1="1707" y1="156" x2="1707" y2="1420"/><line x1="1857" y1="156" x2="1857" y2="1420"/><line x1="2007" y1="156" x2="2007" y2="1420"/>
+  </g>
+
+  <text class="phase" x="35" y="195">1. Ingress / identity</text>
+  <path class="msg" d="M72 220 H210"/><text class="msgtext" x="80" y="213">external_message_id + content</text>
+  <path class="msg" d="M210 255 H357"/><text class="msgtext" x="218" y="248">verify binding account/status/revision</text>
+  <path class="msg" d="M357 290 H507"/><text class="msgtext" x="365" y="283">ChannelInput + trusted scope</text>
+  <rect class="note" x="300" y="315" width="360" height="70"/><text class="notetext" x="318" y="340">derive tenant/app, user/conversation,</text><text class="notetext" x="318" y="359">session_id=default; request_id + trace_id</text>
+
+  <text class="phase" x="35" y="425">2. Atomic Admission</text>
+  <path class="msg" d="M507 450 H657"/><text class="msgtext" x="515" y="443">BEGIN; lock app/binding; pin ConfigVersion</text>
+  <path class="msg" d="M657 485 H657"/><text class="msgtext" x="665" y="478">channel_inbox dedup + payload_hash</text>
+  <path class="msg" d="M657 520 H657"/><text class="msgtext" x="665" y="513">session_lane allocate turn_seq</text>
+  <path class="msg" d="M657 555 H657"/><text class="msgtext" x="665" y="548">execution + artifact attach + dispatch_outbox</text>
+  <path class="msg" d="M657 590 H507"/><text class="msgtext" x="515" y="583">COMMIT admitted(request_id, version, turn_seq)</text>
+  <path class="msg" d="M507 625 H210"/><text class="msgtext" x="270" y="618">admission result; no IM reply yet</text>
+  <rect class="note" x="700" y="645" width="450" height="76"/><text class="notetext" x="718" y="670">提交是线性化点：失败无 execution；成功后</text><text class="notetext" x="718" y="689">Gateway/IM 进程退出也不丢失 durable dispatch。</text>
+
+  <text class="phase" x="35" y="765">3. Dispatch / ownership</text>
+  <path class="msg" d="M807 790 H657"/><text class="msgtext" x="670" y="783">claim dispatch_outbox</text>
+  <path class="msg" d="M807 825 H957"/><text class="msgtext" x="815" y="818">XADD Dispatch(scope, request_id, traceparent)</text>
+  <path class="msg" d="M957 860 H1107"/><text class="msgtext" x="965" y="853">Consumer Group delivery / XAUTOCLAIM</text>
+  <path class="msg" d="M1107 895 H657"/><text class="msgtext" x="850" y="888">claim execution(owner, run_token); fence</text>
+  <path class="msg" d="M1107 930 H1257"/><text class="msgtext" x="1115" y="923">SET NX partition lease</text>
+  <path class="msg" d="M1257 965 H1107"/><text class="msgtext" x="1115" y="958">lease granted; losing renew cancels Context</text>
+
+  <text class="phase" x="35" y="1010">4. Agent execution</text>
+  <path class="msg" d="M1107 1035 H1407"/><text class="msgtext" x="1160" y="1028">Build Runner(pinned ConfigVersion, trace context)</text>
+  <path class="msg" d="M1407 1070 H1257"/><text class="msgtext" x="1265" y="1063">load events/state/summary</text>
+  <path class="msg" d="M1407 1105 H1557"/><text class="msgtext" x="1415" y="1098">GenerateContent(request_id)</text>
+  <path class="msg" d="M1557 1140 H1407"/><text class="msgtext" x="1415" y="1133">model event / tool call</text>
+  <path class="msg" d="M1407 1175 H1707"/><text class="msgtext" x="1480" y="1168">lease + policy authorization</text>
+  <path class="msg" d="M1707 1210 H1407"/><text class="msgtext" x="1460" y="1203">todo_write result or approval request</text>
+  <path class="msg" d="M1407 1245 H1857"/><text class="msgtext" x="1510" y="1238">Runner events + completion</text>
+  <rect class="note" x="1180" y="1270" width="590" height="72"/><text class="notetext" x="1200" y="1295">Session、Memory、Knowledge、Artifact 均按 pinned config</text><text class="notetext" x="1200" y="1314">解析；raw prompt/tool args 不进入 trace/audit payload。</text>
+
+  <text class="phase" x="35" y="1380">5. Durable result / reply</text>
+  <path class="msg" d="M1857 1405 H657"/><text class="msgtext" x="1010" y="1398">verify fence + append event_seq + update execution + reply_outbox</text>
+  <path class="msg" d="M1107 1440 H957"/><text class="msgtext" x="965" y="1433">XACK only after durable transition</text>
+  <path class="msg" d="M1857 1475 H2007"/><text class="msgtext" x="1865" y="1468">claim → rate limit → one SendOnce attempt</text>
+  <path class="msg" d="M2007 1510 H1857"/><text class="msgtext" x="1865" y="1503">SENT / retry / permanent / UNCERTAIN</text>
+  <path class="msg" d="M2007 1510 H72"/><text class="msgtext" x="820" y="1503">provider sends text reply to IM user (current projection)</text>
+</svg>

@@ -1,0 +1,72 @@
+flowchart LR
+  classDef ext fill:#fff7ed,stroke:#f59e0b,color:#7c2d12
+  classDef channel fill:#eff6ff,stroke:#60a5fa,color:#1e3a8a
+  classDef control fill:#ecfdf5,stroke:#34d399,color:#065f46
+  classDef queue fill:#f5f3ff,stroke:#a78bfa,color:#5b21b6
+  classDef worker fill:#f0fdfa,stroke:#2dd4bf,color:#115e59
+  classDef data fill:#f8fafc,stroke:#94a3b8,color:#334155
+  classDef gov fill:#fff1f2,stroke:#fb7185,color:#9f1239
+
+  subgraph EXT["External Systems"]
+    IMU["IM 用户"]
+    IMP["WeCom / Feishu 平台"]
+    CLIENT["OpenAI-compatible Client"]
+    OP["Operator / Admin UI"]
+  end
+
+  subgraph CH["Channel"]
+    CI["WeCom + Feishu Adapters / Normalize + Identity"]
+    OUT["Channel Outbound Resolver"]
+  end
+
+  subgraph CP["Control Plane / Gateway"]
+    AD["Gateway Admission<br/>OpenAI Ingress / Admin API"]
+    PG[("PostgreSQL Authority")]
+  end
+
+  subgraph QC["Queue / Coordination"]
+    DS["Dispatch Outbox + Redis Stream"]
+    LEASE["Execution / Session Lease"]
+  end
+
+  subgraph WR["Worker / Runtime"]
+    RT["Worker Consumer + tRPC-Agent-Go Runtime"]
+    RES["Event Journal + Reply Outbox + Reply Sender<br/>Reply Limiter"]
+  end
+
+  subgraph DATA["Storage / External Provider Backends"]
+    SES[("Session: PostgreSQL / Redis / InMemory")]
+    MEM[("TencentDB Memory")]
+    KNO[("Qdrant Knowledge")]
+    ART[("COS Artifact")]
+    MODEL["OpenAI-compatible Model"]
+  end
+
+  subgraph GOV["Governance / Observability"]
+    TOOL["ToolCatalog + Approval + Audit"]
+    OBS["OTel / Collector / Jaeger / Prometheus / Grafana"]
+  end
+
+  IMU --> IMP
+  IMP --> CI
+  CI --> AD
+  CLIENT --> AD
+  OP --> PG
+  AD --> PG --> DS --> RT --> RES --> OUT --> IMP
+  LEASE -. claim / session serialization .-> RT
+  RT -. pinned ConfigVersion .-> SES
+  RT -. scoped access .-> MEM
+  RT -. scoped access .-> KNO
+  RT -. scoped access .-> ART
+  RT -. model call .-> MODEL
+  RT -. authorization .-> TOOL
+  AD -. trace / metrics .-> OBS
+  RT -. trace / metrics .-> OBS
+  RES -. trace / metrics .-> OBS
+  class IMU,IMP,CLIENT,OP ext
+  class CI,OUT channel
+  class AD,PG control
+  class DS,LEASE queue
+  class RT,RES worker
+  class SES,MEM,KNO,ART,MODEL data
+  class TOOL,OBS gov
