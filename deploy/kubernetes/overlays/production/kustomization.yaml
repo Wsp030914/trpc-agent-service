@@ -4,11 +4,11 @@ namespace: trpc-agent-service-production
 resources:
   - ../../base
 images:
-  # Replace newName/newTag with an immutable release or Git SHA image. For a
-  # digest, remove newTag and use: digest: sha256:<64-hex-digits>.
+  # Fail-closed placeholder: release automation must replace this with the
+  # digest of the published service image before applying the overlay.
   - name: trpc-agent-service
     newName: trpc-agent-service
-    newTag: 0.1.0
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 patches:
   - path: configmap-patch.yaml
   - target:

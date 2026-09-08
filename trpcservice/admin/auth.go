@@ -36,6 +36,13 @@ type AdminAuthConfig struct {
 	AuditorTenantIDs  []string
 }
 
+// Validate checks that configured control-plane credentials have distinct
+// tokens and explicit tenant scopes where required.
+func (c AdminAuthConfig) Validate() error {
+	_, err := c.credentials()
+	return err
+}
+
 // AdminPrincipal is derived from a configured credential. TenantIDs is copied
 // at authentication time and is never accepted from an HTTP header.
 type AdminPrincipal struct {

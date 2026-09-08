@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -43,6 +44,10 @@ const (
 	envHTTPAddr                         = "TRPC_AGENT_SERVICE_HTTP_ADDR"
 	envWorkerID                         = "TRPC_AGENT_SERVICE_WORKER_ID"
 	envAdminToken                       = "TRPC_AGENT_SERVICE_ADMIN_TOKEN"
+	envOperatorToken                    = "TRPC_AGENT_SERVICE_OPERATOR_TOKEN"
+	envOperatorTenantIDs                = "TRPC_AGENT_SERVICE_OPERATOR_TENANT_IDS"
+	envAuditorToken                     = "TRPC_AGENT_SERVICE_AUDITOR_TOKEN"
+	envAuditorTenantIDs                 = "TRPC_AGENT_SERVICE_AUDITOR_TENANT_IDS"
 	envTencentDBGateways                = "TRPC_AGENT_SERVICE_TENCENTDB_GATEWAYS"
 	envShutdownTimeout                  = "TRPC_AGENT_SERVICE_SHUTDOWN_TIMEOUT"
 	envCOSEndpoints                     = "TRPC_AGENT_SERVICE_COS_ENDPOINTS"
@@ -98,6 +103,10 @@ type serviceConfig struct {
 	HTTPAddr                    string
 	WorkerID                    string
 	AdminToken                  string
+	OperatorToken               string
+	OperatorTenantIDs           []string
+	AuditorToken                string
+	AuditorTenantIDs            []string
 	ShutdownTimeout             time.Duration
 	ModelTimeout                time.Duration
 	ArtifactRetention           time.Duration
@@ -148,6 +157,10 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 		HTTPAddr:          getenv(envHTTPAddr),
 		WorkerID:          getenv(envWorkerID),
 		AdminToken:        getenv(envAdminToken),
+		OperatorToken:     getenv(envOperatorToken),
+		OperatorTenantIDs: splitCommaSeparated(getenv(envOperatorTenantIDs)),
+		AuditorToken:      getenv(envAuditorToken),
+		AuditorTenantIDs:  splitCommaSeparated(getenv(envAuditorTenantIDs)),
 		ShutdownTimeout:   defaultShutdownTimeout,
 		ModelTimeout:      defaultModelTimeout,
 		ArtifactRetention: defaultArtifactRetention,
@@ -187,6 +200,11 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 	}
 	if config.Role.runsGateway() && config.DispatcherID == "" {
 		return serviceConfig{}, fmt.Errorf("%s is required for gateway role", envDispatcherID)
+	}
+	if config.Role.runsGateway() {
+		if err := config.adminAuthConfig().Validate(); err != nil {
+			return serviceConfig{}, fmt.Errorf("admin authentication: %w", err)
+		}
 	}
 	if value := getenv(envShutdownTimeout); value != "" {
 		duration, err := time.ParseDuration(value)
@@ -360,7 +378,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 			ingressHandler = gatewayHandler
 		}
 		if config.Role.runsGateway() {
-			adminHandler, err = newAdminHandler(store, config.AdminToken, serviceOperationsReader{
+			adminHandler, err = newAdminHandler(store, config.adminAuthConfig(), serviceOperationsReader{
 				store: store, redis: redisClient,
 				jaegerURL: config.JaegerURL, prometheusURL: config.PrometheusURL, grafanaURL: config.GrafanaURL,
 			})
@@ -594,7 +612,7 @@ func runChannelAdapters(
 	return firstErr
 }
 
-func newAdminHandler(store *postgres.Store, token string, operations ...admin.OperationsReader) (http.Handler, error) {
+func newAdminHandler(store *postgres.Store, authConfig admin.AdminAuthConfig, operations ...admin.OperationsReader) (http.Handler, error) {
 	if store == nil {
 		return nil, errors.New("postgres store is required")
 	}
@@ -608,7 +626,28 @@ func newAdminHandler(store *postgres.Store, token string, operations ...admin.Op
 		}
 		api.Operations = operations[0]
 	}
-	return admin.NewHTTPHandler(api, token)
+	return admin.NewHTTPHandlerWithAuth(api, authConfig)
+}
+
+func (c serviceConfig) adminAuthConfig() admin.AdminAuthConfig {
+	return admin.AdminAuthConfig{
+		SystemAdminToken:  c.AdminToken,
+		OperatorToken:     c.OperatorToken,
+		OperatorTenantIDs: c.OperatorTenantIDs,
+		AuditorToken:      c.AuditorToken,
+		AuditorTenantIDs:  c.AuditorTenantIDs,
+	}
+}
+
+func splitCommaSeparated(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
 }
 
 type serviceOperationsReader struct {

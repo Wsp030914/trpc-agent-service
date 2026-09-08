@@ -23,7 +23,8 @@ import (
 )
 
 const (
-	maxOpenAIRequestBytes = 1 << 20
+	maxOpenAIRequestBytes  = 1 << 20
+	maxOpenAIIdentityBytes = 256
 
 	headerRequestID        = "X-Request-ID"
 	headerIdempotencyKey   = "Idempotency-Key"
@@ -400,7 +401,11 @@ func optionalHeader(r *http.Request, name string) (string, error) {
 	if len(values) == 0 {
 		return "", nil
 	}
-	return strings.TrimSpace(values[0]), nil
+	value := strings.TrimSpace(values[0])
+	if len(value) > maxOpenAIIdentityBytes {
+		return "", errInvalidRequestIdentity
+	}
+	return value, nil
 }
 
 func rejectHeader(r *http.Request, name string) error {

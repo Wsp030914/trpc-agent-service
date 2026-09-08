@@ -315,6 +315,61 @@ func TestConfigFromEnvironmentRequiresAdminTokenForGateway(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvironmentParsesScopedAdminRoles(t *testing.T) {
+	config, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:              string(roleGateway),
+		envPostgresDSN:       "postgres://example",
+		envRedisURL:          "redis://example:6379/0",
+		envAdminToken:        "admin-token",
+		envDispatcherID:      "gateway-1",
+		envOperatorToken:     "operator-token",
+		envOperatorTenantIDs: "tenant-a, tenant-b",
+		envAuditorToken:      "auditor-token",
+		envAuditorTenantIDs:  "tenant-b",
+	}))
+	if err != nil {
+		t.Fatalf("gateway configuration: %v", err)
+	}
+	if len(config.OperatorTenantIDs) != 2 || config.OperatorTenantIDs[0] != "tenant-a" ||
+		config.OperatorTenantIDs[1] != "tenant-b" || len(config.AuditorTenantIDs) != 1 ||
+		config.AuditorTenantIDs[0] != "tenant-b" {
+		t.Fatalf("scoped admin roles = %#v", config.adminAuthConfig())
+	}
+}
+
+func TestConfigFromEnvironmentRejectsUnscopedAdminRole(t *testing.T) {
+	_, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:          string(roleGateway),
+		envPostgresDSN:   "postgres://example",
+		envRedisURL:      "redis://example:6379/0",
+		envAdminToken:    "admin-token",
+		envDispatcherID:  "gateway-1",
+		envOperatorToken: "operator-token",
+	}))
+	if err == nil {
+		t.Fatal("gateway configuration accepted an operator without a tenant scope")
+	}
+}
+
+func TestServiceServerHasResourceLimits(t *testing.T) {
+	service, err := startServiceServer("127.0.0.1:0", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("start service server: %v", err)
+	}
+	defer func() {
+		if err := service.shutdown(context.Background()); err != nil {
+			t.Errorf("shutdown service server: %v", err)
+		}
+	}()
+
+	if service.server.ReadHeaderTimeout != serviceReadHeaderTimeout ||
+		service.server.ReadTimeout != serviceReadTimeout ||
+		service.server.IdleTimeout != serviceIdleTimeout ||
+		service.server.MaxHeaderBytes != serviceMaxHeaderBytes {
+		t.Fatalf("HTTP server limits = %#v", service.server)
+	}
+}
+
 func TestServiceHandlerRoutesGatewayIngress(t *testing.T) {
 	handler := serviceHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {

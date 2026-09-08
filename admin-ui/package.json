@@ -10,18 +10,18 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
-    "react": "latest",
-    "react-dom": "latest",
-    "react-router-dom": "latest",
-    "tdesign-react": "latest",
-    "vite": "latest",
-    "typescript": "latest"
+    "@vitejs/plugin-react": "6.1.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-router-dom": "7.18.3",
+    "tdesign-react": "1.18.3",
+    "vite": "8.2.2",
+    "typescript": "7.0.2"
   },
   "devDependencies": {
-    "@playwright/test": "latest",
-    "@types/node": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest"
+    "@playwright/test": "1.62.1",
+    "@types/node": "26.4.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7"
   }
 }

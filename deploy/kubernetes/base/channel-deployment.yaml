@@ -42,6 +42,10 @@ spec:
             # Channel does not need control-plane credentials.
             - name: TRPC_AGENT_SERVICE_ADMIN_TOKEN
               value: ""
+            - name: TRPC_AGENT_SERVICE_OPERATOR_TOKEN
+              value: ""
+            - name: TRPC_AGENT_SERVICE_AUDITOR_TOKEN
+              value: ""
           readinessProbe:
             httpGet:
               path: /readyz

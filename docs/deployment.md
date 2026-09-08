@@ -49,7 +49,7 @@ Compose 中 Gateway/Worker 的默认 `stop_grace_period` 是 45s，模型超时�
 | --- | --- | --- |
 | `dev` | Gateway/Worker 1；HPA 1–2；Channel 1 | image tag `dev` |
 | `staging` | Gateway/Worker base replicas 2、HPA max 6；Channel 1 | OTLP/Qdrant example endpoint，需要替换 |
-| `production` | Gateway/Worker 3；HPA 3–20；Channel 1；缩容窗口 600s | Channel 仍 `Recreate`；termination grace 75s；请求 1 CPU/1Gi；限制 4 CPU/4Gi；Worker concurrency 8；shutdown timeout 60s；镜像应替换为不可变 release/tag/digest |
+| `production` | Gateway/Worker 3；HPA 3–20；Channel 1；缩容窗口 600s | Channel 仍 `Recreate`；termination grace 75s；请求 1 CPU/1Gi；限制 4 CPU/4Gi；Worker concurrency 8；shutdown timeout 60s；发布前必须把 fail-closed 占位镜像替换为已发布镜像的 SHA-256 digest |
 
 HPA 只按 CPU；当前没有基于 queue lag 的 Kubernetes custom metric。Worker 扩容能增加 execution claim capacity，但不会并行执行同一 Session；Gateway 扩容能增加 HTTP capacity，且不会启动 IM 长连接。Channel Adapter 保持单 owner；跨 Gateway 不存在重复 binding connection，代价是 Channel rollout/owner 故障期间可能有短暂 IM 接入窗口，见[风险登记](risk-register.md)。
 
@@ -70,11 +70,11 @@ Kubernetes base：readiness 每 5s、timeout 3s、failure 6 次；liveness 每 1
 
 ## Secret、ConfigMap 和网络边界
 
-`deploy/kubernetes/secret.example.yaml` 只描述固定 Secret 名 `trpc-agent-service-secrets` 的形状，明确要求 out-of-band 创建。Gateway/Worker 需要 PostgreSQL DSN、Redis URL；Gateway 还需要独立 Admin token。provider key 使用：
+`deploy/kubernetes/secret.example.yaml` 只描述固定 Secret 名 `trpc-agent-service-secrets` 的形状，明确要求 out-of-band 创建。Gateway/Worker 需要 PostgreSQL DSN、Redis URL；Gateway 还需要独立 System Admin token。可选的 Operator/Auditor token 必须分别配套 `TRPC_AGENT_SERVICE_OPERATOR_TENANT_IDS` / `TRPC_AGENT_SERVICE_AUDITOR_TENANT_IDS` 逗号分隔租户 allowlist；角色 token 必须互不相同，配置不完整时 Gateway fail closed。provider key 使用：
 
 `TRPC_AGENT_SERVICE_SECRET_<tenant-id-hex>_<app-id-hex>_<secret-name-hex>_<version-hex>`。
 
-这些值由环境 `SecretProvider` 按 scope 解析。Kubernetes Worker 和 Channel 的 `envFrom` 保持 scoped Provider keys 可用，但显式把不需要的 `TRPC_AGENT_SERVICE_ADMIN_TOKEN` 置空；不要把 Admin token 暴露给 Worker/Channel。ConfigMap 只放非敏感 stream/group/timeout/endpoint 和并发配置。实际外部 SecretProvider、KMS、rotation 流程由部署环境管理；仓库只记录接口与 scope 约束，具体注入、轮换和日志边界仍需在目标环境验证。
+这些值由环境 `SecretProvider` 按 scope 解析。Kubernetes Worker 和 Channel 的 `envFrom` 保持 scoped Provider keys 可用，但显式把不需要的 System Admin、Operator、Auditor token 置空；不要把任何控制面 token 暴露给 Worker/Channel。ConfigMap 只放非敏感 stream/group/timeout/endpoint 和并发配置。实际外部 SecretProvider、KMS、rotation 流程由部署环境管理；仓库只记录接口与 scope 约束，具体注入、轮换和日志边界仍需在目标环境验证。
 
 生产模型 base URL 要使用 HTTPS，并通过代码的 egress/IP policy；COS/Qdrant/TencentDB endpoint map 由 operator 维护，tenant config 只能选择逻辑 name，不可任意注入 URL。
 
@@ -82,10 +82,10 @@ Kubernetes base：readiness 每 5s、timeout 3s、failure 6 次；liveness 每 1
 
 每个 `trpc-service` 角色在创建 PostgreSQL Store 后执行 `store.Migrate`。迁移在 `platform.schema_migration` 保存版本/name/SHA-256 checksum，并使用 PostgreSQL advisory lock；已应用 migration checksum 不匹配或数据库含未知版本时 fail closed。多个副本启动时依靠 advisory lock 串行。
 
-因此发布必须遵循：migration 只追加、不可修改已应用 SQL；DDL 在滚动期间对旧/新二进制都兼容；先完成 schema，再使用新代码；删除字段要分多阶段。Backend data cutover 不是 SQL DDL，而是[数据迁移状态机](data-sync-idempotency.md#6-session-迁移)，成功验证后才切 immutable ConfigVersion。
+因此发布必须遵循：migration 只追加、不可修改已应用 SQL；DDL 在滚动期间对旧/新二进制都兼容；先完成 schema，再使用新代码；删除字段要分多阶段。production overlay 故意使用全零 digest，不能直接发布；发布流水线必须替换为已推送镜像的真实 digest。Backend data cutover 不是 SQL DDL，而是[数据迁移状态机](data-sync-idempotency.md#6-session-迁移)，成功验证后才切 immutable ConfigVersion。
 
 ## 灰度、回滚和实际边界
 
-应用层灰度由 Admin API 的 ConfigVersion canary 完成：按稳定 Session principal/session hash 分流，支持 pause/disable/rollback/promote。Kubernetes overlay 使用普通 RollingUpdate 和 image tag/digest；代码镜像回滚与 Backend 数据回滚分开处理，target Backend 切换后按数据迁移策略完成 authority 对账。
+应用层灰度由 Admin API 的 ConfigVersion canary 完成：按稳定 Session principal/session hash 分流，支持 pause/disable/rollback/promote。Kubernetes overlay 使用普通 RollingUpdate 和不可变 image digest；代码镜像回滚与 Backend 数据回滚分开处理，target Backend 切换后按数据迁移策略完成 authority 对账。Admin UI 的 Jaeger 链接由构建参数 `VITE_JAEGER_URL` 注入；未配置时只显示 Trace ID，不猜测 `localhost` 地址。
 
 部署 Workflow 覆盖可渲染清单、Compose golden path、一次 Worker restart 后继续服务和敏感证据扫描；生产 Kubernetes admission、Ingress、secret 注入、Provider 网络、HA PostgreSQL/Redis/Qdrant 和发布恢复不由这些仓库证据直接证明。Gateway 可多副本；Channel Adapter 是单副本 `Recreate` owner，不能随 Gateway HPA 一起扩展。当前没有 distributed binding lease/leader election/channel sharding；若需要多 Channel owner，需另行设计并验证。

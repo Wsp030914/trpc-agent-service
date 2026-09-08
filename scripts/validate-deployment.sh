@@ -132,13 +132,19 @@ if grep -Eiq 'image:.*(:latest|:dev|REPLACE_ME|CHANGE_ME|\$\{|example\.invalid)'
   exit 1
 fi
 
-if ! grep -Eq 'image: [^[:space:]]+(:[0-9A-Za-z][0-9A-Za-z_.-]*|@sha256:[0-9a-f]{64})' "$production"; then
-  echo 'deployment validation failed: production image has no tag or digest' >&2
+if [ "$(grep -Ec 'image: [^[:space:]]+@sha256:[0-9a-f]{64}$' "$production")" -ne 3 ]; then
+  echo 'deployment validation failed: production workloads must use immutable image digests' >&2
   exit 1
 fi
 
 if [ "$(grep -Fc 'imagePullPolicy: Always' "$production")" -ne 3 ]; then
   echo 'deployment validation failed: production workloads must always pull the fixed image' >&2
+  exit 1
+fi
+
+if [ "$(grep -Fc 'name: TRPC_AGENT_SERVICE_OPERATOR_TOKEN' "$production")" -ne 2 ] || \
+  [ "$(grep -Fc 'name: TRPC_AGENT_SERVICE_AUDITOR_TOKEN' "$production")" -ne 2 ]; then
+  echo 'deployment validation failed: control-plane role tokens must be cleared outside Gateway' >&2
   exit 1
 fi
 

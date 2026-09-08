@@ -13,7 +13,10 @@ import (
 
 const (
 	serviceReadHeaderTimeout = 5 * time.Second
+	serviceReadTimeout       = 15 * time.Second
+	serviceIdleTimeout       = 60 * time.Second
 	serviceReadinessTimeout  = 2 * time.Second
+	serviceMaxHeaderBytes    = 32 << 10
 )
 
 type readinessCheck func(context.Context) error
@@ -66,6 +69,9 @@ func startServiceServer(
 		server: &http.Server{
 			Handler:           serviceHandlerWithReadiness(ingressHandler, adminHandler, readiness),
 			ReadHeaderTimeout: serviceReadHeaderTimeout,
+			ReadTimeout:       serviceReadTimeout,
+			IdleTimeout:       serviceIdleTimeout,
+			MaxHeaderBytes:    serviceMaxHeaderBytes,
 		},
 		done:      make(chan struct{}),
 		readiness: readiness,

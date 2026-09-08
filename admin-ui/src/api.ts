@@ -209,15 +209,15 @@ const tokenKey = 'trpc-agent-admin-token'
 const apiBase = (import.meta.env.VITE_ADMIN_API_BASE as string | undefined) ?? ''
 
 export function getToken(): string {
-  return window.localStorage.getItem(tokenKey) ?? ''
+  return window.sessionStorage.getItem(tokenKey) ?? ''
 }
 
 export function saveToken(token: string): void {
-  window.localStorage.setItem(tokenKey, token)
+  window.sessionStorage.setItem(tokenKey, token)
 }
 
 export function clearToken(): void {
-  window.localStorage.removeItem(tokenKey)
+  window.sessionStorage.removeItem(tokenKey)
 }
 
 export class AdminApiError extends Error {

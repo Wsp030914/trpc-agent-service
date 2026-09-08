@@ -111,6 +111,22 @@ func TestOpenAIHandlerRejectsMissingRequestIdentity(t *testing.T) {
 	}
 }
 
+func TestOpenAIHandlerRejectsOversizedRequestIdentity(t *testing.T) {
+	handler, admitter, _, credentials := newTestOpenAIHandler(t)
+	request := validOpenAIRequest()
+	request.Header.Set(headerSessionID, strings.Repeat("x", maxOpenAIIdentityBytes+1))
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+	if admitter.called || credentials.called {
+		t.Fatal("oversized request identity reached authentication or admission")
+	}
+}
+
 func TestOpenAIHandlerMapsAuthenticationFailure(t *testing.T) {
 	handler, admitter, _, credentials := newTestOpenAIHandler(t)
 	credentials.err = errors.New("credential store unavailable")
