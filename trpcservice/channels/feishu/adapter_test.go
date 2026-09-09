@@ -18,6 +18,59 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
+func TestHandleNewCommandBypassesGateway(t *testing.T) {
+	binding := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "app-secret")
+	source, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter := newFeishuRecordingAdmitter()
+	handler := &feishuNewSessionHandler{}
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(admitter),
+		testFeishuSecrets{key: binding, value: "app-secret"},
+		WithCommandHandler(handler),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.HandleMessage(context.Background(), binding.Snapshot(), feishuTextEvent(
+		"app-a", "om-new", "ou-1", "p2p", "/new",
+	)); err != nil {
+		t.Fatalf("handle /new: %v", err)
+	}
+	if admitter.admittedCount() != 0 {
+		t.Fatal("/new entered Gateway admission")
+	}
+	if handler.input.Text != "/new" || handler.requestID == "" {
+		t.Fatalf("command handler request = %#v", handler)
+	}
+}
+
+func TestHandleNewCommandFailureRecordsReply(t *testing.T) {
+	binding := testFeishuBinding("tenant-a", "support", "binding-a", "app-a", "app-secret")
+	source, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("switch session failed")
+	admitter := newFeishuRecordingAdmitter()
+	adapter, err := NewAdapter(source, gateway.New(admitter), testFeishuSecrets{key: binding, value: "app-secret"},
+		WithCommandHandler(&feishuNewSessionHandler{err: wantErr}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.HandleMessage(context.Background(), binding.Snapshot(), feishuTextEvent(
+		"app-a", "om-new-failed", "ou-1", "p2p", "/new",
+	)); !errors.Is(err, wantErr) {
+		t.Fatalf("handle failed /new = %v, want %v", err, wantErr)
+	}
+	if admitter.failureRequest.RequestID == "" || admitter.failureRequest.ChannelInput == nil {
+		t.Fatalf("failure request = %#v", admitter.failureRequest)
+	}
+}
+
 func TestHandleMessageUsesAppIDBindingAndSendsChannelInputToGateway(t *testing.T) {
 	binding := testFeishuBinding("tenant-a", "support-a", "binding-a", "app-a", "app-secret-a")
 	source, err := config.NewStaticBindingResolver(binding)
@@ -631,9 +684,22 @@ func (c *feishuBlockingClient) CloseAndWait(context.Context) error {
 var _ Client = (*feishuBlockingClient)(nil)
 
 type feishuRecordingAdmitter struct {
-	mu       sync.Mutex
-	requests []gateway.AdmissionRequest
-	results  map[string]gateway.AdmissionResult
+	mu             sync.Mutex
+	requests       []gateway.AdmissionRequest
+	failureRequest gateway.AdmissionRequest
+	results        map[string]gateway.AdmissionResult
+}
+
+type feishuNewSessionHandler struct {
+	requestID string
+	input     channels.ChannelInput
+	err       error
+}
+
+func (h *feishuNewSessionHandler) HandleNewSession(_ context.Context, request channels.NewSessionRequest) error {
+	h.requestID = request.RequestID
+	h.input = request.Input
+	return h.err
 }
 
 func newFeishuRecordingAdmitter() *feishuRecordingAdmitter {
@@ -656,6 +722,13 @@ func (a *feishuRecordingAdmitter) Admit(_ context.Context, request gateway.Admis
 	}
 	a.results[request.IdempotencyKey] = result
 	return result, nil
+}
+
+func (a *feishuRecordingAdmitter) RecordChannelFailure(_ context.Context, request gateway.AdmissionRequest) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.failureRequest = request
+	return nil
 }
 
 func (a *feishuRecordingAdmitter) lastRequest(t *testing.T) gateway.AdmissionRequest {

@@ -35,6 +35,22 @@ docker compose --env-file .env.example up -d --build --wait admin-ui otel-collec
 
 两个脚本使用同一组 Compose 文件：`compose.yaml`、`compose.deployment-e2e.yaml` 和 `compose.quickstart.yaml`。后者仅增加一次性 `quickstart` runner；依赖启动后，runner 复用现有 `cmd/deployment-e2e` 完成 Tenant/App/Config 创建、临时 Credential 签发、`/v1/chat/completions` 请求和 durable execution `SUCCEEDED` 校验。默认 Worker 使用现有 deterministic E2E model。成功输出为 `Golden Path PASSED`；脚本只清理名为 `trpc-agent-service-quickstart` 的 Compose 项目及其 disposable 卷。
 
+默认 Quick Start 只验证 HTTP deterministic Golden Path，不创建或启用真实企业微信/飞书 binding，因此不需要 IM 内部加密密钥。
+
+## IM 流式与卡片回复
+
+IM 回复模式由 `TRPC_AGENT_SERVICE_IM_REPLY_MODE` 控制，取值为 `text`（默认）、`stream` 或 `card`。`stream` 将增量事件按序写入 `reply_outbox`，重试或重启时从已持久化的完整快照继续，并复用 Provider 已发送消息进行更新；`card` 发送原生卡片，正文和状态由统一 Reply 模型生成。WeCom 依赖回调请求上下文，Feishu 依赖同一消息的更新接口；两者均受平台响应窗口、消息长度和频率限制约束。Provider 不支持对应能力时，Reply Sender 将其记录为不可重试的投递失败，不降级为另一种消息类型。
+
+## 模型附件能力
+
+`AppConfig.Model.AttachmentCapabilities` 是模型附件能力的显式 allowlist：
+
+```json
+{"image":true,"audio":false,"file":false}
+```
+
+默认值全部为 `false`，因为 OpenAI-compatible 只代表协议形状，不代表目标模型支持 image、audio 或 generic file。Worker 在 `artifactHydratingModel` 调用实际 Model Provider 前校验能力；ArtifactRef 的 MIME 元数据只用于区分 image/audio/file，不读取内容做 OCR、解析或文本提取。未声明支持的附件返回不可重试的 `unsupported model attachment/file capability`，不会转成 Provider 5xx 或自动 fallback。
+
 ## 本机外部验收结果
 
 本次使用真实企业微信/飞书账号和真实模型完成文本消息收发：两端客户端均收到回复，并保存了客户端截图；对应 execution 为 `SUCCEEDED`，`reply_outbox` 为 `SENT` 且有 Provider receipt。Jaeger Trace、Prometheus target/指标和 Grafana 运行面板也已实测。截图证据集中在 [`acceptance-screenshots`](acceptance-screenshots/acceptance-status.png)。
@@ -90,11 +106,36 @@ Kubernetes base：readiness 每 5s、timeout 3s、failure 6 次；liveness 每 1
 
 ## Secret、ConfigMap 和网络边界
 
-`deploy/kubernetes/secret.example.yaml` 只描述固定 Secret 名 `trpc-agent-service-secrets` 的形状，明确要求 out-of-band 创建。Gateway/Worker 需要 PostgreSQL DSN、Redis URL；Gateway 还需要独立 System Admin token。可选的 Operator/Auditor token 必须分别配套 `TRPC_AGENT_SERVICE_OPERATOR_TENANT_IDS` / `TRPC_AGENT_SERVICE_AUDITOR_TENANT_IDS` 逗号分隔租户 allowlist；角色 token 必须互不相同，配置不完整时 Gateway fail closed。provider key 使用：
+`deploy/kubernetes/secret.example.yaml` 只描述固定 Secret 名 `trpc-agent-service-secrets` 的形状，明确要求 out-of-band 创建。Gateway/Worker 需要 PostgreSQL DSN、Redis URL；Gateway 还需要独立 System Admin token。可选的 Operator/Auditor token 必须分别配套 `TRPC_AGENT_SERVICE_OPERATOR_TENANT_IDS` / `TRPC_AGENT_SERVICE_AUDITOR_TENANT_IDS` 逗号分隔租户 allowlist；角色 token 必须互不相同，配置不完整时 Gateway fail closed。
 
-`TRPC_AGENT_SERVICE_SECRET_<tenant-id-hex>_<app-id-hex>_<secret-name-hex>_<version-hex>`。
+### IM 内部加密密钥
 
-这些值由环境 `SecretProvider` 按 scope 解析。Kubernetes Worker 和 Channel 的 `envFrom` 保持 scoped Provider keys 可用，但显式把不需要的 System Admin、Operator、Auditor token 置空；不要把任何控制面 token 暴露给 Worker/Channel。ConfigMap 只放非敏感 stream/group/timeout/endpoint 和并发配置。实际外部 SecretProvider、KMS、rotation 流程由部署环境管理；仓库只记录接口与 scope 约束，具体注入、轮换和日志边界仍需在目标环境验证。
+真实企业微信或飞书 binding 除厂商凭据外，还必须为每个 `(tenant_id, app_id)` 注入两项平台内部 scoped secret。它们不是企业微信或飞书提供的凭据，也不能用厂商 Bot Secret、App Secret 或同一份内部 key 互相替代：
+
+| SecretRef | 用途 |
+| --- | --- |
+| `im-provider-target-key@v1` | 使用 AES-256-GCM 加密持久化 Provider reply target，使 Reply Outbox 在进程重启后能恢复真实回发目标 |
+| `im-external-id-hmac-key@v1` | 对外部 user/chat/thread ID 做稳定 HMAC 映射，避免原始外部标识直接落库 |
+
+`@v1` 是文档中的 `name@version` 写法；实际 `SecretRef` 拆分为 `Name`=`im-provider-target-key` / `im-external-id-hmac-key`，`Version`=`v1`。两个 secret 每个都必须是 32 字节随机数据的无 padding Base64URL 编码。每个 scope 分别生成并保存；多节点、滚动发布和服务重启必须继续使用相同值。不要把值写入 Git、镜像、ConfigMap、日志、trace 或验收 artifact。
+
+可使用 Python 生成单个值：
+
+```bash
+python -c "import secrets,base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))"
+```
+
+环境变量名必须按以下格式生成：
+
+```text
+TRPC_AGENT_SERVICE_SECRET_<tenant-id-hex>_<app-id-hex>_<secret-name-hex>_<version-hex>
+```
+
+四个 `*-hex` 都是对应 UTF-8 字节的小写十六进制；不是把原始 ID 直接拼接，也不是把 `@v1` 放进 `secret-name`。例如 `tenant_id=tenant-a`、`app_id=support` 时，分别把 `tenant-a`、`support`、两个 secret name 和 `v1` 编码后组成变量名。
+
+Kubernetes 将这两项作为 `trpc-agent-service-secrets` 的额外 key 由外部 Secret 管理系统注入；base 的 `envFrom` 会让 Channel owner（以及需要构造对应 resolver 的角色）读取 scoped key。不要把真实值填入 `secret.example.yaml`。Docker Quick Start 不需要这些 key；若本地确实启用真实 IM，应把 key 放在被 `.gitignore` 忽略的独立 env 文件，并通过 Compose override 的 service-level `env_file` 注入 `channel`，不要修改 `.env.example` 提交值。
+
+这些值由环境 `SecretProvider` 按 `(tenant_id, app_id, SecretRef)` 解析。缺失、scope 错配、Base64URL 带 padding 或解码后不是 32 字节时，真实 IM 的 target 恢复/ID 映射应失败，不得回退到明文 target 或原始外部 ID。实际外部 SecretProvider、KMS、rotation 流程由部署环境管理；仓库只记录接口与 scope 约束，具体注入、轮换和日志边界仍需在目标环境验证。
 
 生产模型 base URL 要使用 HTTPS，并通过代码的 egress/IP policy；COS/Qdrant/TencentDB endpoint map 由 operator 维护，tenant config 只能选择逻辑 name，不可任意注入 URL。
 

@@ -23,6 +23,42 @@ func TestDetectMediaMIMETypeUsesOfficeFilename(t *testing.T) {
 	}
 }
 
+func TestDetectMediaMIMETypeDoesNotTrustWrongImageExtension(t *testing.T) {
+	if got := channels.DetectMediaMIMEType("payload.png", []byte("%PDF-1.7\n")); got != "application/pdf" {
+		t.Fatalf("MIME type for wrong image extension = %q, want application/pdf", got)
+	}
+}
+
+func TestArtifactIngestorKeepsUnknownImageAsImageMIME(t *testing.T) {
+	input, err := channels.NewChannelInput(channels.ChannelInput{
+		TenantID: "tenant-a", AppID: "support", Channel: channels.ChannelWeCom,
+		BindingID: "binding-1", BindingRevision: 1, ExternalMessageID: "message-unknown-image",
+		Conversation: channels.ChannelConversation{Kind: channels.ConversationDirect},
+		MessageType:  channels.MessageTypeImage,
+	}, channels.ChannelMappingInput{ExternalSenderID: "user-1", ProviderSenderTarget: "user-1"})
+	if err != nil {
+		t.Fatalf("new channel input: %v", err)
+	}
+	writer := &recordingArtifactWriter{ref: "artifact://inbound/unknown-image", owned: true}
+	ingestor, err := channels.NewArtifactIngestor(recordingMediaDownloader{download: func(context.Context, channels.ChannelInput, channels.ProviderMediaRef) (channels.DownloadedMedia, error) {
+		return channels.DownloadedMedia{
+			Filename: "payload.bin", MIMEType: "application/octet-stream",
+			Data: []byte{0x00, 0x01, 0x02, 0x03},
+		}, nil
+	}}, writer)
+	if err != nil {
+		t.Fatalf("new artifact ingestor: %v", err)
+	}
+	if _, err := ingestor.Prepare(context.Background(), input, []channels.ProviderMediaRef{{
+		Kind: channels.MessageTypeImage, Reference: "provider-unknown-image",
+	}}); err != nil {
+		t.Fatalf("prepare unknown image: %v", err)
+	}
+	if writer.artifact.MIMEType != "image/octet-stream" {
+		t.Fatalf("unknown image MIME = %q, want image/octet-stream", writer.artifact.MIMEType)
+	}
+}
+
 func TestArtifactIngestorMaterializesOnlyArtifactRefs(t *testing.T) {
 	input, err := channels.NewChannelInput(channels.ChannelInput{
 		TenantID:          "tenant-a",

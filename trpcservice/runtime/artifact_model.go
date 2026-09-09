@@ -6,19 +6,45 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
+
+// ErrUnsupportedModelAttachment identifies a model capability mismatch. It
+// is intentionally separate from provider and infrastructure failures.
+var ErrUnsupportedModelAttachment = worker.ErrUnsupportedAttachment
+
+// UnsupportedModelAttachmentError reports the content type rejected by the
+// configured model capability allowlist.
+type UnsupportedModelAttachmentError struct {
+	ContentType model.ContentType
+}
+
+func (e UnsupportedModelAttachmentError) Error() string {
+	contentType := string(e.ContentType)
+	if contentType == "" {
+		contentType = "unknown"
+	}
+	return fmt.Sprintf("%s: %s", ErrUnsupportedModelAttachment, contentType)
+}
+
+func (e UnsupportedModelAttachmentError) Unwrap() error { return ErrUnsupportedModelAttachment }
 
 // artifactHydratingModel keeps the durable model request reference-only while
 // restoring bytes immediately before the provider call. This keeps provider
 // media out of session events, execution commands, and logs.
 type artifactHydratingModel struct {
 	model.Model
-	artifacts frameworkartifact.Service
-	info      frameworkartifact.SessionInfo
+	artifacts                    frameworkartifact.Service
+	info                         frameworkartifact.SessionInfo
+	capabilities                 tenant.ModelAttachmentCapabilities
+	currentArtifactRefs          []string
+	currentMessageHasAttachments bool
 }
 
 func (m *artifactHydratingModel) GenerateContent(
@@ -29,10 +55,139 @@ func (m *artifactHydratingModel) GenerateContent(
 	if err != nil {
 		return nil, err
 	}
+	if m == nil || m.Model == nil {
+		return nil, errors.New("artifact hydrating model is not initialized")
+	}
+	if err := m.sanitizeHistoricalAttachments(hydratedRequest); err != nil {
+		return nil, worker.NewPermanentExecutionError(err)
+	}
+	if err := validateModelAttachmentCapabilities(hydratedRequest, m.capabilities); err != nil {
+		return nil, worker.NewPermanentExecutionError(err)
+	}
 	if err := m.hydrateRequest(ctx, hydratedRequest); err != nil {
+		if errors.Is(err, ErrUnsupportedModelAttachment) {
+			return nil, worker.NewPermanentExecutionError(err)
+		}
 		return nil, err
 	}
 	return m.Model.GenerateContent(ctx, hydratedRequest)
+}
+
+// validateCurrentMessage performs the same attachment checks as the model
+// boundary, but before Runner persists the user message into the session.
+// This is the important failure boundary: a permanently unsupported inbound
+// attachment must never poison all later text turns in that session.
+func (m *artifactHydratingModel) validateCurrentMessage(ctx context.Context, message model.Message) error {
+	if m == nil || m.Model == nil {
+		return errors.New("artifact hydrating model is not initialized")
+	}
+	if !messageHasAttachments(message) {
+		return nil
+	}
+	validator := *m
+	validator.currentMessageHasAttachments = true
+	validator.currentArtifactRefs = artifactRefsFromMessage(message)
+	request, err := cloneRequest(&model.Request{Messages: []model.Message{message}})
+	if err != nil {
+		return err
+	}
+	if err := validator.sanitizeHistoricalAttachments(request); err != nil {
+		return worker.NewPermanentExecutionError(err)
+	}
+	if err := validateModelAttachmentCapabilities(request, validator.capabilities); err != nil {
+		return worker.NewPermanentExecutionError(err)
+	}
+	if err := validator.hydrateRequest(ctx, request); err != nil {
+		if errors.Is(err, ErrUnsupportedModelAttachment) {
+			return worker.NewPermanentExecutionError(err)
+		}
+		return err
+	}
+	return nil
+}
+
+func messageHasAttachments(message model.Message) bool {
+	for partIndex := range message.ContentParts {
+		part := &message.ContentParts[partIndex]
+		if part.ContentRef != nil || part.Image != nil || part.Audio != nil || part.File != nil {
+			return true
+		}
+		contentType, known := resolvedAttachmentType(part, "")
+		if known && contentType != model.ContentTypeText {
+			return true
+		}
+	}
+	return false
+}
+
+func artifactRefsFromMessage(message model.Message) []string {
+	refs := make([]string, 0, len(message.ContentParts))
+	for partIndex := range message.ContentParts {
+		part := &message.ContentParts[partIndex]
+		if part.ContentRef != nil && part.ContentRef.ArtifactRef != "" {
+			refs = append(refs, part.ContentRef.ArtifactRef)
+		}
+	}
+	return refs
+}
+
+func (m *artifactHydratingModel) isCurrentAttachment(part *model.ContentPart) bool {
+	if m == nil || !m.currentMessageHasAttachments || part == nil {
+		return false
+	}
+	if part.ContentRef == nil {
+		return true
+	}
+	for _, ref := range m.currentArtifactRefs {
+		if ref != "" && ref == part.ContentRef.ArtifactRef {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeHistoricalAttachments keeps unsupported historical media from
+// reaching a model that cannot consume it. Current media is never sanitized:
+// it must fail before session persistence instead.
+func (m *artifactHydratingModel) sanitizeHistoricalAttachments(request *model.Request) error {
+	if request == nil {
+		return errors.New("request cannot be nil")
+	}
+	for messageIndex := range request.Messages {
+		message := &request.Messages[messageIndex]
+		parts := message.ContentParts
+		kept := parts[:0]
+		for partIndex := range parts {
+			part := &parts[partIndex]
+			contentType, known := resolvedAttachmentType(part, "")
+			if !known {
+				kept = append(kept, *part)
+				continue
+			}
+			if err := validateModelAttachmentType(contentType, m.capabilities); err != nil {
+				if m.isCurrentAttachment(part) {
+					return fmt.Errorf("message %d content part %d: %w", messageIndex, partIndex, err)
+				}
+				appendUnsupportedAttachmentNotice(message, contentType)
+				continue
+			}
+			kept = append(kept, *part)
+		}
+		message.ContentParts = kept
+	}
+	return nil
+}
+
+func appendUnsupportedAttachmentNotice(message *model.Message, contentType model.ContentType) {
+	if message == nil {
+		return
+	}
+	notice := fmt.Sprintf("[历史附件已省略：当前模型不支持 %s]", contentType)
+	if strings.TrimSpace(message.Content) == "" {
+		message.Content = notice
+		return
+	}
+	message.Content += "\n" + notice
 }
 
 func cloneRequest(request *model.Request) (*model.Request, error) {
@@ -74,19 +229,33 @@ func (m *artifactHydratingModel) hydrateRequest(ctx context.Context, request *mo
 	if request == nil {
 		return errors.New("request cannot be nil")
 	}
-	if m == nil || m.Model == nil || m.artifacts == nil {
+	if m == nil || m.Model == nil {
 		return errors.New("artifact hydrating model is not initialized")
 	}
 	for messageIndex := range request.Messages {
-		for partIndex := range request.Messages[messageIndex].ContentParts {
-			part := &request.Messages[messageIndex].ContentParts[partIndex]
+		message := &request.Messages[messageIndex]
+		parts := message.ContentParts
+		kept := parts[:0]
+		for partIndex := range parts {
+			part := &parts[partIndex]
 			if part.ContentRef == nil {
+				kept = append(kept, *part)
 				continue
 			}
+			if m.artifacts == nil {
+				return errors.New("artifact service is required for content references")
+			}
 			if err := m.hydratePart(ctx, part); err != nil {
+				var unsupported UnsupportedModelAttachmentError
+				if errors.As(err, &unsupported) && !m.isCurrentAttachment(part) {
+					appendUnsupportedAttachmentNotice(message, unsupported.ContentType)
+					continue
+				}
 				return fmt.Errorf("hydrate message %d content part %d: %w", messageIndex, partIndex, err)
 			}
+			kept = append(kept, *part)
 		}
+		message.ContentParts = kept
 	}
 	return nil
 }
@@ -106,6 +275,11 @@ func (m *artifactHydratingModel) hydratePart(ctx context.Context, part *model.Co
 	if err := validateLoadedArtifact(part.ContentRef, artifactValue.Data); err != nil {
 		return err
 	}
+	contentType, _ := resolvedAttachmentType(part, chooseArtifactMimeType(part.ContentRef, artifactValue.MimeType))
+	if err := validateModelAttachmentType(contentType, m.capabilities); err != nil {
+		return err
+	}
+	part.Type = contentType
 	switch part.Type {
 	case model.ContentTypeFile:
 		file := part.File
@@ -146,6 +320,115 @@ func (m *artifactHydratingModel) hydratePart(ctx context.Context, part *model.Co
 	return nil
 }
 
+func validateModelAttachmentCapabilities(
+	request *model.Request,
+	capabilities tenant.ModelAttachmentCapabilities,
+) error {
+	if request == nil {
+		return errors.New("request cannot be nil")
+	}
+	for messageIndex := range request.Messages {
+		for partIndex := range request.Messages[messageIndex].ContentParts {
+			part := &request.Messages[messageIndex].ContentParts[partIndex]
+			contentType, known := resolvedAttachmentType(part, "")
+			if !known {
+				continue
+			}
+			if err := validateModelAttachmentType(contentType, capabilities); err != nil {
+				return fmt.Errorf("message %d content part %d: %w", messageIndex, partIndex, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateModelAttachmentType(
+	contentType model.ContentType,
+	capabilities tenant.ModelAttachmentCapabilities,
+) error {
+	supported := false
+	switch contentType {
+	case model.ContentTypeText:
+		return nil
+	case model.ContentTypeImage:
+		supported = capabilities.Image
+	case model.ContentTypeAudio:
+		supported = capabilities.Audio
+	case model.ContentTypeFile:
+		supported = capabilities.File
+	default:
+		// Video and unknown content parts have no configured capability in this
+		// service, so they fail closed instead of being treated as generic files.
+	}
+	if supported {
+		return nil
+	}
+	return UnsupportedModelAttachmentError{ContentType: contentType}
+}
+
+// resolvedAttachmentType uses the artifact MIME metadata only to distinguish
+// image/audio from a generic file. It does not inspect, parse, or transform
+// the bytes.
+func resolvedAttachmentType(part *model.ContentPart, fallbackMime string) (model.ContentType, bool) {
+	if part == nil {
+		return "", false
+	}
+	if part.Type == model.ContentTypeText {
+		return model.ContentTypeText, true
+	}
+	if part.Type == model.ContentTypeImage || part.Type == model.ContentTypeAudio || part.Type == model.ContentTypeVideo {
+		return part.Type, true
+	}
+	if part.Type == model.ContentTypeFile {
+		mimeType := strings.ToLower(strings.TrimSpace(fallbackMime))
+		if mimeType == "" && part.ContentRef != nil {
+			mimeType = strings.ToLower(strings.TrimSpace(part.ContentRef.MimeType))
+		}
+		if mimeType == "" && part.File != nil {
+			mimeType = strings.ToLower(strings.TrimSpace(part.File.MimeType))
+		}
+		switch {
+		case strings.HasPrefix(mimeType, "image/"):
+			return model.ContentTypeImage, true
+		case strings.HasPrefix(mimeType, "audio/"):
+			return model.ContentTypeAudio, true
+		case mimeType != "":
+			return model.ContentTypeFile, true
+		case part.ContentRef != nil && part.File == nil:
+			// Artifact metadata is authoritative but is only available after
+			// LoadArtifact; defer this check until hydratePart.
+			return model.ContentTypeFile, false
+		default:
+			return model.ContentTypeFile, true
+		}
+	}
+	if part.Type == "" {
+		switch {
+		case part.Image != nil:
+			return model.ContentTypeImage, true
+		case part.Audio != nil:
+			return model.ContentTypeAudio, true
+		case part.File != nil:
+			return model.ContentTypeFile, true
+		case part.ContentRef != nil:
+			mimeType := strings.ToLower(strings.TrimSpace(part.ContentRef.MimeType))
+			switch {
+			case strings.HasPrefix(mimeType, "image/"):
+				return model.ContentTypeImage, true
+			case strings.HasPrefix(mimeType, "audio/"):
+				return model.ContentTypeAudio, true
+			case mimeType != "":
+				return model.ContentTypeFile, true
+			default:
+				return model.ContentTypeFile, false
+			}
+		default:
+			return model.ContentTypeText, true
+		}
+	}
+	return part.Type, true
+}
+
 func parseArtifactRef(ref *model.ContentRef) (string, int, error) {
 	if ref == nil {
 		return "", 0, errors.New("content ref is required")
@@ -179,8 +462,11 @@ func chooseArtifactName(ref *model.ContentRef, objectName, fallback string) stri
 }
 
 func chooseArtifactMimeType(ref *model.ContentRef, fallback string) string {
-	if ref.MimeType != "" {
+	if strings.TrimSpace(fallback) != "" {
+		return fallback
+	}
+	if ref != nil && ref.MimeType != "" {
 		return ref.MimeType
 	}
-	return fallback
+	return ""
 }

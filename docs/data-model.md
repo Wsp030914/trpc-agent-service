@@ -1,6 +1,6 @@
 # 数据模型
 
-本模型按当前 `trpcservice/postgres/migrations/000001_platform.sql` 到 `000016_inbound_artifact_upload_lease.sql`、Go model 和 framework resolver 整理。SQL 是平台控制面和执行状态的权威来源；Session 内容、向量、对象和 Memory 内容分别由真实配置选中的 framework/外部 Backend 持有。
+本模型按当前 `trpcservice/postgres/migrations/000001_platform.sql` 到 `000019_channel_processing_failure.sql`、Go model 和 framework resolver 整理。SQL 是平台控制面和执行状态的权威来源；Session 内容、向量、对象和 Memory 内容分别由真实配置选中的 framework/外部 Backend 持有。
 
 ## 实体关系
 
@@ -11,6 +11,7 @@ erDiagram
   AGENT_APP ||--o{ API_CREDENTIAL : authenticates
   AGENT_APP ||--o{ CHANNEL_BINDING : binds
   AGENT_APP ||--o{ SESSION_LANE : orders
+  CHANNEL_BINDING ||--o{ CONVERSATION_SESSION : selects
   SESSION_LANE ||--o{ EXECUTION : allocates
   EXECUTION ||--o{ EXECUTION_EVENT : emits
   EXECUTION ||--o{ DISPATCH_OUTBOX : dispatches
@@ -19,6 +20,7 @@ erDiagram
   CHANNEL_BINDING ||--o{ CHANNEL_IDENTITY : maps
   CHANNEL_BINDING ||--o{ CHANNEL_CONVERSATION : maps
   CHANNEL_BINDING ||--o{ CHANNEL_INBOX : deduplicates
+  CHANNEL_INBOX ||--o{ REPLY_OUTBOX : commands_and_failures
   CHANNEL_INBOX ||--o{ INBOUND_ARTIFACT : stages
   SESSION_LANE ||--o{ ARTIFACT : owns
   AGENT_APP ||--o{ KNOWLEDGE_BASE : owns
@@ -65,6 +67,14 @@ erDiagram
     text session_principal_id PK
     text session_id PK
     bigint next_turn_seq
+  }
+  CONVERSATION_SESSION {
+    text tenant_id PK
+    text app_id PK
+    text binding_id PK
+    text session_principal_id PK
+    text active_session_id
+    bigint version
   }
   EXECUTION {
     text tenant_id PK
@@ -131,6 +141,7 @@ erDiagram
     bytea payload_hash
     text request_id
     text status
+    text reject_reason
     text message_type
   }
   REPLY_OUTBOX {
@@ -140,6 +151,7 @@ erDiagram
     text binding_id
     text request_id
     text source_event_id
+    text source_kind
     bigint revision
     text status
     int attempt
@@ -232,7 +244,9 @@ erDiagram
 flowchart LR
   T["Tenant\nplatform.tenant"] --> A["Agent App\nplatform.agent_app"]
   A --> L["Session Lane\nplatform.session_lane\nordering metadata"]
+  A --> CS["Active Session Pointer\nplatform.conversation_session"]
   L -. scoped identity .-> S["Session\nframework Session backend"]
+  CS -. current session identity .-> S
   S --> E["Event\nframework Session events"]
   S --> SU["Summary\nframework Session state"]
   J["execution_event\nplatform journal"] -. resume/audit projection .-> E
@@ -245,7 +259,7 @@ flowchart LR
   classDef sql fill:#ecfdf5,stroke:#34d399,color:#065f46
   classDef logical fill:#fff7ed,stroke:#f59e0b,color:#7c2d12
   classDef external fill:#eff6ff,stroke:#60a5fa,color:#1e3a8a
-  class T,A,L,J sql
+  class T,A,L,CS,J sql
   class S,E,SU logical
   class MS,MB external
 ```
@@ -270,13 +284,14 @@ flowchart LR
 | `channel_binding` | IM 账号和租户/app 的绑定 | PostgreSQL | PK `(tenant, app, binding)`；`binding_revision` 由字段变更触发递增；public route（legacy）全局唯一 |
 | `channel_identity` | binding-scoped 外部用户到内部 `user_id` 的稳定映射 | PostgreSQL | 外部 user 只存 HMAC digest；digest 在 binding 内唯一；provider target 为 AEAD envelope |
 | `channel_conversation` | 群聊/topic 到 conversation/session principal 的映射 | PostgreSQL | chat/thread digest 在 binding 内唯一；scope 为 `group`/`topic` |
-| `channel_inbox` | IM message 去重、拒绝记录和 reply target | PostgreSQL | PK `(tenant, app, binding, external_message_id)`；payload hash 冲突即拒绝；`ADMITTED`/`REJECTED` |
+| `channel_inbox` | IM message/平台命令去重、拒绝记录和 reply target | PostgreSQL | PK `(tenant, app, binding, external_message_id)`；payload hash 冲突即拒绝；`ADMITTED`/`REJECTED`；处理失败为 `CHANNEL_PROCESSING_FAILED` |
+| `conversation_session` | Channel principal 当前使用的 Session 指针 | PostgreSQL | PK `(tenant, app, binding, session_principal_id)`；`active_session_id` 非空；`/new` 事务内锁定、换新并递增 `version` |
 | `session_lane` | 平台侧 Session 顺序分配器 | PostgreSQL | PK `(tenant, app, principal, session)`；`next_turn_seq > 0` |
 | framework Session | event、state、tracks、summary 和 framework Session identity | 配置选中的 Redis/PostgreSQL/InMemory service | InMemory 只用于 local/test；平台不复制一份内容表 |
 | `execution` | 一次已 Admission 的执行命令、租约和终态 | PostgreSQL | PK `(tenant, app, request_id)`；幂等唯一键；turn 唯一键；active lane index；`PENDING/RUNNING/WAITING_APPROVAL/SUCCEEDED/FAILED/CANCELED/UNCERTAIN` |
 | `execution_event` | Runner 事件持久化和 resume 序列 | PostgreSQL | PK `(tenant, app, request, event_seq)`；序号单调递增 |
 | `dispatch_outbox` | execution 到 Redis Stream 的可靠发布中继 | PostgreSQL | `PENDING/PUBLISHING/SENT/CONSUMED`；Relay claim 后发布；不能替代 execution |
-| `reply_outbox` | Runner 完成后的 IM 回复投递队列 | PostgreSQL | `(binding, request, source_event, revision)` 唯一；`PENDING/SENDING/SENT/PERMANENTLY_FAILED/UNCERTAIN`；独立 lease/attempt |
+| `reply_outbox` | execution、平台命令或接入失败的 IM 回复投递队列 | PostgreSQL | `(binding, request, source_event, revision)` 唯一；source kind 为 `execution`/`channel_command`/`channel_failure`；`PENDING/SENDING/SENT/PERMANENTLY_FAILED/UNCERTAIN`；独立 lease/attempt |
 | `tool_approval` | 危险工具的人工决策 | PostgreSQL | exact request/session/tool/argument digest；同一 context 只能有一个 pending |
 | `artifact` | Session artifact 元数据和对象生命周期 | SQL metadata + COS object | session/filename/version 唯一；`PENDING/AVAILABLE/DELETED`；cleanup attempt/lease/completed |
 | `inbound_artifact` | IM 入站对象 staging、Admission attach 和清理 | SQL metadata + COS object | message/item PK，artifact ref 唯一；`UPLOADING/PENDING/ATTACHED/DELETED`；上传租约/cleanup 字段 |
@@ -288,17 +303,21 @@ flowchart LR
 
 ## Session、Memory、Summary 的关系
 
+Channel principal 先通过 `(tenant_id, app_id, binding_id, session_principal_id)` 查 `conversation_session`；没有指针时使用并持久化 `default`。普通消息把该 active Session ID 固化进 execution 并指向对应 `session_lane`。`/new` 不复制或删除 framework Session 内容，只在事务中把指针换成新 UUID；后续消息因此进入新的 lane 和 framework Session，旧会话仍由原 backend 保存。
+
 一个平台 `execution` 通过 `(tenant_id, app_id, session_principal_id, session_id)` 指向 `session_lane`，并用 ConfigVersion 选择 framework Session resolver。对于 PostgreSQL Session，resolver 使用配置的 schema（默认 `agent`）；对于 Redis Session，resolver 使用 framework Redis service。两者都由 `session.Router` 按 provider 选择，平台的 Redis session lease 负责跨节点串行，而不是让 provider 自己解决 runner 并发。
 
 framework Session 中的 event/state/tracks/summary 是实际上下文 authority。平台 `execution_event` 是对外 resume、审计和回复投影所需的 Runner event journal，不等价于 framework transcript。Memory 是 TencentDB 外部服务的 ingestor：平台不保存 Memory 内容表，只保存配置/secret 引用；私聊 key 包含 scope/user/session，群聊当前跳过归因写入。Summary 同样随 Session backend 保存，Redis→PostgreSQL migration 会显式复制并校验 summary。
 
 ## 配置、执行和回复的关系
 
-Admission 将 `config_version` 固化到 execution，并通过 FK 保证该版本仍存在。执行期间模型/工具/Session/Knowledge/Artifact resolver 都从该版本选择。Runner 事件落入 `execution_event` 后，journal 在同一事务里可创建 `reply_outbox`；Channel 角色中的 Reply Sender 只消费持久回复，不重新执行 Runner。这样请求结果、事件 resume 和 IM 发送有清晰 authority，但 Provider 发送本身仍可能是 uncertain。
+Admission 将 `config_version` 固化到 execution，并通过 FK 保证该版本仍存在。执行期间模型/工具/Session/Knowledge/Artifact resolver 都从该版本选择。`/new` 使用当前 Session identity 执行同一 stable/canary 选择，并以选中版本判定 IM 权限。
+
+Runner 的 terminal event 落入 `execution_event` 后，journal 在同一事务里可创建 `source_kind=execution` 的 `reply_outbox`；非终态 error event 不投影失败回复。`/new` 的切换结果使用 `channel_command`，媒体准备、Admission 或命令处理失败使用 `channel_failure`，后两者都以关联 `channel_inbox` 作为来源完整性约束。Channel 角色中的 Reply Sender 只消费持久回复，不重新执行 Runner。这样请求结果、事件 resume 和 IM 发送有清晰 authority，但 Provider 发送本身仍可能是 uncertain。
 
 ## 约束边界
 
 - `AppConfig` 里的 `BackendRef` 是选择契约，不代表 PostgreSQL schema 为每种 provider 自动创建适配。可用 provider 见[后端适配](backend-adaptation.md)。
-- `channel_binding` 的 secret 是 `SecretRef`，不是 secret 值；channel identity/conversation 的 provider target 是密文，不是可检索的明文外部 ID。
+- `channel_binding` 的 provider secret 是 `SecretRef`，不是 secret 值；真实 IM 另外依赖按 `(tenant_id, app_id)` 注入的 `im-provider-target-key@v1` 和 `im-external-id-hmac-key@v1`。channel identity/conversation 的 provider target 是密文，外部 user/chat/thread 是 HMAC digest，不是可检索的明文外部 ID；这些内部 key 不落 PostgreSQL。
 - SQL catalog 负责 Knowledge 的 tenant/app/config/KB 授权；Qdrant collection/point 不能单独成为权限来源。
 - artifact object 删除和 metadata 状态变更不是同一外部原子事务；cleanup 用可恢复 candidate/lease/attempt 处理“对象已删、状态未更新”或反向异常。

@@ -15,6 +15,8 @@ Gateway 不做内存队列后返回成功。PostgreSQL `Store.Admit` 是 Admissi
 
 事务提交前任何步骤失败，不能留下可消费的半个请求；提交后即使 Gateway 崩溃，Relay 仍能从 outbox 继续。新请求一旦进入迁移的 `DRAINING/COPYING/VERIFYING`，Admission 返回 `ErrAdmissionDraining`；已经 Admission 的 source execution 仍按 source ConfigVersion 排空。
 
+Channel 的 `/new` 是独立的平台命令事务，不创建 execution。它先用映射后的 principal 和当前 active Session ID 执行与普通消息相同的 stable/canary 选择及 IM access 判定，再锁定 `(tenant, app, binding, session_principal)` 的 `conversation_session` 指针，生成新 Session ID，并原子写入 Inbox、指针更新和 `channel_command` Reply Outbox。相同 external message ID + payload 重放已有结果；不同 payload 冲突。权限拒绝不创建/切换指针，只提交 `REJECTED` Inbox 和失败 ACK。
+
 ## 2. Event、state、summary 关系
 
 Runner 运行时产生 framework event。Worker 不在释放 Session lease 后再异步写这些 event，而是先持续排空 Runner channel，再在 execution fence 有效时写 `execution_event(event_seq, payload)`；terminal 状态可以和最后一批 event 在同一数据库事务中提交。Gateway/HTTP `QueuedRunner` 从 `execution_event` durable source resume，而不是读取 Worker 内存。
@@ -31,7 +33,9 @@ Memory 只在 immutable ConfigVersion 选择 TencentDB Memory 时装配。Resolv
 
 HTTP OpenAI 入口要求唯一 `request_id`、`Idempotency-Key`、`X-Session-ID` 和 Bearer API key。请求 payload 只允许一个 user text message，tenant/app/user/principal/config 不能由 body 覆盖。相同 scope/source/idempotency key 且 payload hash 相同，Admission 返回原 execution 结果；相同 key 配不同 payload 返回 conflict。`request_id` 自身也是 scope 内主键，不能用不同请求复用。
 
-WeCom/Feishu adapter 使用官方 WebSocket/long connection，external message ID 作为 idempotency key。当前模式没有 HTTP webhook URL 或 callback signature verification，因此这些 README 字段对当前接入为 `NOT_APPLICABLE`；WebSocket/SDK 使用 binding external account + scoped secret 完成认证。`channel_inbox` 记录 message type、payload hash、请求 ID、ADMITTED/REJECTED 和加密 reply target。重复消息同 hash 重放原结果；hash 不同是冲突。unsupported、附件拒绝和 IM access denied 也保留 durable rejection，避免 Provider 不断重试造成无界副作用。
+WeCom/Feishu adapter 使用官方 WebSocket/long connection，external message ID 作为 idempotency key。当前模式没有 HTTP webhook URL 或 callback signature verification，因此这些 README 字段对当前接入为 `NOT_APPLICABLE`；WebSocket/SDK 使用 binding external account + scoped secret 完成认证。`channel_inbox` 记录 message type、payload hash、请求 ID、ADMITTED/REJECTED 和加密 reply target。重复消息同 hash 重放原结果；hash 不同是冲突。unsupported、附件拒绝、IM access denied 和 channel processing failure 也保留 durable rejection，避免 Provider 不断重试造成无界副作用。下载/解密/COS 上传、配置 pin、Admission 或 `/new` 命令处理失败时，以同一 payload hash 写 `REJECTED` Inbox 和唯一 `channel_failure` Reply Outbox；重复记录不会新增回复。若同一 Admission 已经提交为 `ADMITTED`，提交结果优先，失败补偿不覆盖它也不发送错误回复。
+
+外部 user/chat/thread 映射使用每个 `(tenant_id, app_id)` 稳定注入的 `im-external-id-hmac-key@v1`；Reply target 使用 `im-provider-target-key@v1` 加密后才写入 identity、conversation 或 inbox。进程重启后，Resolver 必须用同一 scope、同一版本 key 重新计算 digest 或打开 envelope；缺 key、scope 错配或格式错误都不能回退到原始外部 ID。
 
 用户映射同样幂等：direct 以 binding-scoped external user hash 查稳定 user；group/topic 以 chat hash + thread hash 查稳定 conversation。数据库 `ON CONFLICT DO NOTHING` 后再次读取，避免两个 Adapter 并发创建两个内部主体。
 
@@ -51,7 +55,7 @@ Worker 通过 PostgreSQL execution lease 和 `run_token` claim。续租失败会
 | `WAITING_APPROVAL` | 等待 exact approval，不是成功 | 不把消息当完成；审批后重新 claim/继续 |
 | `UNCERTAIN` | Runner 已启动且外部副作用/状态可能已发生但结果不明 | 不自动重试；交由运维/Provider 对账 |
 
-普通基础设施 retry 通过 bounded exponential/jitter 将 execution 放回 `PENDING` 并创建下一次 dispatch；attempt 受实现边界限制。它只适用于 retryable 错误，不能覆盖 side-effect uncertain。
+普通基础设施 retry 通过 bounded exponential/jitter 将 execution 放回 `PENDING` 并创建下一次 dispatch；attempt 受实现边界限制。queue claim 明确携带当前是否为最终 attempt。COS、模型、Session、Knowledge 等 Runner 构建错误发生在 `RunnerStarted` 前时，非最终 attempt 不写终态并继续 retry；最终 attempt 或永久错误先写 terminal error event 和 `FAILED`，从而驱动一次 IM 失败回复。它只适用于 retryable 错误，不能覆盖 side-effect uncertain。
 
 ## 6. Session 迁移
 
@@ -79,7 +83,11 @@ Artifact object 和 SQL metadata 不具备跨系统两阶段提交：可能出�
 
 ## 9. Reply Outbox 和外部副作用
 
-Runner journal 只为客户端可见 event 创建 Reply Outbox projection；Channel 角色中的 Reply Sender 与 Runner 分离，可在 execution 成功后继续投递。Sender claim row、重新验证 binding/revision、使用 Redis 分布式 binding rate limit，再调用 Provider 的一次 `SendOnce`。WeCom/Feishu 对已知 HTTP/provider retryable 错误有限重试；Feishu 的 `uuid=ReplyID` 是 provider 请求幂等提示，但当前代码没有通用的安全结果查询协议。
+Runner journal 只为客户端可见 event 创建 Reply Outbox projection；失败投影只接受框架的 terminal error event，不能用 `evt.Error != nil` 代替终态判断，否则非终态错误后恢复成功会产生错误或重复回复。Channel 角色中的 Reply Sender 与 Runner 分离，可在 execution 成功后继续投递。Sender claim row、重新验证 binding/revision、使用 Redis 分布式 binding rate limit，再调用 Provider 的一次 `SendOnce`。WeCom/Feishu 对已知 HTTP/provider retryable 错误有限重试；Feishu 的 `uuid=ReplyID` 是 provider 请求幂等提示，但当前代码没有通用的安全结果查询协议。
+
+`reply_outbox.source_kind` 区分三类权威来源：`execution` 必须关联 execution；`channel_command` 和 `channel_failure` 必须关联同 scope/binding/request 的 `channel_inbox`。数据库 deferred constraint trigger 校验该来源，避免失败回复绕过 Inbox 幂等边界。
+
+Reply Outbox 保存的是带 scope/AAD 的加密 target envelope，不是原始 Provider target。Sender 在每次投递前通过 scoped `SecretProvider` 解析 `im-provider-target-key@v1` 并解密，因此该 key 必须跨进程重启和多节点保持稳定；key 丢失时不能伪造成功，也不能改用明文 target。
 
 若 transport timeout、context cancellation、receipt 无效、lease 丢失或 completion 更新失败，Provider 是否已经接受消息无法知道，状态写为 `UNCERTAIN`，不自动再次发送。已知 permanent 错误写 `PERMANENTLY_FAILED`；已知 retryable 写回 `PENDING` 并应用 Retry-After/上限；reply attempts 有默认最大值。该分类是“安全防重复”与“可能漏发”的明确取舍。
 
@@ -90,7 +98,7 @@ Runner journal 只为客户端可见 event 创建 Reply Outbox projection；Chan
 | Admission → SQL | 同一幂等 key 不会创建两个 execution；事务失败不产生可消费 admission | 外部 provider 发送不在该事务内 |
 | SQL outbox → Redis | Relay 可重试；Redis message 至少一次到 Consumer | 发布和 SQL 状态不是跨系统 exactly-once |
 | Redis → execution claim | 过期 lease 可接管；run token fencing | 已经发生的外部副作用可被安全推断 |
-| Runner → event journal | lease 有效时 event seq/终态持久化，stream 可 resume | Session provider 与 SQL journal 跨存储原子性 |
+| Runner → event journal | lease 有效时 event seq/终态持久化，stream 可 resume；最终构建失败也写 terminal event | Session provider 与 SQL journal 跨存储原子性 |
 | Runner → tool | 当前 `ToolCatalog` 以 `todo_write` 和安全策略作为执行边界；未知/无权限工具拒绝 | 外部副作用由工具自身语义和 `UNCERTAIN` 分类共同约束 |
-| execution → reply | 回复可从 outbox 异步恢复，已知错误有限重试 | Provider uncertain 时不自动重发，可能需要人工对账 |
+| execution/command/channel failure → reply | 回复可从对应 source kind 的 outbox 异步恢复；失败回复按 Inbox/event 幂等 | Provider uncertain 时不自动重发，可能需要人工对账 |
 | object → cleanup | exact candidate、lease、retry 可恢复 | COS 和 SQL 不构成单个原子事务 |

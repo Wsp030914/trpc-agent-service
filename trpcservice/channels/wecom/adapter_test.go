@@ -20,6 +20,65 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
+func TestHandleNewCommandBypassesGateway(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "bot-secret")
+	source, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter := newWeComRecordingAdmitter()
+	handler := &wecomNewSessionHandler{}
+	adapter, err := NewAdapter(
+		source,
+		gateway.New(admitter),
+		testWeComSecrets{key: binding, value: "bot-secret"},
+		WithCommandHandler(handler),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.HandleMessage(context.Background(), binding.Snapshot(), Message{
+		MessageID:   "msg-new",
+		AIBotID:     "bot-a",
+		ChatType:    "single",
+		From:        MessageFrom{UserID: "user-a"},
+		MessageType: "text",
+		Text:        MessageText{Content: "/new"},
+	}); err != nil {
+		t.Fatalf("handle /new: %v", err)
+	}
+	if admitter.admittedCount() != 0 {
+		t.Fatal("/new entered Gateway admission")
+	}
+	if handler.input.Text != "/new" || handler.requestID == "" {
+		t.Fatalf("command handler request = %#v", handler)
+	}
+}
+
+func TestHandleNewCommandFailureRecordsReply(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "bot-secret")
+	source, err := config.NewStaticBindingResolver(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("switch session failed")
+	admitter := newWeComRecordingAdmitter()
+	adapter, err := NewAdapter(source, gateway.New(admitter), testWeComSecrets{key: binding, value: "bot-secret"},
+		WithCommandHandler(&wecomNewSessionHandler{err: wantErr}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.HandleMessage(context.Background(), binding.Snapshot(), Message{
+		MessageID: "msg-new-failed", AIBotID: "bot-a", ChatType: "single",
+		From: MessageFrom{UserID: "user-a"}, MessageType: "text", Text: MessageText{Content: "/new"},
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("handle failed /new = %v, want %v", err, wantErr)
+	}
+	if admitter.failureRequest.RequestID == "" || admitter.failureRequest.ChannelInput == nil {
+		t.Fatalf("failure request = %#v", admitter.failureRequest)
+	}
+}
+
 func TestHandleMessageUsesBotIDBindingAndSendsChannelInputToGateway(t *testing.T) {
 	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "bot-secret-a")
 	source, err := config.NewStaticBindingResolver(binding)
@@ -586,11 +645,42 @@ func TestOutboundClientSendsThroughBindingScopedSender(t *testing.T) {
 	}
 }
 
+func TestAdapterResolvesTheLiveBindingSender(t *testing.T) {
+	binding := testWeComBinding("tenant-a", "support", "binding-a", "bot-a", "bot-secret")
+	sender := &recordingWeComSender{messageID: "provider-msg-1"}
+	adapter := &Adapter{
+		runs: map[string]*wecomBindingRun{
+			bindingKey(binding.Snapshot()): {
+				snapshot: binding,
+				client:   &wecomClientHandle{client: sender},
+			},
+		},
+	}
+
+	resolved, err := adapter.ResolveOutboundSender(context.Background(), binding.Snapshot())
+	if err != nil {
+		t.Fatalf("resolve live sender: %v", err)
+	}
+	if resolved != sender {
+		t.Fatalf("resolved sender = %T %p, want shared sender %T %p", resolved, resolved, sender, sender)
+	}
+}
+
 type recordingWeComSender struct {
 	target    string
 	text      string
 	messageID string
 }
+
+func (r *recordingWeComSender) Run(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (*recordingWeComSender) Close(context.Context) error { return nil }
+
+var _ ClientRunner = (*recordingWeComSender)(nil)
+var _ MessageSender = (*recordingWeComSender)(nil)
 
 type wecomBlockingRunner struct {
 	closed chan struct{}
@@ -672,9 +762,22 @@ func (s *recordingWeComSender) SendMessage(_ context.Context, target, text strin
 }
 
 type wecomRecordingAdmitter struct {
-	mu       sync.Mutex
-	requests []gateway.AdmissionRequest
-	results  map[string]gateway.AdmissionResult
+	mu             sync.Mutex
+	requests       []gateway.AdmissionRequest
+	failureRequest gateway.AdmissionRequest
+	results        map[string]gateway.AdmissionResult
+}
+
+type wecomNewSessionHandler struct {
+	requestID string
+	input     channels.ChannelInput
+	err       error
+}
+
+func (h *wecomNewSessionHandler) HandleNewSession(_ context.Context, request channels.NewSessionRequest) error {
+	h.requestID = request.RequestID
+	h.input = request.Input
+	return h.err
 }
 
 func newWeComRecordingAdmitter() *wecomRecordingAdmitter {
@@ -697,6 +800,13 @@ func (a *wecomRecordingAdmitter) Admit(_ context.Context, request gateway.Admiss
 	}
 	a.results[request.IdempotencyKey] = result
 	return result, nil
+}
+
+func (a *wecomRecordingAdmitter) RecordChannelFailure(_ context.Context, request gateway.AdmissionRequest) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.failureRequest = request
+	return nil
 }
 
 func (a *wecomRecordingAdmitter) lastRequest(t *testing.T) gateway.AdmissionRequest {

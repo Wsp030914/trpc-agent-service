@@ -210,6 +210,15 @@ func (c AppConfig) Validate() error {
 	return nil
 }
 
+// ModelAttachmentCapabilities is the explicit allowlist for non-text model
+// content. Zero values are deliberately deny-by-default because an
+// OpenAI-compatible endpoint is not assumed to implement every content part.
+type ModelAttachmentCapabilities struct {
+	Image bool `json:"image"`
+	Audio bool `json:"audio"`
+	File  bool `json:"file"`
+}
+
 // ModelConfig identifies the model runtime and scoped API key selected by a
 // tenant application.
 type ModelConfig struct {
@@ -218,8 +227,9 @@ type ModelConfig struct {
 	// APIKeyRef is the external secret selected for this model. It is required
 	// because the production worker resolves the model credential only through
 	// a scoped secret reference.
-	APIKeyRef  SecretRef         `json:"api_key_ref"`
-	Parameters map[string]string `json:"parameters"`
+	APIKeyRef              SecretRef                   `json:"api_key_ref"`
+	Parameters             map[string]string           `json:"parameters"`
+	AttachmentCapabilities ModelAttachmentCapabilities `json:"attachment_capabilities"`
 }
 
 // ModelProviderOpenAI is the only model provider constructed by the

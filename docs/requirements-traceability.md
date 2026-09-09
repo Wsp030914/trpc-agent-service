@@ -44,9 +44,9 @@ Gateway 可多副本；Gateway 不启动 IM 长连接。Channel Adapter 为单�
 | --- | --- | --- | --- |
 | R3.1 | 至少两类 IM，含微信/企业微信 | WeCom Bot WebSocket + Feishu/Lark WebSocket；真实账号收发；客户端截图/Trace/人工确认 | EXTERNALLY_VERIFIED (real WeCom + Feishu) |
 | R3.2 | inbound normalize → ChannelInput/Runner | provider protocol → `ChannelInput` → Gateway Admission → framework Runner；真实入站 execution 记录 | EXTERNALLY_VERIFIED (real messages) |
-| R3.3 | Agent event → reply | durable event projection；Channel role 的 WeCom/Feishu Reply Sender 消费 Reply Outbox 并发送文本；客户端截图；真实 `SENT`/Provider receipt | EXTERNALLY_VERIFIED (real replies) |
+| R3.3 | Agent event/接入失败 → reply | terminal event durable projection；媒体/Admission/命令失败写 `channel_failure` Outbox；Channel role 的 WeCom/Feishu Reply Sender 消费 Reply Outbox；客户端截图；真实 `SENT`/Provider receipt | EXTERNALLY_VERIFIED (real replies) |
 | R3.4 | binding、secret、auth、dedupe、identity | binding scope/revision、scoped SecretProvider、官方 WebSocket/SDK protocol auth、HMAC/AEAD、inbox；真实连接状态 | EXTERNALLY_VERIFIED (real connections) |
-| R3.5 | direct/group/topic Session 隔离 | direct=user principal；group/topic=conversation principal；binding/tenant/app scope | REPO_VERIFIED |
+| R3.5 | direct/group/topic Session 隔离与 `/new` | direct=user principal；group/topic=conversation principal；`conversation_session` scoped active pointer；`/new` 原子切换且不进入 Runner | REPO_VERIFIED |
 | R3.6 | 长度、频率、异步、媒体、撤回、重试边界 | 32 MiB media/COS staging、Redis reply limiter、Reply Outbox、Feishu recall、adapter tests | REPO_VERIFIED |
 | R3.7 | 真实第三方 IM 账号和网络可用性 | 本机真实企业微信/飞书账号、真实网络、文本收发、Provider receipt；证据见 `acceptance-screenshots` | EXTERNALLY_VERIFIED (local accounts/network) |
 
@@ -73,7 +73,7 @@ Gateway 可多副本；Gateway 不启动 IM 长连接。Channel Adapter 为单�
 | --- | --- | --- | --- |
 | R5.1 | node failure/duplicate delivery | XAUTOCLAIM、execution lease/run token、ACK after durable transition | REPO_VERIFIED |
 | R5.2 | IM retry/DB/Redis temporary failure | bounded backoff、readiness gating、outbox/lease recovery、uncertain classification | REPO_VERIFIED |
-| R5.3 | model timeout/tool/budget failure | context cancellation、typed retryable/permanent/uncertain errors、budget fail closed | REPO_VERIFIED |
+| R5.3 | model/runtime/tool/budget failure | context cancellation、typed retryable/permanent/uncertain errors；Runner 构建最终失败持久化 terminal event；budget fail closed | REPO_VERIFIED |
 | R5.4 | context/goroutine/event drain | shutdown readiness gate、stop claim、Runner event drain before Session lease release | REPO_VERIFIED |
 | R5.5 | canary/config rollback | immutable ConfigVersion、stable/canary、pause/rollback/promote、migration guard | REPO_VERIFIED |
 | R5.6 | capacity assessment | evaluator/observer/error gate、Worker concurrency、Session serial lane、reply limiter formulas | REPO_VERIFIED |

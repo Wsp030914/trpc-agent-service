@@ -106,6 +106,8 @@ type Claim struct {
 	TurnSeq int64
 	Lease   Lease
 	Attempt int
+	// FinalAttempt is true when another retry is not available for this claim.
+	FinalAttempt bool
 }
 
 // Validate checks the durable execution identity and lease ownership in a claim.

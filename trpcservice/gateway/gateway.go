@@ -384,6 +384,12 @@ type ChannelConfigVersionPinner interface {
 	PinChannelConfig(context.Context, AdmissionRequest) (string, error)
 }
 
+// ChannelFailureRecorder durably replies when a verified channel request
+// cannot reach execution admission.
+type ChannelFailureRecorder interface {
+	RecordChannelFailure(context.Context, AdmissionRequest) error
+}
+
 // ChannelAttachmentPreparer is an adapter-owned media boundary. Raw provider
 // media handles stay in the adapter closure and only resulting ArtifactRefs
 // cross into Gateway admission.
@@ -422,6 +428,16 @@ func (g Gateway) HandleChannel(
 		return AdmissionResult{}, errors.New("channel attachment preparer is required")
 	}
 	return g.handle(ctx, req, prepare)
+}
+
+// RecordChannelFailure persists one idempotent failure reply for a verified
+// channel request that bypassed normal admission, such as a platform command.
+func (g Gateway) RecordChannelFailure(ctx context.Context, request AdmissionRequest) error {
+	recorder, ok := g.admitter.(ChannelFailureRecorder)
+	if !ok {
+		return errors.New("channel failure recorder is required")
+	}
+	return recorder.RecordChannelFailure(ctx, request)
 }
 
 func (g Gateway) handle(
@@ -505,6 +521,16 @@ func (g Gateway) handle(
 	}
 	if err := admissionRequest.Validate(); err != nil {
 		return AdmissionResult{}, err
+	}
+	if channelInput != nil {
+		defer func() {
+			if err == nil && result.Status != AdmissionStatusRejected {
+				return
+			}
+			if failureErr := g.RecordChannelFailure(admitCtx, admissionRequest); failureErr != nil {
+				err = errors.Join(err, fmt.Errorf("record channel failure: %w", failureErr))
+			}
+		}()
 	}
 	var cleanup func(context.Context) error
 	if prepare != nil {

@@ -273,12 +273,47 @@ func TestGatewayPinsChannelConfigBeforeAttachmentsAndCompensatesAdmissionFailure
 	if len(admitter.request.Message.ArtifactRefs) != 1 || len(admitter.request.ChannelInput.ArtifactRefs) != 1 {
 		t.Fatalf("prepared admission artifacts = %#v", admitter.request)
 	}
+	if admitter.failureRequest.RequestID != "request-attachment" {
+		t.Fatalf("failure request = %#v", admitter.failureRequest)
+	}
+
+	prepareErr := errors.New("download attachment failed")
+	prepareAdmitter := &pinnerAdmitter{}
+	prepareResolver, err := gateway.NewChannelBindingInputIdentityResolverFromBinding(
+		binding.Snapshot(),
+		tenant.RuntimeContext{
+			TenantID: binding.TenantID, AppID: binding.AppID,
+			Channel: string(binding.Channel), BindingID: binding.BindingID,
+			TraceID: "request-prepare-failure",
+		},
+	)
+	if err != nil {
+		t.Fatalf("new prepare failure resolver: %v", err)
+	}
+	_, err = gateway.New(prepareAdmitter).HandleChannel(context.Background(), gateway.Request{
+		RequestID: "request-prepare-failure", IdempotencyKey: "message-attachment",
+		Tenant: prepareResolver, ChannelInput: &input,
+	}, func(context.Context, channels.ChannelInput, string) (channels.ChannelInput, func(context.Context) error, error) {
+		return channels.ChannelInput{}, nil, prepareErr
+	})
+	if !errors.Is(err, prepareErr) {
+		t.Fatalf("prepare failure = %v, want %v", err, prepareErr)
+	}
+	if prepareAdmitter.failureRequest.RequestID != "request-prepare-failure" || prepareAdmitter.request.RequestID != "" {
+		t.Fatalf("prepare failure recorder=%#v admission=%#v", prepareAdmitter.failureRequest, prepareAdmitter.request)
+	}
 }
 
 type pinnerAdmitter struct {
-	request gateway.AdmissionRequest
-	result  gateway.AdmissionResult
-	err     error
+	request        gateway.AdmissionRequest
+	failureRequest gateway.AdmissionRequest
+	result         gateway.AdmissionResult
+	err            error
+}
+
+func (a *pinnerAdmitter) RecordChannelFailure(_ context.Context, request gateway.AdmissionRequest) error {
+	a.failureRequest = request
+	return nil
 }
 
 func (a *pinnerAdmitter) PinChannelConfig(context.Context, gateway.AdmissionRequest) (string, error) {

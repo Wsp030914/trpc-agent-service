@@ -137,10 +137,9 @@ func (d mediaDownloader) downloadWeCom(
 	if filename == "." || filename == "/" || filename == "" {
 		filename = "attachment"
 	}
-	mimeType := strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])
-	if mimeType == "" || mimeType == "application/octet-stream" || mimeType == "application/zip" {
-		mimeType = channels.DetectMediaMIMEType(filename, data)
-	}
+	// Do not trust the provider HTTP header for capability classification. A
+	// wrong header must not turn arbitrary bytes into an image/audio part.
+	mimeType := channels.DetectMediaMIMEType(filename, data)
 	if _, _, err := mime.ParseMediaType(mimeType); err != nil {
 		mimeType = "application/octet-stream"
 	}

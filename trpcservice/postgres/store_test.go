@@ -68,10 +68,11 @@ func TestAppConfigPersistenceDocumentRoundTrip(t *testing.T) {
 				AppID:    "research",
 				Version:  "v7",
 				Model: tenant.ModelConfig{
-					Provider:   "openai",
-					Model:      "gpt-4.1",
-					APIKeyRef:  tenant.SecretRef{Name: "model-key", Version: "3"},
-					Parameters: map[string]string{"temperature": "0.2"},
+					Provider:               "openai",
+					Model:                  "gpt-4.1",
+					APIKeyRef:              tenant.SecretRef{Name: "model-key", Version: "3"},
+					Parameters:             map[string]string{"temperature": "0.2"},
+					AttachmentCapabilities: tenant.ModelAttachmentCapabilities{Image: true, Audio: true},
 				},
 				Tools: tenant.ToolPolicy{
 					VisibleTools:        []string{"search"},

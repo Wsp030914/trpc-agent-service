@@ -10,6 +10,7 @@ import (
 
 	platformartifact "github.com/liuzengh/trpc-agent-service/trpcservice/artifact"
 	artifactcos "github.com/liuzengh/trpc-agent-service/trpcservice/artifact/cos"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	knowledgeqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/knowledge/qdrant"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	memorytencentdb "github.com/liuzengh/trpc-agent-service/trpcservice/memory/tencentdb"
@@ -26,6 +27,7 @@ import (
 	sessionredis "github.com/liuzengh/trpc-agent-service/trpcservice/session/redis"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	"trpc.group/trpc-go/trpc-agent-go/event"
 )
 
 type workerRuntime struct {
@@ -61,6 +63,7 @@ type workerRuntimeDependencies struct {
 	pauseAfterClaim             time.Duration
 	pauseAfterMigrationCopy     time.Duration
 	pauseAfterMigrationCopyItem time.Duration
+	replyMode                   worker.ReplyMode
 }
 
 const (
@@ -194,7 +197,17 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	if err != nil {
 		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
 	}
-	events, err := postgres.NewExecutionEventJournal(deps.store, postgres.WithReplyEventBuilder(worker.BuildReplyEvent))
+	replyMode := deps.replyMode
+	if replyMode == "" {
+		replyMode = worker.ReplyModeText
+	}
+	replyBuilder := worker.BuildReplyEvent
+	if replyMode != worker.ReplyModeText {
+		replyBuilder = func(ctx context.Context, exec worker.Execution, sequence int64, evt *event.Event) ([]channels.Reply, error) {
+			return worker.BuildReplyEventForMode(ctx, exec, sequence, evt, replyMode)
+		}
+	}
+	events, err := postgres.NewExecutionEventJournal(deps.store, postgres.WithReplyEventBuilder(replyBuilder))
 	if err != nil {
 		return nil, joinCloseError(err, knowledge.Close, memories.Close, sessionRouter.Close)
 	}

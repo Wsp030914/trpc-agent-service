@@ -400,6 +400,7 @@ func (c *Consumer) executeClaim(ctx context.Context, claim queue.Claim) (bool, e
 	if err != nil {
 		return false, fmt.Errorf("attach execution lease: %w", err)
 	}
+	runCtx = ContextWithFinalAttempt(runCtx, claim.FinalAttempt)
 	done := make(chan error, 1)
 	go c.renewLease(runCtx, cancelRun, claim, done)
 	result, runErr := c.executor.Run(runCtx, claim.Job)

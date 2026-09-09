@@ -1,6 +1,7 @@
 package wecom
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 )
 
 const maxProviderURLLength = 16 << 10
+
+const wecomProviderTargetPrefix = "wecom-target-v1:"
 
 var (
 	errWeComBindingAccountMismatch  = errors.New("wecom binding account does not match event")
@@ -40,6 +43,10 @@ type Message struct {
 	Stream      MessageStream   `json:"stream"`
 	Event       json.RawMessage `json:"event"`
 	EventType   string          `json:"eventtype"`
+	// ResponseRequestID is copied from the authenticated callback frame
+	// header. It is not provider input and is never persisted in plaintext;
+	// channelInput seals the complete message target before admission.
+	ResponseRequestID string `json:"-"`
 }
 
 type MessageFrom struct {
@@ -96,7 +103,8 @@ type VerifiedProviderEnvelope struct {
 	ProviderTimestamp time.Time
 	Context           ProviderEventContext
 
-	mapping channels.ChannelMappingInput
+	mapping     channels.ChannelMappingInput
+	replyTarget string
 }
 
 // Validate checks the normalized fields needed to build ChannelInput.
@@ -166,6 +174,9 @@ func (e VerifiedProviderEnvelope) Validate() error {
 	if err := e.mapping.Validate(e.ConversationKind); err != nil {
 		return fmt.Errorf("wecom mapping: %w", err)
 	}
+	if e.replyTarget == "" {
+		return errWeComMessageInvalid
+	}
 	return nil
 }
 
@@ -201,6 +212,14 @@ func normalizeMessage(binding channels.BindingSnapshot, message Message) (Verifi
 		mapping.ExternalChatID = chatID
 		mapping.ProviderConversationTarget = chatID
 	}
+	destination := senderID
+	if conversationKind == channels.ConversationGroup {
+		destination = chatID
+	}
+	replyTarget, err := encodeProviderTarget(destination, message.ResponseRequestID)
+	if err != nil {
+		return VerifiedProviderEnvelope{}, errWeComMessageInvalid
+	}
 	envelope := VerifiedProviderEnvelope{
 		TenantID:          binding.TenantID,
 		AppID:             binding.AppID,
@@ -217,11 +236,56 @@ func normalizeMessage(binding channels.BindingSnapshot, message Message) (Verifi
 		ProviderTimestamp: providerTimestamp,
 		Context:           providerContext,
 		mapping:           mapping,
+		replyTarget:       replyTarget,
 	}
 	if err := envelope.Validate(); err != nil {
 		return VerifiedProviderEnvelope{}, err
 	}
 	return envelope, nil
+}
+
+type providerTarget struct {
+	Destination string `json:"destination"`
+	RequestID   string `json:"request_id,omitempty"`
+}
+
+func encodeProviderTarget(destination, requestID string) (string, error) {
+	normalized, err := channels.NormalizeExternalID(destination)
+	if err != nil || normalized != destination {
+		return "", errWeComMessageInvalid
+	}
+	encoded, err := json.Marshal(providerTarget{
+		Destination: destination,
+		RequestID:   requestID,
+	})
+	if err != nil {
+		return "", err
+	}
+	return wecomProviderTargetPrefix + base64.RawURLEncoding.EncodeToString(encoded), nil
+}
+
+func decodeProviderTarget(value string) (providerTarget, error) {
+	if strings.HasPrefix(value, wecomProviderTargetPrefix) {
+		encoded := strings.TrimPrefix(value, wecomProviderTargetPrefix)
+		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+		if err != nil {
+			return providerTarget{}, errors.New("wecom provider target is invalid")
+		}
+		var target providerTarget
+		if err := json.Unmarshal(decoded, &target); err != nil {
+			return providerTarget{}, errors.New("wecom provider target is invalid")
+		}
+		normalized, err := channels.NormalizeExternalID(target.Destination)
+		if err != nil || normalized != target.Destination || strings.ContainsAny(target.RequestID, "\r\n") {
+			return providerTarget{}, errors.New("wecom provider target is invalid")
+		}
+		return target, nil
+	}
+	normalized, err := channels.NormalizeExternalID(value)
+	if err != nil || normalized != value {
+		return providerTarget{}, errors.New("wecom provider target is invalid")
+	}
+	return providerTarget{Destination: value}, nil
 }
 
 func normalizeConversation(chatType, chatID string) (channels.ConversationKind, string, error) {

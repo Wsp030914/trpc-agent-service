@@ -65,6 +65,7 @@ const (
 	envJaegerURL                        = "TRPC_AGENT_SERVICE_JAEGER_URL"
 	envPrometheusURL                    = "TRPC_AGENT_SERVICE_PROMETHEUS_URL"
 	envGrafanaURL                       = "TRPC_AGENT_SERVICE_GRAFANA_URL"
+	envIMReplyMode                      = "TRPC_AGENT_SERVICE_IM_REPLY_MODE"
 
 	defaultHTTPAddr          = ":8080"
 	defaultRedisStream       = "trpc-agent-service:dispatch"
@@ -117,6 +118,7 @@ type serviceConfig struct {
 	JaegerURL                   string
 	PrometheusURL               string
 	GrafanaURL                  string
+	IMReplyMode                 worker.ReplyMode
 	Telemetry                   platformtelemetry.Config
 	Pricing                     platformmetrics.PricingCatalog
 }
@@ -168,6 +170,7 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 		JaegerURL:         defaultJaegerURL,
 		PrometheusURL:     defaultPrometheusURL,
 		GrafanaURL:        defaultGrafanaURL,
+		IMReplyMode:       worker.ReplyMode(getenv(envIMReplyMode)),
 		Telemetry: platformtelemetry.Config{
 			Protocol:       getenv(envOTELProtocol),
 			TraceEndpoint:  getenv(envOTELTracesEndpoint),
@@ -191,6 +194,12 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 	}
 	if config.HTTPAddr == "" {
 		config.HTTPAddr = defaultHTTPAddr
+	}
+	if config.IMReplyMode == "" {
+		config.IMReplyMode = worker.ReplyModeText
+	}
+	if err := config.IMReplyMode.Validate(); err != nil {
+		return serviceConfig{}, fmt.Errorf("%s: %w", envIMReplyMode, err)
 	}
 	if config.Role.runsWorker() && config.WorkerID == "" {
 		return serviceConfig{}, fmt.Errorf("%s is required for worker role", envWorkerID)
@@ -415,7 +424,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 
 	var replies *replyRuntime
 	if config.Role.runsChannel() {
-		replies, err = newReplyRuntime(store, redisClient, channelReplyOwner(config), os.Getenv, metricsRecorder)
+		replies, err = newReplyRuntime(store, redisClient, channelReplyOwner(config), wecomAdapter, os.Getenv, metricsRecorder)
 		if err != nil {
 			return err
 		}
@@ -451,6 +460,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 			pauseAfterClaim:             config.PauseAfterClaim,
 			pauseAfterMigrationCopy:     config.PauseAfterMigrationCopy,
 			pauseAfterMigrationCopyItem: config.PauseAfterMigrationCopyItem,
+			replyMode:                   config.IMReplyMode,
 		})
 		if err != nil {
 			return err
@@ -544,6 +554,7 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 		admitter,
 		secrets,
 		wecom.WithAttachmentIngestor(attachmentIngestor),
+		wecom.WithCommandHandler(store),
 		wecom.WithMetrics(store.Metrics()),
 	)
 	if err != nil {
@@ -554,6 +565,7 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 		admitter,
 		secrets,
 		feishu.WithAttachmentIngestor(attachmentIngestor),
+		feishu.WithCommandHandler(store),
 		feishu.WithRecallAdmitter(store),
 		feishu.WithMetrics(store.Metrics()),
 	)

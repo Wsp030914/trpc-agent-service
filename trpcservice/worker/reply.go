@@ -37,7 +37,29 @@ var (
 	// ErrReplyBindingChanged means a reply was created against an older
 	// binding authorization snapshot and must not be sent with the new target.
 	ErrReplyBindingChanged = errors.New("reply binding authorization changed")
+	// ErrReplyCapabilityUnavailable means the selected provider has no native
+	// implementation for the requested rich reply kind.
+	ErrReplyCapabilityUnavailable = errors.New("reply provider capability is unavailable")
 )
+
+// ReplyMode selects the IM presentation mode for new executions. Text is the
+// compatibility default; stream and card use the same durable Reply Outbox.
+type ReplyMode string
+
+const (
+	ReplyModeText   ReplyMode = "text"
+	ReplyModeStream ReplyMode = "stream"
+	ReplyModeCard   ReplyMode = "card"
+)
+
+func (m ReplyMode) Validate() error {
+	switch m {
+	case ReplyModeText, ReplyModeStream, ReplyModeCard:
+		return nil
+	default:
+		return fmt.Errorf("reply mode %q is invalid", m)
+	}
+}
 
 // Build returns one durable text reply for a completed execution event.
 // Events without user-visible assistant text return no replies while the
@@ -47,6 +69,19 @@ func BuildReplyEvent(
 	exec Execution,
 	sequence int64,
 	evt *event.Event,
+) ([]channels.Reply, error) {
+	return BuildReplyEventForMode(ctx, exec, sequence, evt, ReplyModeText)
+}
+
+// BuildReplyEventForMode projects model partials and terminal output into
+// durable provider-neutral frames. The PostgreSQL journal later converts
+// partial stream deltas into full snapshots atomically with event persistence.
+func BuildReplyEventForMode(
+	ctx context.Context,
+	exec Execution,
+	sequence int64,
+	evt *event.Event,
+	mode ReplyMode,
 ) ([]channels.Reply, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -66,26 +101,67 @@ func BuildReplyEvent(
 	if evt.RequestID != "" && evt.RequestID != exec.RequestID {
 		return nil, errors.New("runner event request_id does not match execution")
 	}
-	if exec.Tenant.Channel == "" || exec.Tenant.BindingID == "" || !evt.IsRunnerCompletion() {
+	if err := mode.Validate(); err != nil {
+		return nil, err
+	}
+	if exec.Tenant.Channel == "" || exec.Tenant.BindingID == "" {
 		return nil, nil
 	}
-	if evt.Error != nil || evt.IsTerminalError() {
+	if evt.IsTerminalError() {
+		text := replyErrorText(evt)
+		if mode == ReplyModeText {
+			return []channels.Reply{newReply(exec, sequence, mode, text, "")}, nil
+		}
+		if mode == ReplyModeCard {
+			return []channels.Reply{newCardReplyWithStatusAndPhase(exec, sequence, text, "FAILED", channels.StreamPhaseAbort)}, nil
+		}
+		return []channels.Reply{newReply(exec, sequence, mode, text, channels.StreamPhaseAbort)}, nil
+	}
+	if exec.ApprovalPending && evt.IsRunnerCompletion() {
 		return nil, nil
 	}
+	if mode == ReplyModeText && !evt.IsRunnerCompletion() {
+		// Text mode keeps the terminal projection contract: the runner
+		// completion owns the one user-visible reply. The journal merges the
+		// preceding final chat.completion into it when necessary.
+		return nil, nil
+	}
+	phase := channels.StreamPhaseEnd
 	text := visibleAssistantText(evt)
-	if text == "" {
-		return nil, nil
-	}
-	target := channels.ReplyTarget{
-		Kind:             channels.TargetKindUser,
-		InternalEntityID: exec.Tenant.UserID,
-	}
-	if exec.Tenant.SessionPrincipalID != "" && exec.Tenant.SessionPrincipalID != exec.Tenant.UserID {
-		target = channels.ReplyTarget{
-			Kind:             channels.TargetKindConversation,
-			InternalEntityID: exec.Tenant.SessionPrincipalID,
+	isPartial := evt.Response != nil && evt.Response.IsPartial
+	if mode == ReplyModeStream || mode == ReplyModeCard {
+		if isPartial {
+			if mode == ReplyModeCard && channels.Channel(exec.Tenant.Channel) == channels.ChannelWeCom {
+				// WeCom has no card patch operation. Emit one final card instead
+				// of creating a new card for every partial event.
+				return nil, nil
+			}
+			text = visibleAssistantDeltaText(evt)
+			phase = channels.StreamPhaseUpdate
+		} else if !evt.IsRunnerCompletion() {
+			return nil, nil
 		}
 	}
+	if text == "" && !evt.IsRunnerCompletion() {
+		return nil, nil
+	}
+	if text == "" && evt.IsRunnerCompletion() && mode == ReplyModeText {
+		// A text reply has no lifecycle row to close. Do not enqueue an invalid
+		// empty ordinary message when the runner completed without visible text.
+		return nil, nil
+	}
+	if mode == ReplyModeCard {
+		status := "SUCCEEDED"
+		if isPartial {
+			status = "STREAMING"
+		}
+		return []channels.Reply{newCardReplyWithStatusAndPhase(exec, sequence, text, status, phase)}, nil
+	}
+	return []channels.Reply{newReply(exec, sequence, mode, text, phase)}, nil
+}
+
+func newReply(exec Execution, sequence int64, mode ReplyMode, text string, phase channels.StreamPhase) channels.Reply {
+	target := replyTarget(exec)
 	reply := channels.Reply{
 		TenantID:        exec.Tenant.TenantID,
 		AppID:           exec.Tenant.AppID,
@@ -98,8 +174,53 @@ func BuildReplyEvent(
 		Target:          target,
 		Text:            text,
 	}
+	if mode == ReplyModeStream {
+		reply.Kind = channels.ReplyKindStream
+		reply.StreamID = exec.RequestID
+		reply.StreamPhase = phase
+		reply.StreamSequence = sequence
+	}
 	reply.ReplyID = reply.StableID()
-	return []channels.Reply{reply}, nil
+	return reply
+}
+
+func newCardReply(exec Execution, sequence int64, text string) channels.Reply {
+	return newCardReplyWithStatusAndPhase(exec, sequence, text, "SUCCEEDED", channels.StreamPhaseEnd)
+}
+
+func newCardReplyWithStatus(exec Execution, sequence int64, text, status string) channels.Reply {
+	return newCardReplyWithStatusAndPhase(exec, sequence, text, status, channels.StreamPhaseEnd)
+}
+
+func newCardReplyWithStatusAndPhase(
+	exec Execution,
+	sequence int64,
+	text, status string,
+	phase channels.StreamPhase,
+) channels.Reply {
+	reply := newReply(exec, sequence, ReplyModeStream, "", phase)
+	reply.Kind = channels.ReplyKindCard
+	reply.Card = &channels.ReplyCard{
+		Title:  "Agent 回复",
+		Body:   text,
+		Status: status,
+	}
+	reply.ReplyID = reply.StableID()
+	return reply
+}
+
+func replyTarget(exec Execution) channels.ReplyTarget {
+	target := channels.ReplyTarget{
+		Kind:             channels.TargetKindUser,
+		InternalEntityID: exec.Tenant.UserID,
+	}
+	if exec.Tenant.SessionPrincipalID != "" && exec.Tenant.SessionPrincipalID != exec.Tenant.UserID {
+		target = channels.ReplyTarget{
+			Kind:             channels.TargetKindConversation,
+			InternalEntityID: exec.Tenant.SessionPrincipalID,
+		}
+	}
+	return target
 }
 
 // ReplyOutbox persists and leases provider replies independently from the
@@ -362,7 +483,7 @@ func (s *ReplySender) sendOne(ctx context.Context, delivery ReplyDelivery) error
 		}
 		return s.recordFailure(ctx, delivery, err, retryable, errorType, started, span)
 	}
-	receipt, err := provider.Client.SendOnce(sendCtx, delivery.Reply, providerTarget)
+	receipt, err := sendReply(sendCtx, provider.Client, delivery, providerTarget)
 	if err != nil {
 		if isReplySideEffectUncertain(err) || errors.Is(err, context.Canceled) {
 			if errors.Is(err, context.Canceled) {
@@ -387,6 +508,32 @@ func (s *ReplySender) sendOne(ctx context.Context, delivery ReplyDelivery) error
 		}, time.Since(started), "")
 	}
 	return nil
+}
+
+func sendReply(
+	ctx context.Context,
+	client channels.ProviderOutboundClient,
+	delivery ReplyDelivery,
+	providerTarget string,
+) (channels.ProviderReceipt, error) {
+	switch delivery.Reply.ReplyKind() {
+	case channels.ReplyKindText:
+		return client.SendOnce(ctx, delivery.Reply, providerTarget)
+	case channels.ReplyKindStream:
+		rich, ok := client.(channels.ProviderStreamOutboundClient)
+		if !ok {
+			return channels.ProviderReceipt{}, fmt.Errorf("%w: stream", ErrReplyCapabilityUnavailable)
+		}
+		return rich.SendStream(ctx, delivery.Reply, providerTarget, delivery.ProviderMessageID)
+	case channels.ReplyKindCard:
+		rich, ok := client.(channels.ProviderCardOutboundClient)
+		if !ok {
+			return channels.ProviderReceipt{}, fmt.Errorf("%w: card", ErrReplyCapabilityUnavailable)
+		}
+		return rich.SendCard(ctx, delivery.Reply, providerTarget, delivery.ProviderMessageID)
+	default:
+		return channels.ProviderReceipt{}, fmt.Errorf("%w: %s", ErrReplyCapabilityUnavailable, delivery.Reply.ReplyKind())
+	}
 }
 
 func (s *ReplySender) recordUncertain(
@@ -549,7 +696,7 @@ func waitForReplySender(ctx context.Context, delay time.Duration) error {
 }
 
 func visibleAssistantText(evt *event.Event) string {
-	if evt == nil || evt.Response == nil {
+	if !isUserVisibleAssistantEvent(evt) {
 		return ""
 	}
 	var text string
@@ -561,4 +708,46 @@ func visibleAssistantText(evt *event.Event) string {
 		text += message.Content
 	}
 	return text
+}
+
+func visibleAssistantDeltaText(evt *event.Event) string {
+	if !isUserVisibleAssistantEvent(evt) {
+		return ""
+	}
+	var text string
+	for _, choice := range evt.Response.Choices {
+		message := choice.Delta
+		if message.Content == "" {
+			// Some runners expose a cumulative partial snapshot in Message
+			// instead of an incremental Delta.
+			message = choice.Message
+		}
+		if message.Role != "" && message.Role != model.RoleAssistant {
+			continue
+		}
+		text += message.Content
+	}
+	return text
+}
+
+func isUserVisibleAssistantEvent(evt *event.Event) bool {
+	if evt == nil || evt.Response == nil || evt.Error != nil {
+		return false
+	}
+	if evt.Response.IsToolCallResponse() || evt.Response.IsToolResultResponse() {
+		return false
+	}
+	switch evt.Object {
+	case "", model.ObjectTypeChatCompletion, model.ObjectTypeChatCompletionChunk, model.ObjectTypeRunnerCompletion:
+		return true
+	default:
+		return false
+	}
+}
+
+func replyErrorText(evt *event.Event) string {
+	if evt != nil && evt.Error != nil && evt.Error.Type == unsupportedAttachmentErrorType {
+		return "当前模型不支持该附件类型，请更换模型或移除附件。"
+	}
+	return "执行失败，请稍后重试。"
 }

@@ -88,6 +88,18 @@ func WithMetrics(recorder *platformmetrics.Recorder) AdapterOption {
 	}
 }
 
+// WithCommandHandler registers the durable platform command boundary used by
+// /new. Commands are handled before Gateway and never enter Runner admission.
+func WithCommandHandler(handler channels.NewSessionHandler) AdapterOption {
+	return func(adapter *Adapter) error {
+		if handler == nil {
+			return errors.New("new session command handler is required")
+		}
+		adapter.commandHandler = handler
+		return nil
+	}
+}
+
 // WithClientFactory replaces only the SDK client constructor. Production code
 // should leave it unset so the official Feishu WebSocket SDK is used.
 func WithClientFactory(factory ClientFactory) AdapterOption {
@@ -135,6 +147,7 @@ type Adapter struct {
 	admissionGateway   *gateway.Gateway
 	secrets            platformsecret.SecretProvider
 	attachmentIngestor channels.AttachmentIngestor
+	commandHandler     channels.NewSessionHandler
 	recallAdmitter     channels.RecallAdmitter
 	now                func() time.Time
 	metrics            *platformmetrics.Recorder
@@ -563,6 +576,11 @@ func (a *Adapter) HandleMessage(
 		return err
 	}
 	requestID := uuid.NewString()
+	eventCtx, span := platformtelemetry.StartSpan(ctx, "channel.event",
+		attribute.String("channel", string(channels.ChannelFeishu)),
+		attribute.String("binding_id", binding.BindingID),
+	)
+	defer span.End()
 	runtimeContext := tenant.RuntimeContext{
 		TenantID:  binding.TenantID,
 		AppID:     binding.AppID,
@@ -575,16 +593,38 @@ func (a *Adapter) HandleMessage(
 	if err != nil {
 		return fmt.Errorf("feishu admission identity: %w", err)
 	}
-	eventCtx, span := platformtelemetry.StartSpan(ctx, "channel.event",
-		attribute.String("channel", string(channels.ChannelFeishu)),
-		attribute.String("binding_id", binding.BindingID),
-	)
-	defer span.End()
+	identity, err := identityResolver.ResolveAdmissionIdentity(eventCtx)
+	if err != nil {
+		return fmt.Errorf("resolve feishu admission identity: %w", err)
+	}
 	admissionRequest := gateway.Request{
 		RequestID:      requestID,
 		IdempotencyKey: envelope.ExternalMessageID,
 		Tenant:         identityResolver,
 		ChannelInput:   &input,
+	}
+	if channels.RoutePlatformCommand(input) == channels.PlatformCommandNewSession {
+		if a.commandHandler == nil {
+			err = errors.New("new session command handler is not configured")
+		} else {
+			err = a.commandHandler.HandleNewSession(eventCtx, channels.NewSessionRequest{
+				RequestID: requestID,
+				Input:     input,
+			})
+		}
+		if err != nil {
+			failureRequest := gateway.AdmissionRequest{
+				RequestID: requestID, IdempotencyKey: envelope.ExternalMessageID,
+				Identity: identity, ChannelInput: &input,
+				Message: gateway.Message{Text: input.Text, ArtifactRefs: append([]string(nil), input.ArtifactRefs...)},
+			}
+			err = errors.Join(err, a.admissionGateway.RecordChannelFailure(eventCtx, failureRequest))
+			platformtelemetry.MarkError(span, "command", err)
+		}
+		if a.metrics != nil {
+			a.metrics.RecordIMCallback(eventCtx, platformmetrics.Labels{Channel: string(channels.ChannelFeishu)}, errorType(err))
+		}
+		return err
 	}
 	if len(envelope.Media) > 0 {
 		pinnedIngestor, ok := a.attachmentIngestor.(channels.PinnedAttachmentIngestor)

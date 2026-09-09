@@ -22,14 +22,17 @@ import (
 
 const (
 	maxFeishuReplyTextBytes    = 150 << 10
+	maxFeishuCardBytes         = 30 << 10
 	maxFeishuInboundMediaBytes = 32 << 20
 )
 
 var (
 	errFeishuReplyTooLarge          = errors.New("feishu reply is too large")
 	errFeishuReplyUnsupported       = errors.New("feishu reply is unsupported")
+	errFeishuStreamStateLost        = errors.New("feishu stream provider message is unavailable")
 	errFeishuOutboundNotInitialized = errors.New("feishu outbound client is not initialized")
 	errFeishuProviderMessageID      = errors.New("feishu provider message id is missing")
+	errFeishuCardTooLarge           = errors.New("feishu card is too large")
 )
 
 // ProviderSendError is the stable, body-redacted error returned by one
@@ -257,6 +260,9 @@ func (c *OutboundClient) SendOnce(
 	if reply.Channel != channels.ChannelFeishu {
 		return channels.ProviderReceipt{}, errors.New("feishu outbound client received another channel")
 	}
+	if reply.ReplyKind() != channels.ReplyKindText {
+		return channels.ProviderReceipt{}, errFeishuReplyUnsupported
+	}
 	content, err := encodeReply(reply)
 	if err != nil {
 		return channels.ProviderReceipt{}, err
@@ -276,16 +282,189 @@ func (c *OutboundClient) SendOnce(
 }
 
 func encodeReply(reply channels.Reply) ([]byte, error) {
-	if !utf8.ValidString(reply.Text) || len([]byte(reply.Text)) > maxFeishuReplyTextBytes {
+	return encodeText(reply.Text)
+}
+
+func encodeText(text string) ([]byte, error) {
+	if !utf8.ValidString(text) || len([]byte(text)) > maxFeishuReplyTextBytes {
 		return nil, errFeishuReplyTooLarge
 	}
 	content, err := json.Marshal(struct {
 		Text string `json:"text"`
-	}{Text: reply.Text})
+	}{Text: text})
 	if err != nil {
 		return nil, fmt.Errorf("encode feishu text: %w", err)
 	}
 	return content, nil
+}
+
+// SendStream sends the first frame as a reply and updates that bot message on
+// later frames. The previous provider message ID is loaded from Reply Outbox,
+// so recovery never creates a second visible stream message.
+func (c *OutboundClient) SendStream(
+	ctx context.Context,
+	reply channels.Reply,
+	providerTarget string,
+	previousProviderMessageID string,
+) (channels.ProviderReceipt, error) {
+	if c == nil || c.client == nil {
+		return channels.ProviderReceipt{}, errFeishuOutboundNotInitialized
+	}
+	if err := reply.Validate(); err != nil {
+		return channels.ProviderReceipt{}, fmt.Errorf("feishu stream reply: %w", err)
+	}
+	if reply.Channel != channels.ChannelFeishu || reply.ReplyKind() != channels.ReplyKindStream {
+		return channels.ProviderReceipt{}, errFeishuReplyUnsupported
+	}
+	content, err := encodeText(reply.Text)
+	if err != nil {
+		return channels.ProviderReceipt{}, err
+	}
+	if previousProviderMessageID == "" &&
+		reply.StreamPhase != channels.StreamPhaseStart &&
+		reply.StreamPhase != channels.StreamPhaseEnd &&
+		reply.StreamPhase != channels.StreamPhaseAbort {
+		return channels.ProviderReceipt{}, errFeishuStreamStateLost
+	}
+	if previousProviderMessageID != "" && reply.StreamPhase != channels.StreamPhaseStart {
+		return c.updateTextMessage(ctx, previousProviderMessageID, content)
+	}
+	kind, id, err := parseProviderTarget(providerTarget)
+	if err != nil {
+		return channels.ProviderReceipt{}, err
+	}
+	switch kind {
+	case feishuTargetMessage:
+		return c.replyMessageWithType(ctx, id, larkim.MsgTypeText, content, reply.ReplyID)
+	case feishuTargetUser, feishuTargetConversation:
+		return c.createMessageWithType(ctx, kind, id, larkim.MsgTypeText, content, reply.ReplyID)
+	default:
+		return channels.ProviderReceipt{}, errFeishuReplyUnsupported
+	}
+}
+
+// SendCard sends a native interactive card. If a provider message ID is
+// supplied, Feishu's card patch API updates that card instead of creating a
+// duplicate.
+func (c *OutboundClient) SendCard(
+	ctx context.Context,
+	reply channels.Reply,
+	providerTarget string,
+	previousProviderMessageID string,
+) (channels.ProviderReceipt, error) {
+	if c == nil || c.client == nil {
+		return channels.ProviderReceipt{}, errFeishuOutboundNotInitialized
+	}
+	if err := reply.Validate(); err != nil {
+		return channels.ProviderReceipt{}, fmt.Errorf("feishu card reply: %w", err)
+	}
+	if reply.Channel != channels.ChannelFeishu || reply.ReplyKind() != channels.ReplyKindCard {
+		return channels.ProviderReceipt{}, errFeishuReplyUnsupported
+	}
+	content, err := encodeCard(*reply.Card)
+	if err != nil {
+		return channels.ProviderReceipt{}, err
+	}
+	if previousProviderMessageID != "" {
+		req := larkim.NewPatchMessageReqBuilder().
+			MessageId(previousProviderMessageID).
+			Body(larkim.NewPatchMessageReqBodyBuilder().Content(string(content)).Build()).
+			Build()
+		resp, err := c.client.Im.Message.Patch(ctx, req)
+		if err != nil {
+			return channels.ProviderReceipt{}, transportError(err)
+		}
+		if resp == nil {
+			return channels.ProviderReceipt{}, &ProviderSendError{Retryable: true, Uncertain: true, cause: errors.New("empty feishu card patch response")}
+		}
+		if !resp.Success() {
+			return channels.ProviderReceipt{}, responseError(resp.ApiResp, resp.Code)
+		}
+		return channels.ProviderReceipt{ProviderMessageID: previousProviderMessageID}, nil
+	}
+	kind, id, err := parseProviderTarget(providerTarget)
+	if err != nil {
+		return channels.ProviderReceipt{}, err
+	}
+	switch kind {
+	case feishuTargetMessage:
+		return c.replyMessageWithType(ctx, id, larkim.MsgTypeInteractive, content, reply.ReplyID)
+	case feishuTargetUser, feishuTargetConversation:
+		return c.createMessageWithType(ctx, kind, id, larkim.MsgTypeInteractive, content, reply.ReplyID)
+	default:
+		return channels.ProviderReceipt{}, errFeishuReplyUnsupported
+	}
+}
+
+func encodeCard(card channels.ReplyCard) ([]byte, error) {
+	type cardText struct {
+		Tag     string `json:"tag"`
+		Content string `json:"content"`
+	}
+	type cardAction struct {
+		Tag   string            `json:"tag"`
+		Text  cardText          `json:"text"`
+		Type  string            `json:"type,omitempty"`
+		Value map[string]string `json:"value,omitempty"`
+	}
+	type cardElement struct {
+		Tag     string       `json:"tag"`
+		Content string       `json:"content,omitempty"`
+		Text    *cardText    `json:"text,omitempty"`
+		Actions []cardAction `json:"actions,omitempty"`
+	}
+	type cardHeader struct {
+		Title struct {
+			Tag     string `json:"tag"`
+			Content string `json:"content"`
+		} `json:"title"`
+		Template string `json:"template,omitempty"`
+	}
+	type cardBody struct {
+		Elements []cardElement `json:"elements"`
+	}
+	payload := struct {
+		Schema string     `json:"schema"`
+		Header cardHeader `json:"header"`
+		Body   cardBody   `json:"body"`
+	}{}
+	payload.Schema = "2.0"
+	payload.Header.Title.Tag = "plain_text"
+	payload.Header.Title.Content = card.Title
+	payload.Header.Template = "blue"
+	payload.Body.Elements = append(payload.Body.Elements, cardElement{
+		Tag:     "markdown",
+		Content: card.Body,
+	})
+	if card.Status != "" {
+		payload.Body.Elements = append(payload.Body.Elements, cardElement{
+			Tag:  "div",
+			Text: &cardText{Tag: "plain_text", Content: "状态：" + card.Status},
+		})
+	}
+	if len(card.Actions) > 0 {
+		actions := make([]cardAction, 0, len(card.Actions))
+		for _, action := range card.Actions {
+			actions = append(actions, cardAction{
+				Tag:  "button",
+				Text: cardText{Tag: "plain_text", Content: action.Label},
+				Type: "primary",
+				Value: map[string]string{
+					"action_id": action.ID,
+					"value":     action.Value,
+				},
+			})
+		}
+		payload.Body.Elements = append(payload.Body.Elements, cardElement{Tag: "action", Actions: actions})
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode feishu card: %w", err)
+	}
+	if len(encoded) > maxFeishuCardBytes {
+		return nil, errFeishuCardTooLarge
+	}
+	return encoded, nil
 }
 
 func (c *OutboundClient) createMessage(
@@ -294,11 +473,20 @@ func (c *OutboundClient) createMessage(
 	content []byte,
 	uuid string,
 ) (channels.ProviderReceipt, error) {
+	return c.createMessageWithType(ctx, targetKind, targetID, larkim.MsgTypeText, content, uuid)
+}
+
+func (c *OutboundClient) createMessageWithType(
+	ctx context.Context,
+	targetKind, targetID, msgType string,
+	content []byte,
+	uuid string,
+) (channels.ProviderReceipt, error) {
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(targetKind).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
 			ReceiveId(targetID).
-			MsgType(larkim.MsgTypeText).
+			MsgType(msgType).
 			Content(string(content)).
 			Uuid(uuid).
 			Build()).
@@ -325,10 +513,19 @@ func (c *OutboundClient) replyMessage(
 	content []byte,
 	uuid string,
 ) (channels.ProviderReceipt, error) {
+	return c.replyMessageWithType(ctx, messageID, larkim.MsgTypeText, content, uuid)
+}
+
+func (c *OutboundClient) replyMessageWithType(
+	ctx context.Context,
+	messageID, msgType string,
+	content []byte,
+	uuid string,
+) (channels.ProviderReceipt, error) {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(messageID).
 		Body(larkim.NewReplyMessageReqBodyBuilder().
-			MsgType(larkim.MsgTypeText).
+			MsgType(msgType).
 			Content(string(content)).
 			Uuid(uuid).
 			Build()).
@@ -347,6 +544,31 @@ func (c *OutboundClient) replyMessage(
 		return receiptFromID(resp.Data.MessageId)
 	}
 	return receiptFromID(nil)
+}
+
+func (c *OutboundClient) updateTextMessage(
+	ctx context.Context,
+	messageID string,
+	content []byte,
+) (channels.ProviderReceipt, error) {
+	req := larkim.NewUpdateMessageReqBuilder().
+		MessageId(messageID).
+		Body(larkim.NewUpdateMessageReqBodyBuilder().
+			MsgType(larkim.MsgTypeText).
+			Content(string(content)).
+			Build()).
+		Build()
+	resp, err := c.client.Im.Message.Update(ctx, req)
+	if err != nil {
+		return channels.ProviderReceipt{}, transportError(err)
+	}
+	if resp == nil {
+		return channels.ProviderReceipt{}, &ProviderSendError{Retryable: true, Uncertain: true, cause: errors.New("empty feishu message update response")}
+	}
+	if !resp.Success() {
+		return channels.ProviderReceipt{}, responseError(resp.ApiResp, resp.Code)
+	}
+	return channels.ProviderReceipt{ProviderMessageID: messageID}, nil
 }
 
 func receiptFromID(providerMessageID *string) (channels.ProviderReceipt, error) {
@@ -375,7 +597,7 @@ func responseError(response *larkcore.ApiResp, code int) error {
 		StatusCode:      statusCode,
 		Code:            code,
 		Retryable:       retryableFeishuStatus(statusCode),
-		Uncertain:       statusCode >= http.StatusInternalServerError,
+		Uncertain:       statusCode == http.StatusRequestTimeout || statusCode >= http.StatusInternalServerError,
 		RetryAfterDelay: retryAfter,
 	}
 }

@@ -12,6 +12,12 @@ import (
 // as an ordinary permanent failure.
 var ErrSessionLeaseLost = errors.New("session lease lost")
 
+// ErrUnsupportedAttachment identifies a model capability mismatch without
+// coupling the worker package to the runtime/model adapter package.
+var ErrUnsupportedAttachment = errors.New("unsupported model attachment/file capability")
+
+const unsupportedAttachmentErrorType = "unsupported_attachment"
+
 // RetryableExecutionError marks a failure that is safe to try again before a
 // runner has started any externally visible work.
 type RetryableExecutionError struct{ Err error }

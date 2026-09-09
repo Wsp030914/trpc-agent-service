@@ -25,6 +25,7 @@ const (
 	defaultReconnectMax      = 30 * time.Second
 	defaultReconcileInterval = time.Second
 	clientCloseTimeout       = 5 * time.Second
+	wecomMessageTargetTTL    = time.Hour
 )
 
 var errAttachmentIngestorRequired = errors.New("attachment ingestor is required")
@@ -69,6 +70,18 @@ func WithAttachmentIngestor(ingestor channels.AttachmentIngestor) AdapterOption 
 func WithMetrics(recorder *platformmetrics.Recorder) AdapterOption {
 	return func(adapter *Adapter) error {
 		adapter.metrics = recorder
+		return nil
+	}
+}
+
+// WithCommandHandler registers the durable platform command boundary used by
+// /new. Commands are handled before Gateway and never enter Runner admission.
+func WithCommandHandler(handler channels.NewSessionHandler) AdapterOption {
+	return func(adapter *Adapter) error {
+		if handler == nil {
+			return errors.New("new session command handler is required")
+		}
+		adapter.commandHandler = handler
 		return nil
 	}
 }
@@ -118,6 +131,7 @@ type Adapter struct {
 	admissionGateway   *gateway.Gateway
 	secrets            platformsecret.SecretProvider
 	attachmentIngestor channels.AttachmentIngestor
+	commandHandler     channels.NewSessionHandler
 	now                func() time.Time
 	metrics            *platformmetrics.Recorder
 	clientFactory      ClientFactory
@@ -532,6 +546,11 @@ func (a *Adapter) HandleMessage(
 		return err
 	}
 	requestID := uuid.NewString()
+	eventCtx, span := platformtelemetry.StartSpan(ctx, "channel.event",
+		attribute.String("channel", string(channels.ChannelWeCom)),
+		attribute.String("binding_id", binding.BindingID),
+	)
+	defer span.End()
 	runtimeContext := tenant.RuntimeContext{
 		TenantID:  binding.TenantID,
 		AppID:     binding.AppID,
@@ -544,16 +563,38 @@ func (a *Adapter) HandleMessage(
 	if err != nil {
 		return fmt.Errorf("wecom admission identity: %w", err)
 	}
-	eventCtx, span := platformtelemetry.StartSpan(ctx, "channel.event",
-		attribute.String("channel", string(channels.ChannelWeCom)),
-		attribute.String("binding_id", binding.BindingID),
-	)
-	defer span.End()
+	identity, err := identityResolver.ResolveAdmissionIdentity(eventCtx)
+	if err != nil {
+		return fmt.Errorf("resolve wecom admission identity: %w", err)
+	}
 	admissionRequest := gateway.Request{
 		RequestID:      requestID,
 		IdempotencyKey: envelope.ExternalMessageID,
 		Tenant:         identityResolver,
 		ChannelInput:   &input,
+	}
+	if channels.RoutePlatformCommand(input) == channels.PlatformCommandNewSession {
+		if a.commandHandler == nil {
+			err = errors.New("new session command handler is not configured")
+		} else {
+			err = a.commandHandler.HandleNewSession(eventCtx, channels.NewSessionRequest{
+				RequestID: requestID,
+				Input:     input,
+			})
+		}
+		if err != nil {
+			failureRequest := gateway.AdmissionRequest{
+				RequestID: requestID, IdempotencyKey: envelope.ExternalMessageID,
+				Identity: identity, ChannelInput: &input,
+				Message: gateway.Message{Text: input.Text, ArtifactRefs: append([]string(nil), input.ArtifactRefs...)},
+			}
+			err = errors.Join(err, a.admissionGateway.RecordChannelFailure(eventCtx, failureRequest))
+			platformtelemetry.MarkError(span, "command", err)
+		}
+		if a.metrics != nil {
+			a.metrics.RecordIMCallback(eventCtx, platformmetrics.Labels{Channel: string(channels.ChannelWeCom)}, errorType(err))
+		}
+		return err
 	}
 	if len(envelope.Media) > 0 {
 		pinnedIngestor, ok := a.attachmentIngestor.(channels.PinnedAttachmentIngestor)
@@ -579,6 +620,45 @@ func (a *Adapter) HandleMessage(
 		a.metrics.RecordIMCallback(eventCtx, platformmetrics.Labels{Channel: string(channels.ChannelWeCom)}, errorType(err))
 	}
 	return err
+}
+
+// ResolveOutboundSender returns the live binding-scoped WebSocket sender.
+// WeCom permits only one active long connection per BotID, so Reply Outbox
+// must use this sender instead of constructing a second client.
+func (a *Adapter) ResolveOutboundSender(
+	ctx context.Context,
+	binding channels.BindingSnapshot,
+) (MessageSender, error) {
+	if a == nil {
+		return nil, &ProviderSendError{Retryable: true, cause: errors.New("wecom adapter is nil")}
+	}
+	if ctx == nil {
+		return nil, &ProviderSendError{Retryable: true, cause: errors.New("context is required")}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := binding.Validate(); err != nil {
+		return nil, fmt.Errorf("wecom binding: %w", err)
+	}
+	key := bindingKey(binding)
+	a.runsMu.Lock()
+	run := a.runs[key]
+	a.runsMu.Unlock()
+	if run == nil {
+		return nil, &ProviderSendError{Retryable: true, cause: errors.New("wecom binding connection is not running")}
+	}
+	run.clientMu.Lock()
+	handle := run.client
+	run.clientMu.Unlock()
+	if handle == nil || handle.client == nil {
+		return nil, &ProviderSendError{Retryable: true, cause: errors.New("wecom binding connection is not ready")}
+	}
+	sender, ok := handle.client.(MessageSender)
+	if !ok {
+		return nil, &ProviderSendError{Retryable: true, cause: errors.New("wecom binding client cannot send messages")}
+	}
+	return sender, nil
 }
 
 func (a *Adapter) ensureCurrentBinding(ctx context.Context, snapshot channels.BindingSnapshot) error {
@@ -619,7 +699,10 @@ func (a *Adapter) channelInput(ctx context.Context, envelope VerifiedProviderEnv
 	if err != nil {
 		return channels.ChannelInput{}, err
 	}
-	return input, nil
+	return channels.WithMessageReplyTarget(input, channels.MessageReplyTarget{
+		ProviderTarget: envelope.replyTarget,
+		ExpiresAt:      a.now().UTC().Add(wecomMessageTargetTTL),
+	})
 }
 
 // Close gracefully stops every live binding client.

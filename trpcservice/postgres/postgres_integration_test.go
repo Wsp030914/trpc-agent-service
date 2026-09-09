@@ -84,6 +84,7 @@ func TestPostgresMigrationFromEmptySchema(t *testing.T) {
 		"knowledge_chunk",
 		"channel_identity",
 		"channel_conversation",
+		"conversation_session",
 		"channel_inbox",
 		"channel_recall_inbox",
 		"reply_outbox",

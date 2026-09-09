@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -103,6 +104,11 @@ func (j *ExecutionEventJournal) HandleRunnerEvent(
 	if err != nil {
 		return fmt.Errorf("marshal execution event: %w", err)
 	}
+	eventID := evt.ID
+	if eventID == "" {
+		digest := sha256.Sum256(payload)
+		eventID = fmt.Sprintf("payload:%x", digest)
+	}
 
 	tx, err := j.store.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -142,6 +148,22 @@ FOR UPDATE`,
 		}
 		return fmt.Errorf("lock execution for event append: %w", err)
 	}
+	var existingSequence int64
+	err = tx.QueryRow(ctx, `
+SELECT event_seq
+FROM platform.execution_event
+WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND event_id = $4`,
+		exec.Tenant.TenantID, exec.Tenant.AppID, exec.RequestID, eventID,
+	).Scan(&existingSequence)
+	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit duplicate execution event: %w", err)
+		}
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("check duplicate execution event: %w", err)
+	}
 	var sequence int64
 	if err := tx.QueryRow(
 		ctx,
@@ -157,12 +179,13 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3`,
 	if _, err := tx.Exec(
 		ctx,
 		`INSERT INTO platform.execution_event (
-    tenant_id, app_id, request_id, event_seq, event_type, payload
-) VALUES ($1, $2, $3, $4, $5, $6)`,
+    tenant_id, app_id, request_id, event_seq, event_id, event_type, payload
+) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		exec.Tenant.TenantID,
 		exec.Tenant.AppID,
 		exec.RequestID,
 		sequence,
+		eventID,
 		executionEventType(evt),
 		payload,
 	); err != nil {

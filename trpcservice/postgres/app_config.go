@@ -293,10 +293,11 @@ WHERE tenant_id = $1
 }
 
 type modelConfigDocument struct {
-	Provider   string            `json:"provider"`
-	Model      string            `json:"model"`
-	APIKeyRef  secretRefDocument `json:"api_key_ref,omitempty"`
-	Parameters map[string]string `json:"parameters,omitempty"`
+	Provider               string                             `json:"provider"`
+	Model                  string                             `json:"model"`
+	APIKeyRef              secretRefDocument                  `json:"api_key_ref,omitempty"`
+	Parameters             map[string]string                  `json:"parameters,omitempty"`
+	AttachmentCapabilities tenant.ModelAttachmentCapabilities `json:"attachment_capabilities,omitempty"`
 }
 
 type toolPolicyDocument struct {
@@ -347,10 +348,11 @@ func marshalAppConfig(cfg tenant.AppConfig) (
 	error,
 ) {
 	modelConfig, err := json.Marshal(modelConfigDocument{
-		Provider:   cfg.Model.Provider,
-		Model:      cfg.Model.Model,
-		APIKeyRef:  newSecretRefDocument(cfg.Model.APIKeyRef),
-		Parameters: cfg.Model.Parameters,
+		Provider:               cfg.Model.Provider,
+		Model:                  cfg.Model.Model,
+		APIKeyRef:              newSecretRefDocument(cfg.Model.APIKeyRef),
+		Parameters:             cfg.Model.Parameters,
+		AttachmentCapabilities: cfg.Model.AttachmentCapabilities,
 	})
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("marshal model config: %w", err)
@@ -450,10 +452,11 @@ func unmarshalAppConfig(
 		AppID:    appID,
 		Version:  version,
 		Model: tenant.ModelConfig{
-			Provider:   modelDocument.Provider,
-			Model:      modelDocument.Model,
-			APIKeyRef:  modelDocument.APIKeyRef.value(),
-			Parameters: modelDocument.Parameters,
+			Provider:               modelDocument.Provider,
+			Model:                  modelDocument.Model,
+			APIKeyRef:              modelDocument.APIKeyRef.value(),
+			Parameters:             modelDocument.Parameters,
+			AttachmentCapabilities: modelDocument.AttachmentCapabilities,
 		},
 		Tools: tenant.ToolPolicy{
 			VisibleTools:        toolDocument.VisibleTools,

@@ -128,7 +128,11 @@ RETURNING lease_until, attempt`, stored.tenantID, stored.appID, stored.requestID
 	if err != nil {
 		return queue.Claim{}, false, err
 	}
-	claim := queue.Claim{Job: job, TurnSeq: stored.turnSeq, Attempt: stored.attempt, Lease: queue.Lease{Owner: request.Owner, Token: token, Until: leaseUntil.UTC()}}
+	claim := queue.Claim{
+		Job: job, TurnSeq: stored.turnSeq, Attempt: stored.attempt,
+		FinalAttempt: stored.attempt >= maxExecutionAttempts,
+		Lease:        queue.Lease{Owner: request.Owner, Token: token, Until: leaseUntil.UTC()},
+	}
 	if err := claim.Validate(); err != nil {
 		return queue.Claim{}, false, err
 	}

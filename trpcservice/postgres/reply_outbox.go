@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,10 +21,16 @@ var (
 	// ErrReplyTargetExpired means a message-scoped provider target cannot be
 	// replaced with a stable user or conversation target.
 	ErrReplyTargetExpired = errors.New("reply target is expired")
+	errReplyStreamClosed  = errors.New("reply stream is already closed")
 )
 
 type storedReplyPayload struct {
-	Text string `json:"text"`
+	Kind           channels.ReplyKind   `json:"kind,omitempty"`
+	StreamID       string               `json:"stream_id,omitempty"`
+	StreamPhase    channels.StreamPhase `json:"stream_phase,omitempty"`
+	StreamSequence int64                `json:"stream_sequence,omitempty"`
+	Text           string               `json:"text,omitempty"`
+	Card           *channels.ReplyCard  `json:"card,omitempty"`
 }
 
 type storedReplyTarget struct {
@@ -37,15 +44,48 @@ func insertReplyOutboxTx(
 	tenantID, appID, bindingID, requestID string,
 	replies []channels.Reply,
 ) error {
+	return insertReplyOutboxTxWithSourceKind(
+		ctx, tx, tenantID, appID, bindingID, requestID, "execution", replies,
+	)
+}
+
+func insertReplyOutboxTxWithSourceKind(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, appID, bindingID, requestID, sourceKind string,
+	replies []channels.Reply,
+) error {
+	if sourceKind != "execution" && sourceKind != "channel_command" && sourceKind != "channel_failure" {
+		return errors.New("reply projection source kind is invalid")
+	}
 	for _, reply := range replies {
 		if reply.TenantID != tenantID || reply.AppID != appID || reply.BindingID != bindingID || reply.RequestID != requestID {
 			return errors.New("reply projection scope does not match state")
+		}
+		if err := normalizeStreamReplyTx(ctx, tx, &reply); errors.Is(err, errReplyStreamClosed) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("normalize reply stream: %w", err)
+		}
+		pendingReplyID, pendingPhase, err := pendingLifecycleReplyTx(ctx, tx, reply)
+		if err != nil {
+			return fmt.Errorf("find pending rich reply: %w", err)
+		}
+		if pendingReplyID != "" && pendingPhase == channels.StreamPhaseStart && reply.StreamPhase == channels.StreamPhaseUpdate {
+			reply.StreamPhase = channels.StreamPhaseStart
 		}
 		reply.ReplyID = reply.StableID()
 		if err := reply.Validate(); err != nil {
 			return fmt.Errorf("projected reply: %w", err)
 		}
-		payload, err := json.Marshal(storedReplyPayload{Text: reply.Text})
+		payload, err := json.Marshal(storedReplyPayload{
+			Kind:           reply.ReplyKind(),
+			StreamID:       reply.StreamID,
+			StreamPhase:    reply.StreamPhase,
+			StreamSequence: reply.StreamSequence,
+			Text:           reply.Text,
+			Card:           reply.Card,
+		})
 		if err != nil {
 			return fmt.Errorf("marshal reply payload: %w", err)
 		}
@@ -56,13 +96,43 @@ func insertReplyOutboxTx(
 		if err != nil {
 			return fmt.Errorf("marshal reply target: %w", err)
 		}
+		if pendingReplyID != "" {
+			// Keep every stream sequence as a durable identity. Coalescing by
+			// rewriting the old row would make a later duplicate of that old
+			// sequence insertable. SUPERSEDED rows retain the unique key while
+			// remaining invisible to the sender and ordering barrier.
+			if _, err := tx.Exec(ctx, `
+UPDATE platform.reply_outbox
+SET status = 'SUPERSEDED', lease_owner = NULL, lease_until = NULL,
+    last_error_type = 'stream_coalesced',
+    last_error = 'superseded by a newer pending stream snapshot',
+    updated_at = clock_timestamp()
+WHERE tenant_id = $1
+  AND app_id = $2
+  AND binding_id = $3
+  AND request_id = $4
+  AND reply_kind = $5
+  AND stream_id = $6
+  AND stream_sequence < $7
+  AND status = 'PENDING'`,
+				reply.TenantID,
+				reply.AppID,
+				reply.BindingID,
+				reply.RequestID,
+				reply.ReplyKind(),
+				reply.StreamID,
+				reply.StreamSequence,
+			); err != nil {
+				return fmt.Errorf("coalesce reply outbox: %w", err)
+			}
+		}
 		if _, err := tx.Exec(ctx, `
 INSERT INTO platform.reply_outbox (
     reply_id, tenant_id, app_id, binding_id, binding_revision, channel, request_id,
-    source_event_id, revision, target_ref, payload
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-ON CONFLICT (tenant_id, app_id, binding_id, request_id, source_event_id, revision)
-DO NOTHING`,
+    source_event_id, revision, reply_kind, stream_id, stream_phase, stream_sequence,
+    target_ref, payload, source_kind
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+ON CONFLICT DO NOTHING`,
 			reply.ReplyID,
 			reply.TenantID,
 			reply.AppID,
@@ -72,13 +142,158 @@ DO NOTHING`,
 			reply.RequestID,
 			reply.SourceEventID,
 			reply.Revision,
+			reply.ReplyKind(),
+			reply.StreamID,
+			reply.StreamPhase,
+			reply.StreamSequence,
 			target,
 			payload,
+			sourceKind,
 		); err != nil {
 			return fmt.Errorf("insert reply outbox: %w", err)
 		}
 	}
 	return nil
+}
+
+func pendingLifecycleReplyTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	reply channels.Reply,
+) (string, channels.StreamPhase, error) {
+	if !isLifecycleReply(reply) {
+		return "", "", nil
+	}
+	var replyID string
+	var phase channels.StreamPhase
+	err := tx.QueryRow(ctx, `
+SELECT reply_id, stream_phase
+FROM platform.reply_outbox
+WHERE tenant_id = $1
+  AND app_id = $2
+  AND binding_id = $3
+  AND request_id = $4
+  AND reply_kind = $5
+  AND stream_id = $6
+  AND stream_sequence < $7
+  AND status = 'PENDING'
+ORDER BY stream_sequence DESC, created_at DESC
+LIMIT 1
+FOR UPDATE`,
+		reply.TenantID,
+		reply.AppID,
+		reply.BindingID,
+		reply.RequestID,
+		reply.ReplyKind(),
+		reply.StreamID,
+		reply.StreamSequence,
+	).Scan(&replyID, &phase)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return replyID, phase, nil
+}
+
+// normalizeStreamReplyTx turns partial model deltas into durable full
+// snapshots. The previous snapshot is read in the same transaction as the
+// execution event and outbox insert, so a crash cannot expose an unpersisted
+// stream frame to the sender.
+func normalizeStreamReplyTx(ctx context.Context, tx pgx.Tx, reply *channels.Reply) error {
+	if reply == nil || !isLifecycleReply(*reply) {
+		return nil
+	}
+	var closed int
+	err := tx.QueryRow(ctx, `
+SELECT 1
+FROM platform.reply_outbox
+WHERE tenant_id = $1
+  AND app_id = $2
+  AND binding_id = $3
+  AND request_id = $4
+  AND reply_kind = $5
+  AND stream_id = $6
+  AND stream_phase IN ('end', 'abort')
+LIMIT 1`,
+		reply.TenantID,
+		reply.AppID,
+		reply.BindingID,
+		reply.RequestID,
+		reply.ReplyKind(),
+		reply.StreamID,
+	).Scan(&closed)
+	if err == nil {
+		return errReplyStreamClosed
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	var previousText string
+	err = tx.QueryRow(ctx, `
+SELECT COALESCE(payload->>'text', payload->'card'->>'body', '')
+FROM platform.reply_outbox
+WHERE tenant_id = $1
+  AND app_id = $2
+  AND binding_id = $3
+  AND request_id = $4
+  AND reply_kind = $5
+  AND stream_id = $6
+  AND stream_sequence < $7
+ORDER BY stream_sequence DESC, created_at DESC
+LIMIT 1`,
+		reply.TenantID,
+		reply.AppID,
+		reply.BindingID,
+		reply.RequestID,
+		reply.ReplyKind(),
+		reply.StreamID,
+		reply.StreamSequence,
+	).Scan(&previousText)
+	hasPrevious := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	currentText := reply.Text
+	if reply.ReplyKind() == channels.ReplyKindCard && reply.Card != nil {
+		currentText = reply.Card.Body
+	}
+	if reply.StreamPhase == channels.StreamPhaseEnd && currentText == "" {
+		currentText = previousText
+		if currentText == "" {
+			currentText = "执行完成"
+		}
+	} else if reply.StreamPhase != channels.StreamPhaseEnd {
+		currentText = appendStreamSnapshot(previousText, currentText)
+	}
+	if reply.ReplyKind() == channels.ReplyKindCard && reply.Card != nil {
+		reply.Card.Body = currentText
+	} else {
+		reply.Text = currentText
+	}
+	if hasPrevious {
+		if reply.StreamPhase == channels.StreamPhaseStart {
+			reply.StreamPhase = channels.StreamPhaseUpdate
+		}
+	} else if reply.StreamPhase == channels.StreamPhaseUpdate {
+		reply.StreamPhase = channels.StreamPhaseStart
+	}
+	return nil
+}
+
+func isLifecycleReply(reply channels.Reply) bool {
+	return (reply.ReplyKind() == channels.ReplyKindStream || reply.ReplyKind() == channels.ReplyKindCard) && reply.StreamID != ""
+}
+
+func appendStreamSnapshot(previous, current string) string {
+	if current == "" {
+		return previous
+	}
+	if previous != "" && strings.HasPrefix(current, previous) {
+		return current
+	}
+	return previous + current
 }
 
 // ClaimReplies leases ready replies in event order within one request.
@@ -155,7 +370,15 @@ WITH candidates AS (
           AND p.binding_id = o.binding_id
           AND p.request_id = o.request_id
           AND p.revision < o.revision
-          AND p.status IN ('PENDING', 'SENDING', 'UNCERTAIN')
+          AND (
+              p.status IN ('PENDING', 'SENDING', 'UNCERTAIN')
+              OR (
+                  o.reply_kind IN ('stream', 'card')
+                  AND p.reply_kind = o.reply_kind
+                  AND p.stream_id = o.stream_id
+                  AND p.status = 'PERMANENTLY_FAILED'
+              )
+          )
     )
     ORDER BY o.created_at, o.reply_id
     FOR UPDATE SKIP LOCKED
@@ -170,14 +393,30 @@ FROM candidates c
 WHERE o.reply_id = c.reply_id
 RETURNING o.reply_id, o.tenant_id, o.app_id, o.binding_id,
           o.binding_revision, o.channel, o.request_id, o.source_event_id,
-          o.revision, o.target_ref, o.payload, o.attempt,
-          o.lease_owner, o.lease_until, o.provider_message_id,
-          (SELECT e.trace_id FROM platform.execution e
-           WHERE e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.request_id = o.request_id),
-          (SELECT e.trace_parent FROM platform.execution e
-           WHERE e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.request_id = o.request_id),
-          (SELECT e.trace_state FROM platform.execution e
-           WHERE e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.request_id = o.request_id)`,
+          o.revision, o.reply_kind, o.stream_id, o.stream_phase,
+          o.stream_sequence, o.target_ref, o.payload, o.attempt,
+          o.lease_owner, o.lease_until,
+          CASE WHEN o.reply_kind IN ('stream', 'card') AND o.stream_id <> '' THEN
+              COALESCE((SELECT p.provider_message_id
+                        FROM platform.reply_outbox p
+                        WHERE p.tenant_id = o.tenant_id
+                          AND p.app_id = o.app_id
+                          AND p.binding_id = o.binding_id
+                          AND p.request_id = o.request_id
+                          AND p.reply_kind = o.reply_kind
+                          AND p.stream_id = o.stream_id
+                          AND p.stream_sequence < o.stream_sequence
+                          AND p.status = 'SENT'
+                          AND p.provider_message_id <> ''
+                        ORDER BY p.stream_sequence DESC
+                        LIMIT 1), o.provider_message_id)
+            ELSE o.provider_message_id END,
+          COALESCE((SELECT e.trace_id FROM platform.execution e
+           WHERE e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.request_id = o.request_id), ''),
+          COALESCE((SELECT e.trace_parent FROM platform.execution e
+           WHERE e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.request_id = o.request_id), ''),
+          COALESCE((SELECT e.trace_state FROM platform.execution e
+           WHERE e.tenant_id = o.tenant_id AND e.app_id = o.app_id AND e.request_id = o.request_id), '')`,
 		owner, intervalLiteral(leaseDuration), limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim reply outbox: %w", err)
@@ -204,15 +443,17 @@ type replyRowScanner interface {
 func scanReplyDelivery(row replyRowScanner) (worker.ReplyDelivery, error) {
 	var (
 		replyID, tenantID, appID, bindingID, channel, requestID string
-		sourceEventID, leaseOwner, providerMessageID            string
+		sourceEventID, replyKind, streamID, streamPhase         string
+		leaseOwner, providerMessageID                           string
 		traceID, traceParent, traceState                        string
-		bindingRevision, revision, attempt                      int64
+		bindingRevision, revision, streamSequence, attempt      int64
 		targetJSON, payloadJSON                                 []byte
 		leaseUntil                                              time.Time
 	)
 	if err := row.Scan(
 		&replyID, &tenantID, &appID, &bindingID, &bindingRevision, &channel, &requestID,
-		&sourceEventID, &revision, &targetJSON, &payloadJSON, &attempt, &leaseOwner, &leaseUntil,
+		&sourceEventID, &revision, &replyKind, &streamID, &streamPhase, &streamSequence,
+		&targetJSON, &payloadJSON, &attempt, &leaseOwner, &leaseUntil,
 		&providerMessageID, &traceID, &traceParent, &traceState,
 	); err != nil {
 		return worker.ReplyDelivery{}, fmt.Errorf("scan reply outbox: %w", err)
@@ -239,7 +480,12 @@ func scanReplyDelivery(row replyRowScanner) (worker.ReplyDelivery, error) {
 			Kind:             target.Kind,
 			InternalEntityID: target.InternalEntityID,
 		},
-		Text: payload.Text,
+		Text:           payload.Text,
+		Kind:           channels.ReplyKind(replyKind),
+		StreamID:       streamID,
+		StreamPhase:    channels.StreamPhase(streamPhase),
+		StreamSequence: streamSequence,
+		Card:           payload.Card,
 	}
 	return worker.ReplyDelivery{
 		Reply:             reply,

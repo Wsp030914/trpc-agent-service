@@ -139,7 +139,7 @@
 
 ## 快速开始
 
-以下脚本使用 Docker Compose 启动 disposable 的最小 Golden Path 环境，并在容器内构建和运行现有 `cmd/deployment-e2e`：PostgreSQL、Redis、Qdrant、HTTP Gateway 和两个 deterministic E2E Worker。不需要本机安装 Go，也不需要真实 OpenAI、企业微信或飞书凭据。脚本会使用仓库内仅用于本地验收的 `.env.example`，并在结束时清理本次 Compose 项目及卷。
+以下脚本使用 Docker Compose 启动 disposable 的最小 Golden Path 环境，并在容器内构建和运行现有 `cmd/deployment-e2e`：PostgreSQL、Redis、Qdrant、HTTP Gateway 和两个 deterministic E2E Worker。不需要本机安装 Go，也不需要真实 OpenAI、企业微信或飞书凭据。该 Quick Start 不启用真实 IM binding，因此也不需要 `im-provider-target-key@v1` 和 `im-external-id-hmac-key@v1`；真实 IM 的内部密钥配置见 [`docs/deployment.md`](docs/deployment.md)。脚本会使用仓库内仅用于本地验收的 `.env.example`，并在结束时清理本次 Compose 项目及卷。
 
 ```bash
 git clone https://github.com/liuzengh/trpc-agent-service.git

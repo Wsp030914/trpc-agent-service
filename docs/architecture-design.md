@@ -22,6 +22,8 @@
 - API key、模型 key、数据库 DSN、IM secret 均通过 scoped `SecretProvider` 解析。平台数据库保存引用、digest 或加密 envelope，不保存原始凭据。日志、audit 和 trace 不包含 prompt、tool arguments、provider body；错误和 audit metadata 还会做 PII/credential redaction。
 - 审计查询由 Admin principal 的 role 和 tenant allowlist 决定；Operator/Auditor 不能靠请求参数扩大作用域。Control Plane 与 data-plane bearer token 分离。
 
+真实 IM 还需要两项独立的平台内部 key：`im-provider-target-key@v1` 用 AES-256-GCM 保护持久化 Provider target，`im-external-id-hmac-key@v1` 对外部 user/chat/thread ID 做稳定 HMAC。两者按 `(tenant_id, app_id)` 通过 scoped `SecretProvider` 注入；每个值都是 32 字节随机数据的无 padding Base64URL 编码，并且必须跨节点、重启和滚动发布保持稳定。它们不是 WeCom/Feishu 的 Bot/App Secret。
+
 这套机制定义了代码级租户隔离契约；真实生产集群、SecretProvider 和跨组织权限审计属于部署环境边界，不由仓库内测试单独证明。
 
 ## 3. Gateway / Worker 节点化架构
@@ -39,7 +41,9 @@ HTTP Admission 是无状态路径；Channel Adapter 进程按 active binding 建
 
 ## 4. 消息路由与 Sticky Session
 
-HTTP 请求的 session 由认证 service principal + `X-Session-ID` 组成，Channel direct 消息由稳定映射的 user ID + `default` Session ID 组成；group/topic 消息由 binding-scoped conversation 生成稳定 `conversation_id`/`session_principal_id` + `default` Session ID 组成。跨 tenant、app 或 binding 的同名外部 ID 不会复用内部主体。
+HTTP 请求的 session 由认证 service principal + `X-Session-ID` 组成。Channel direct 消息由稳定映射的 user ID 作为 principal，group/topic 消息由 binding-scoped conversation 生成稳定 `conversation_id`/`session_principal_id`；两者再通过 `conversation_session` 读取当前 active Session ID，首次使用默认为 `default`。跨 tenant、app 或 binding 的同名外部 ID 不会复用内部主体。
+
+WeCom/Feishu 中内容经 trim 后精确等于 `/new` 的文本消息是平台命令，不进入 Gateway execution admission，也不交给模型。PostgreSQL 命令事务在 `(tenant_id, app_id, binding_id, session_principal_id)` 作用域内锁定或创建 `conversation_session` 指针，生成新的 Session ID，写入幂等 `channel_inbox`，并以 `source_kind=channel_command` 写成功 Reply Outbox；切换和回复要么共同提交，要么共同回滚。旧 Session 内容不删除，后续普通消息只使用新指针。
 
 Gateway 在一个 PostgreSQL 事务中锁定必要的 app/binding 行，校验 active/canary config 和迁移 gate，给 Session lane 分配 `turn_seq`，插入 execution、入站 artifact 关联和 dispatch outbox。`session_lane` 的 unique `(tenant, app, session_principal, session_id, turn_seq)` 是顺序的持久证据。Worker 使用 `Scope.Key("session", principal, session)` 取得 Redis Session Lease 并持有 Session Lock；同一 partition 在任意节点同一时刻只有一个 Runner 能执行。
 
@@ -49,7 +53,7 @@ Gateway 在一个 PostgreSQL 事务中锁定必要的 app/binding 行，校验 a
 
 配置采用发布后不可变、激活指针可变的模型。Admin 先写 `PUBLISHED` 的 `app_config_version`，再通过 activate/rollback 改 `agent_app.active_config_version`。配置表有数据库不可变触发器；执行记录永久保存它实际 Admission 时的 `config_version`。因此激活只影响新 Admission，已经入队或运行的 execution 不会中途切换模型、工具或数据后端。
 
-Canary 选择一个已发布版本和 1–100 的比例，按稳定 tenant/app/session principal/session 维度计算 deterministic bucket。pause/disable 使新请求回到 stable；rollback 移除 canary；promote 把 canary 变成 stable。应用层 canary 与 K8s rolling update 是两个层次：前者控制租户请求使用的 immutable config，后者替换进程镜像。若只改变 Session/Knowledge Backend，不能直接激活；必须先完成支持范围内的数据迁移，成功事务同时切换 active config。失败保持 source active。
+Canary 选择一个已发布版本和 1–100 的比例，按稳定 tenant/app/session principal/session 维度计算 deterministic bucket。`/new` 在切换前使用当前 active Session ID 做相同选择，并用选中版本的 IM access policy 判权，避免普通消息进入 canary 而命令仍按 stable 判权。pause/disable 使新请求回到 stable；rollback 移除 canary；promote 把 canary 变成 stable。应用层 canary 与 K8s rolling update 是两个层次：前者控制租户请求使用的 immutable config，后者替换进程镜像。若只改变 Session/Knowledge Backend，不能直接激活；必须先完成支持范围内的数据迁移，成功事务同时切换 active config。失败保持 source active。
 
 ## 6. Session、Memory、Knowledge、Artifact
 
@@ -71,7 +75,9 @@ Admission 的线性化点是 PostgreSQL 事务提交：幂等记录、Session tu
 
 Adapter 规范化 text/image/file/mixed/card/event/unsupported，映射 direct/group/topic，建立 `channel_identity`/`channel_conversation`，然后携带 provider-neutral `ChannelInput` 进入 Gateway Admission。binding 的 tenant/app scope 和 revision 在连接前、入站消息和 Admission 事务中重复校验；external message ID 做去重；external user/chat/thread 通过 binding-scoped HMAC 映射到内部 identity/conversation，direct 使用 user principal，group/topic 使用 conversation principal，从而隔离 tenant/app/binding 及不同会话。
 
-外部 message ID 是 binding-scoped channel idempotency key；同一 ID 同一 payload 重放已有结果，不同 payload 冲突。媒体下载经过 HTTPS/public-IP/大小校验并写 COS，绑定在 pinned ConfigVersion 下。Agent durable event 在 Gateway 的 `QueuedRunner` 中投影为 OpenAI-compatible stream/non-stream；IM reply 则由 Channel 角色中的 `reply_outbox` 和 Reply Sender 异步发送。当前 WeCom/Feishu 的 IM 回复投影为文本；Agent event 到 IM 的完整卡片或流式卡片映射沿当前 Provider 适配边界处理。Feishu 支持 recall inbox；WeCom/Feishu 都有 provider-specific 长度、重连、限流和错误分类。
+外部 message ID 是 binding-scoped channel idempotency key；同一 ID 同一 payload 重放已有结果，不同 payload 冲突。媒体下载经过 HTTPS/public-IP/大小校验并写 COS，绑定在 pinned ConfigVersion 下。下载、解密、COS 上传、配置 pin 或 Admission 失败时，Gateway/Adapter 以同一 Inbox 幂等键写 `REJECTED` 和 `source_kind=channel_failure` 的失败 Reply Outbox；若 Admission 实际已提交，则已提交结果优先，不追加错误回复。`/new` 的映射、判权、切换、Outbox 或提交失败也沿该失败记录边界返回用户可见回复。
+
+Agent durable event 在 Gateway 的 `QueuedRunner` 中投影为 OpenAI-compatible stream/non-stream；IM reply 则由 Channel 角色中的 `reply_outbox` 和 Reply Sender 异步发送，持久化 text、stream、card 三类回复，并按 sequence 和上一次 Provider message ID 恢复流式更新。只有 `IsTerminalError()` 事件投影“执行失败”；携带 `Error` 的非终态事件不会提前失败或造成后续成功时重复回复。WeCom 使用 stream update/template card 协议，Feishu 使用同一消息更新和原生 interactive card；`TRPC_AGENT_SERVICE_IM_REPLY_MODE` 选择 `text`（默认）、`stream` 或 `card`。Feishu 支持 recall inbox；WeCom/Feishu 都有 provider-specific 长度、重连、限流和错误分类。
 
 当前通道组合选择 WeCom Bot WebSocket 与 Feishu/Lark WebSocket。绑定、Secret、协议校验、消息去重、身份映射、媒体 staging 和异步文本回复均沿这两条官方长连接路径实现；`public_route_id` 仅作为历史绑定字段，不参与当前通道入口。
 
@@ -93,7 +99,7 @@ Audit 是 metadata-only 的 PostgreSQL sink，包含 README 要求的 tenant/cha
 
 ## 12. 故障恢复
 
-Worker crash 后，Redis pending delivery 可被 XAUTOCLAIM；PostgreSQL execution lease 过期后可被另一 Worker claim。run token 和 execution fence 防止旧 Worker 在 lease 丢失后写终态、事件、Session 或工具权限。Redis session lease 丢失会取消 context；若 Runner 尚未启动可重试，已启动则按可能副作用处理为 uncertain。模型超时和明确的基础设施失败是 bounded retry；Side-effect unknown 不自动重试。
+Worker crash 后，Redis pending delivery 可被 XAUTOCLAIM；PostgreSQL execution lease 过期后可被另一 Worker claim。run token 和 execution fence 防止旧 Worker 在 lease 丢失后写终态、事件、Session 或工具权限。Redis session lease 丢失会取消 context；若 Runner 尚未启动可重试，已启动则按可能副作用处理为 uncertain。模型超时和明确的基础设施失败是 bounded retry；Side-effect unknown 不自动重试。若 COS、模型、Session 或 Knowledge 等依赖导致 Runner 在 `RunnerStarted` 前构建失败，非最终 attempt 保持可重试；最终 attempt（或永久错误）先持久化 terminal error event 和 `FAILED`，再结束消费，使 IM Reply Outbox 能产生一次失败回复。
 
 Reply Sender 独立于 Runner，且归 Channel 角色所有：reply outbox 可以在 Agent 已成功后继续投递。已知 retryable Provider error 按 bounded delay 重试；transport/取消/receipt 缺失/lease 丢失会将 reply 标为 `UNCERTAIN`，避免不知道 Provider 是否已经发送时重复发消息。IM recall 通过 inbox 去重并取消尚未完成的 execution。
 

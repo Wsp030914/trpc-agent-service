@@ -25,6 +25,7 @@ func newReplyRuntime(
 	store *postgres.Store,
 	redisClient *platformredis.Client,
 	owner string,
+	wecomResolver channeloutbound.WeComMessageSenderResolver,
 	getenv func(string) string,
 	metrics *platformmetrics.Recorder,
 ) (*replyRuntime, error) {
@@ -40,7 +41,7 @@ func newReplyRuntime(
 	if err != nil {
 		return nil, err
 	}
-	providers, err := channeloutbound.NewResolver(store, secrets, limiter)
+	providers, err := channeloutbound.NewResolver(store, secrets, limiter, wecomResolver)
 	if err != nil {
 		return nil, err
 	}

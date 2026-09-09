@@ -292,6 +292,7 @@ func (c *WebSocketClient) runConnection(ctx context.Context, conn *websocket.Con
 		if err := json.Unmarshal(frame.Body, &message); err != nil {
 			return fmt.Errorf("decode wecom message frame: %w", err)
 		}
+		message.ResponseRequestID = frame.Headers.ReqID
 		if frame.Cmd == "aibot_event_callback" && message.MessageType == "" {
 			message.MessageType = "event"
 		}
@@ -387,30 +388,109 @@ func (c *WebSocketClient) SendMessage(ctx context.Context, chatID, text string) 
 	if chatID == "" || text == "" {
 		return "", errors.New("wecom chat id and message text are required")
 	}
+	requestID := uuid.NewString()
+	err := c.startInBackground()
+	if err != nil {
+		return "", err
+	}
+	err = c.waitForAuthentication(ctx)
+	if err != nil {
+		return "", err
+	}
+	return c.sendRequest(ctx, "aibot_send_msg", requestID, map[string]any{
+		"chatid":   chatID,
+		"msgtype":  "markdown",
+		"markdown": map[string]string{"content": text},
+	})
+}
+
+// SendStream sends one WeCom stream frame. The first frame uses
+// aibot_respond_msg; later frames use aibot_respond_update_msg and keep the
+// original callback request ID so the provider can associate the response
+// with the inbound message.
+func (c *WebSocketClient) SendStream(
+	ctx context.Context,
+	destination, callbackRequestID, streamID, content string,
+	finish, update bool,
+) (string, error) {
+	if c == nil {
+		return "", errors.New("wecom websocket client is nil")
+	}
+	if ctx == nil {
+		return "", errors.New("context is required")
+	}
+	if destination == "" || callbackRequestID == "" || streamID == "" || content == "" {
+		return "", errors.New("wecom stream target, stream id, and content are required")
+	}
 	if err := c.startInBackground(); err != nil {
 		return "", err
 	}
+	if err := c.waitForAuthentication(ctx); err != nil {
+		return "", err
+	}
+	command := "aibot_respond_msg"
+	if update {
+		command = "aibot_respond_update_msg"
+	}
+	return c.sendRequest(ctx, command, callbackRequestID, map[string]any{
+		"msgtype": "stream",
+		"stream": map[string]any{
+			"id":      streamID,
+			"content": content,
+			"finish":  finish,
+		},
+	})
+}
+
+// SendCard sends a provider-native WeCom template card using the delayed
+// outbound command. Card updates are represented by a new durable card
+// operation when a provider does not expose an update primitive.
+func (c *WebSocketClient) SendCard(ctx context.Context, destination string, card map[string]any) (string, error) {
+	if c == nil {
+		return "", errors.New("wecom websocket client is nil")
+	}
+	if ctx == nil {
+		return "", errors.New("context is required")
+	}
+	if destination == "" || card == nil {
+		return "", errors.New("wecom card destination and payload are required")
+	}
+	if err := c.startInBackground(); err != nil {
+		return "", err
+	}
+	requestID := uuid.NewString()
+	if err := c.waitForAuthentication(ctx); err != nil {
+		return "", err
+	}
+	return c.sendRequest(ctx, "aibot_send_msg", requestID, map[string]any{
+		"chatid":        destination,
+		"msgtype":       "template_card",
+		"template_card": card,
+	})
+}
+
+func (c *WebSocketClient) waitForAuthentication(ctx context.Context) error {
 	for {
 		if c.isAuthenticated() {
-			break
+			return nil
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return "", ctx.Err()
+			return ctx.Err()
 		case <-timer.C:
 		}
 	}
-	requestID := uuid.NewString()
+}
+
+func (c *WebSocketClient) sendRequest(ctx context.Context, command, requestID string, body any) (string, error) {
+	if requestID == "" {
+		return "", errors.New("wecom request id is required")
+	}
 	resultCh := make(chan requestResult, 1)
 	c.addPending(requestID, resultCh)
-	err := c.writeCurrentFrame("aibot_send_msg", requestID, map[string]any{
-		"chatid":   chatID,
-		"msgtype":  "markdown",
-		"markdown": map[string]string{"content": text},
-	})
-	if err != nil {
+	if err := c.writeCurrentFrame(command, requestID, body); err != nil {
 		c.removePending(requestID)
 		return "", err
 	}

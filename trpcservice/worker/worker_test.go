@@ -178,6 +178,37 @@ func TestWorkerMarksTerminalEventForAtomicProjection(t *testing.T) {
 	}
 }
 
+func TestWorkerPersistsRunnerBuildFailureOnlyOnFinalAttempt(t *testing.T) {
+	wantErr := errors.New("resolve model failed")
+	w := testWorker(t, sharedBackendConfig())
+	w.Runner = func(context.Context, worker.Execution) (frameworkrunner.Runner, error) {
+		return nil, wantErr
+	}
+	var projected []worker.Execution
+	var events []*event.Event
+	w.Events = eventSinkFunc(func(_ context.Context, exec worker.Execution, evt *event.Event) error {
+		projected = append(projected, exec)
+		events = append(events, evt)
+		return nil
+	})
+	job := testJob("request-build-failure", "tenant-a", "session-1")
+	if _, err := w.Run(worker.ContextWithFinalAttempt(context.Background(), false), job); !errors.Is(err, wantErr) {
+		t.Fatalf("retryable build error = %v, want %v", err, wantErr)
+	}
+	if len(events) != 0 {
+		t.Fatalf("non-final build failure persisted %d events", len(events))
+	}
+	if _, err := w.Run(worker.ContextWithFinalAttempt(context.Background(), true), job); !errors.Is(err, wantErr) {
+		t.Fatalf("final build error = %v, want %v", err, wantErr)
+	}
+	if len(events) != 1 || !events[0].IsTerminalError() {
+		t.Fatalf("final build failure events = %#v", events)
+	}
+	if projected[0].TerminalStatus != queue.CompletionFailed {
+		t.Fatalf("final build status = %q, want FAILED", projected[0].TerminalStatus)
+	}
+}
+
 func TestWorkerCleanupErrorsDoNotChangeBusinessResult(t *testing.T) {
 	closeErr := errors.New("runner close failed")
 	runner := &recordingRunner{

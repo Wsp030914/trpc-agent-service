@@ -486,6 +486,62 @@ func TestChannelAdmissionRollsBackInboxAndMappingOnFailure(t *testing.T) {
 	}
 }
 
+func TestRecordChannelFailurePersistsOneVisibleReply(t *testing.T) {
+	p := newIM05Fixture(t, newIntegrationTargetProtector(t, "v1"))
+	request := newIM05Request(t, p.route, p.binding, "message-failed", "request-failed", channels.MessageTypeImage, "")
+	input, err := channels.WithMessageReplyTarget(*request.ChannelInput, channels.MessageReplyTarget{
+		ProviderTarget: "provider-message-failed",
+		ExpiresAt:      time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("attach failure reply target: %v", err)
+	}
+	request.ChannelInput = &input
+
+	if err := p.store.RecordChannelFailure(p.ctx, request); err != nil {
+		t.Fatalf("record channel failure: %v", err)
+	}
+	if err := p.store.RecordChannelFailure(p.ctx, request); err != nil {
+		t.Fatalf("replay channel failure: %v", err)
+	}
+
+	var status, reason, replyText string
+	var targetEnvelope []byte
+	var replyCount int
+	if err := p.pool.QueryRow(p.ctx, `
+SELECT status, COALESCE(reject_reason, ''), provider_reply_target_envelope
+FROM platform.channel_inbox
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
+  AND external_message_id = $4`,
+		p.scope.TenantID, p.scope.AppID, p.binding.BindingID, request.IdempotencyKey,
+	).Scan(&status, &reason, &targetEnvelope); err != nil {
+		t.Fatalf("read failed channel inbox: %v", err)
+	}
+	if status != "REJECTED" || reason != "CHANNEL_PROCESSING_FAILED" || len(targetEnvelope) == 0 {
+		t.Fatalf("failed channel inbox = status:%q reason:%q target:%d", status, reason, len(targetEnvelope))
+	}
+	if err := p.pool.QueryRow(p.ctx, `
+SELECT count(*), min(payload->>'text')
+FROM platform.reply_outbox
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
+  AND request_id = $4 AND source_kind = 'channel_failure'`,
+		p.scope.TenantID, p.scope.AppID, p.binding.BindingID, request.RequestID,
+	).Scan(&replyCount, &replyText); err != nil {
+		t.Fatalf("read failed channel reply: %v", err)
+	}
+	if replyCount != 1 || replyText != channels.ChannelFailureReply {
+		t.Fatalf("failed channel replies = count:%d text:%q", replyCount, replyText)
+	}
+	if _, err := p.pool.Exec(p.ctx, `
+UPDATE platform.reply_outbox
+SET status = 'SENT', updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3 AND request_id = $4`,
+		p.scope.TenantID, p.scope.AppID, p.binding.BindingID, request.RequestID,
+	); err != nil {
+		t.Fatalf("retire failed channel reply fixture: %v", err)
+	}
+}
+
 type im05Fixture struct {
 	pool    *pgxpool.Pool
 	ctx     context.Context

@@ -56,6 +56,9 @@ type Execution struct {
 	// TerminalStatus is set only on the terminal event passed to a durable
 	// EventSink. The sink must persist it in the same transaction as that event.
 	TerminalStatus queue.CompletionStatus
+	// ApprovalPending marks a completion event that parks the execution for
+	// human review. It must not close an IM stream as a successful answer.
+	ApprovalPending bool
 }
 
 // SessionLock owns an acquired session partition lock. Context is canceled
@@ -324,6 +327,11 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	}()
 	r, err := w.Runner(workerCtx, exec)
 	if err != nil {
+		if FinalAttemptFromContext(ctx) || IsPermanentExecutionError(err) {
+			if persistErr := w.persistRunnerFailure(runCtx, exec, err); persistErr != nil {
+				return result, persistErr
+			}
+		}
 		return result, classifySessionLeaseFailure(runCtx, result.RunnerStarted, err)
 	}
 	if r == nil {
@@ -365,13 +373,21 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		agent.WithDisableTracing(true),
 	)
 	if err != nil {
+		if persistErr := w.persistRunnerFailure(runCtx, exec, err); persistErr != nil {
+			return result, persistErr
+		}
 		return result, classifySessionLeaseFailure(runCtx, result.RunnerStarted, err)
 	}
 	if events == nil {
-		return result, NewSideEffectUncertainError(errors.New("runner event channel is nil"))
+		runnerErr := errors.New("runner event channel is nil")
+		if persistErr := w.persistRunnerFailure(runCtx, exec, runnerErr); persistErr != nil {
+			return result, persistErr
+		}
+		return result, NewSideEffectUncertainError(runnerErr)
 	}
 	var sinkErr error
 	var runnerErr error
+	terminalEventPersisted := false
 	approvalBoundary := false
 	var drainTimer *time.Timer
 	var drainDone <-chan time.Time
@@ -429,6 +445,7 @@ drainLoop:
 		}
 		eventExec := exec
 		approvalPending, _ := approval.snapshot()
+		eventExec.ApprovalPending = approvalPending
 		if !approvalPending {
 			switch {
 			case evt.IsTerminalError():
@@ -446,6 +463,8 @@ drainLoop:
 				cancelModel()
 				beginDrain()
 			}
+		} else if evt.IsTerminalError() {
+			terminalEventPersisted = true
 		}
 		approvalPending, _ = approval.snapshot()
 		if approvalPending && evt.Response != nil && evt.Response.IsToolResultResponse() {
@@ -459,12 +478,89 @@ drainLoop:
 		return result, NewSideEffectUncertainError(sinkErr)
 	}
 	if err := runnerCtx.Err(); err != nil {
+		if !terminalEventPersisted {
+			if persistErr := w.persistRunnerFailure(runCtx, exec, err); persistErr != nil {
+				return result, persistErr
+			}
+		}
 		return result, classifySessionLeaseFailure(runCtx, result.RunnerStarted, err)
 	}
 	if runnerErr != nil {
+		if !terminalEventPersisted {
+			if persistErr := w.persistRunnerFailure(runCtx, exec, runnerErr); persistErr != nil {
+				return result, persistErr
+			}
+		}
 		return result, runnerErr
 	}
+	approvalPending, _ := approval.snapshot()
+	if !result.RunnerCompleted && !approvalPending {
+		missingCompletion := errors.New("runner completed without completion event")
+		if !terminalEventPersisted {
+			if persistErr := w.persistRunnerFailure(runCtx, exec, missingCompletion); persistErr != nil {
+				return result, persistErr
+			}
+		}
+		return result, missingCompletion
+	}
 	return result, nil
+}
+
+func (w Worker) persistRunnerFailure(ctx context.Context, exec Execution, cause error) error {
+	if w.Events == nil || cause == nil {
+		return nil
+	}
+	if !shouldPersistRunnerFailure(cause) {
+		return nil
+	}
+	if ctx != nil && errors.Is(context.Cause(ctx), ErrSessionLeaseLost) {
+		return nil
+	}
+	if ctx != nil && errors.Is(context.Cause(ctx), context.Canceled) &&
+		!errors.Is(cause, ErrExecutionCanceled) {
+		return nil
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.eventSinkTimeout())
+	defer cancel()
+	errorType := "runner_failure"
+	errorMessage := "runner execution failed"
+	if errors.Is(cause, ErrUnsupportedAttachment) {
+		errorType = unsupportedAttachmentErrorType
+		errorMessage = "model attachment capability is unsupported"
+	} else if errors.Is(cause, context.DeadlineExceeded) {
+		errorType = "execution_timeout"
+		errorMessage = "execution timed out"
+	} else if errors.Is(cause, context.Canceled) || errors.Is(cause, ErrExecutionCanceled) {
+		errorType = "execution_canceled"
+		errorMessage = "execution canceled"
+	}
+	synthetic := event.NewErrorEvent(exec.RequestID, "platform", errorType, errorMessage)
+	synthetic.RequestID = exec.RequestID
+	eventExec := exec
+	if IsSideEffectUncertainError(cause) {
+		eventExec.TerminalStatus = queue.CompletionUncertain
+	} else {
+		eventExec.TerminalStatus = queue.CompletionFailed
+	}
+	if err := w.handleRunnerEvent(persistCtx, eventExec, synthetic); err != nil {
+		return NewSideEffectUncertainError(fmt.Errorf("persist terminal runner failure: %w", err))
+	}
+	return nil
+}
+
+func shouldPersistRunnerFailure(cause error) bool {
+	if cause == nil || IsSideEffectUncertainError(cause) {
+		return true
+	}
+	if !IsRetryableExecutionError(cause) {
+		return true
+	}
+	// Timeout/cancellation and explicit user cancellation close the current
+	// stream. A separately classified retryable infrastructure error keeps the
+	// execution retryable and must not be converted into a terminal event.
+	return errors.Is(cause, context.DeadlineExceeded) ||
+		errors.Is(cause, context.Canceled) ||
+		errors.Is(cause, ErrExecutionCanceled)
 }
 
 func classifySessionLeaseFailure(ctx context.Context, runnerStarted bool, err error) error {

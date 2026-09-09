@@ -288,10 +288,35 @@ func TestConsumerExtractsTraceContextFromDispatch(t *testing.T) {
 	}
 }
 
+func TestConsumerPropagatesFinalAttemptFromClaim(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claim := testQueueClaim(t, "request-consumer-final-attempt")
+	claim.FinalAttempt = true
+	stream := &testStream{
+		delivery: queue.Delivery{ID: "final-1", Dispatch: queue.Dispatch{
+			OutboxID: 1, TenantID: "tenant-a", AppID: "support", RequestID: claim.Job.RequestID(),
+		}},
+		cancel: cancel,
+	}
+	executor := &consumerExecutor{result: worker.RunResult{RunnerCompleted: true}}
+	consumer, err := worker.NewConsumer(executor, stream, &testExecutionStore{claim: claim}, "worker-1")
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v", err)
+	}
+	if !executor.finalAttempt {
+		t.Fatal("executor did not receive final-attempt claim")
+	}
+}
+
 type consumerExecutor struct {
-	result  worker.RunResult
-	err     error
-	traceID string
+	result       worker.RunResult
+	err          error
+	traceID      string
+	finalAttempt bool
 }
 
 type blockingConsumerExecutor struct {
@@ -317,6 +342,7 @@ func (e *consumerExecutor) Run(ctx context.Context, _ execution.Job) (worker.Run
 		return worker.RunResult{}, errors.New("lease is missing")
 	}
 	e.traceID = platformtelemetry.TraceID(ctx)
+	e.finalAttempt = worker.FinalAttemptFromContext(ctx)
 	return e.result, e.err
 }
 

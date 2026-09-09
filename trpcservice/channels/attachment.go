@@ -21,19 +21,28 @@ type DownloadedMedia struct {
 	Data     []byte
 }
 
-// DetectMediaMIMEType prefers a trustworthy filename extension over magic-byte
-// sniffing. Office Open XML files are ZIP containers, so sniffing alone would
-// make .docx/.xlsx/.pptx unreadable to models that use the MIME type.
+// DetectMediaMIMEType trusts content bytes first. Office Open XML files are
+// ZIP containers, so their known extension is used only for that ambiguous
+// ZIP result; a wrong image/audio extension cannot upgrade arbitrary bytes.
 func DetectMediaMIMEType(filename string, data []byte) string {
+	sniffed := strings.ToLower(strings.TrimSpace(http.DetectContentType(data)))
+	extensionMIME := ""
 	if extension := path.Ext(strings.TrimSpace(filename)); extension != "" {
-		if detected := mime.TypeByExtension(strings.ToLower(extension)); detected != "" {
-			if detected == "application/x-zip-compressed" {
-				return "application/zip"
-			}
-			return detected
+		extensionMIME = strings.ToLower(strings.TrimSpace(mime.TypeByExtension(strings.ToLower(extension))))
+		if extensionMIME == "application/x-zip-compressed" {
+			extensionMIME = "application/zip"
 		}
 	}
-	return http.DetectContentType(data)
+	if sniffed != "" && sniffed != "application/octet-stream" && sniffed != "application/zip" {
+		return sniffed
+	}
+	if sniffed == "application/zip" && extensionMIME != "" {
+		return extensionMIME
+	}
+	if sniffed != "" {
+		return sniffed
+	}
+	return "application/octet-stream"
 }
 
 // InboundArtifact identifies one deterministic, tenant-scoped artifact write.
@@ -227,6 +236,13 @@ func (i *ArtifactIngestor) prepare(
 				cleanup(context.WithoutCancel(ctx)),
 			)
 		}
+		mimeType := DetectMediaMIMEType(downloaded.Filename, downloaded.Data)
+		// The provider-normalized kind is the only reliable fallback when an
+		// image format cannot be sniffed. Keep it in the MIME namespace so the
+		// worker cannot silently downgrade the attachment to a generic file.
+		if reference.Kind == MessageTypeImage && mimeType == "application/octet-stream" {
+			mimeType = "image/octet-stream"
+		}
 		artifact := InboundArtifact{
 			TenantID:          input.TenantID,
 			AppID:             input.AppID,
@@ -236,7 +252,7 @@ func (i *ArtifactIngestor) prepare(
 			ConfigVersion:     configVersion,
 			Kind:              reference.Kind,
 			Filename:          downloaded.Filename,
-			MIMEType:          downloaded.MIMEType,
+			MIMEType:          mimeType,
 			Data:              downloaded.Data,
 		}
 		artifactRef, owned, err := i.writer.WriteInboundArtifact(ctx, artifact)

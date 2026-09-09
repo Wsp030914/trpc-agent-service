@@ -20,6 +20,8 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
+const channelFailureEventID = "platform_channel:failure"
+
 // Admit atomically revalidates the trusted request identity, fixes the active
 // config version, allocates a session turn, and inserts the execution and its
 // transactional dispatch outbox record.
@@ -247,6 +249,16 @@ func (s *Store) Admit(
 		if err != nil {
 			return gateway.AdmissionResult{}, err
 		}
+		mapped.SessionID, err = ensureActiveSessionTx(
+			ctx,
+			tx,
+			request.Identity.Tenant.Scope(),
+			request.Identity.Tenant.BindingID,
+			mapped.SessionPrincipalID,
+		)
+		if err != nil {
+			return gateway.AdmissionResult{}, err
+		}
 		admission.runtimeContext = request.Identity.Tenant
 		admission.runtimeContext.ConfigVersion = app.ActiveConfigVersion
 		admission.runtimeContext.BindingRevision = request.Identity.BindingRevision
@@ -346,6 +358,106 @@ func (s *Store) Admit(
 	return admission.createExecution()
 }
 
+// RecordChannelFailure durably records a rejected Inbox row and its
+// provider-neutral failure reply. Replays are idempotent, and an admission
+// that committed despite an ambiguous caller error always wins.
+func (s *Store) RecordChannelFailure(ctx context.Context, request gateway.AdmissionRequest) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	if request.Identity.Source != gateway.TenantSourceVerifiedChannelBinding || request.ChannelInput == nil {
+		return gateway.ErrChannelInputRequired
+	}
+	if s.identityMapper == nil {
+		return errors.New("channel identity mapper is required")
+	}
+	mappingRequest, err := channelIdentityMappingRequest(request)
+	if err != nil {
+		return err
+	}
+	payloadHash, err := s.identityMapper.channelPayloadHash(ctx, mappingRequest, *request.ChannelInput)
+	if err != nil {
+		return err
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin channel failure: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	if err := revalidateChannelBindingSnapshot(ctx, tx, request.Identity); err != nil {
+		return err
+	}
+	inbox, found, err := findChannelInbox(
+		ctx, tx, request.Identity.Tenant.TenantID, request.Identity.Tenant.AppID,
+		request.Identity.Tenant.BindingID, request.ChannelInput.ExternalMessageID,
+	)
+	if err != nil {
+		return err
+	}
+	if found {
+		if !bytes.Equal(inbox.PayloadHash, payloadHash[:]) {
+			return gateway.ErrIdempotencyConflict
+		}
+		if inbox.Status == channelInboxStatusAdmitted {
+			return tx.Commit(ctx)
+		}
+		if inbox.Status != channelInboxStatusRejected {
+			return fmt.Errorf("channel inbox status %q is invalid", inbox.Status)
+		}
+		request.RequestID = inbox.RequestID
+	}
+	targetEnvelope, targetExpiresAt, err := request.ChannelInput.SealMessageReplyTarget(
+		ctx, s.identityMapper.protector, request.Identity.Tenant.Scope(), request.RequestID,
+	)
+	if err != nil {
+		return err
+	}
+	if found {
+		encodedTarget, err := json.Marshal(targetEnvelope)
+		if err != nil {
+			return fmt.Errorf("marshal channel failure reply target: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE platform.channel_inbox
+SET provider_reply_target_envelope = $5, reply_target_expires_at = $6,
+    updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND binding_id = $3
+  AND external_message_id = $4 AND status = 'REJECTED'`,
+			request.Identity.Tenant.TenantID, request.Identity.Tenant.AppID,
+			request.Identity.Tenant.BindingID, request.ChannelInput.ExternalMessageID,
+			encodedTarget, targetExpiresAt,
+		); err != nil {
+			return fmt.Errorf("update channel failure reply target: %w", err)
+		}
+	} else if err := insertChannelInbox(
+		ctx, tx, request, payloadHash[:], channelInboxStatusRejected,
+		"CHANNEL_PROCESSING_FAILED", targetEnvelope, targetExpiresAt,
+	); err != nil {
+		return admissionInsertError("insert failed channel inbox", err)
+	}
+	reply := channels.Reply{
+		TenantID: request.Identity.Tenant.TenantID, AppID: request.Identity.Tenant.AppID,
+		RequestID: request.RequestID, SourceEventID: channelFailureEventID,
+		Channel: channels.Channel(request.Identity.Tenant.Channel), BindingID: request.Identity.Tenant.BindingID,
+		BindingRevision: request.Identity.BindingRevision, Revision: 1,
+		Target: channels.ReplyTarget{Kind: channels.TargetKindMessage, InternalEntityID: request.RequestID},
+		Text:   channels.ChannelFailureReply,
+	}
+	if err := insertReplyOutboxTxWithSourceKind(
+		ctx, tx, reply.TenantID, reply.AppID, reply.BindingID, reply.RequestID,
+		"channel_failure", []channels.Reply{reply},
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit channel failure: %w", err)
+	}
+	return nil
+}
+
 // PinChannelConfig selects the exact config version that a channel request
 // will use before provider media is materialized. The identity mapping runs
 // in the same transaction as the app canary read, then the transaction is
@@ -395,6 +507,16 @@ func (s *Store) PinChannelConfig(
 		return "", err
 	}
 	mapped, err := s.identityMapper.mapInTransaction(ctx, tx, mappingRequest)
+	if err != nil {
+		return "", err
+	}
+	mapped.SessionID, err = ensureActiveSessionTx(
+		ctx,
+		tx,
+		request.Identity.Tenant.Scope(),
+		request.Identity.Tenant.BindingID,
+		mapped.SessionPrincipalID,
+	)
 	if err != nil {
 		return "", err
 	}

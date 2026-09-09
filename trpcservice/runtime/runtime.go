@@ -22,8 +22,10 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
+	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
+	frameworkevent "trpc.group/trpc-go/trpc-agent-go/event"
 	frameworkknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	modelopenai "trpc.group/trpc-go/trpc-agent-go/model/openai"
@@ -308,19 +310,25 @@ func (r *Runtime) BuildRunner(
 			metrics:   r.metrics,
 		}
 	}
+	// The model must be wrapped before LLMAgent captures it. This keeps
+	// externalized media behind the artifact boundary and performs the model
+	// capability check before the wrapped provider is called.
+	artifactModel := &artifactHydratingModel{
+		Model:                        modelRuntime.Model,
+		artifacts:                    artifactService,
+		capabilities:                 exec.Config.Model.AttachmentCapabilities,
+		currentArtifactRefs:          append([]string(nil), exec.Message.ArtifactRefs...),
+		currentMessageHasAttachments: len(exec.Message.ArtifactRefs) > 0,
+		info: frameworkartifact.SessionInfo{
+			AppName:   appName,
+			UserID:    exec.Tenant.SessionPrincipalID,
+			SessionID: exec.Tenant.SessionID,
+		},
+	}
+	modelRuntime.Model = artifactModel
 	if artifactService != nil {
-		// The model must be wrapped before LLMAgent captures it. The session
-		// service must likewise be wrapped before Runner options capture it;
-		// otherwise the durable path would still persist inline media bytes.
-		modelRuntime.Model = &artifactHydratingModel{
-			Model:     modelRuntime.Model,
-			artifacts: artifactService,
-			info: frameworkartifact.SessionInfo{
-				AppName:   appName,
-				UserID:    exec.Tenant.SessionPrincipalID,
-				SessionID: exec.Tenant.SessionID,
-			},
-		}
+		// The session service must likewise be wrapped before Runner options
+		// capture it; otherwise the durable path would persist inline media.
 		sessionService = sessionexternalization.Wrap(
 			sessionService,
 			artifactService,
@@ -375,8 +383,64 @@ func (r *Runtime) BuildRunner(
 	if resolved == nil {
 		return nil, errors.New("runtime runner construction returned nil")
 	}
-	return resolved, nil
+	return &attachmentValidatingRunner{base: resolved, model: artifactModel}, nil
 }
+
+// attachmentValidatingRunner puts the current-message attachment check ahead
+// of the framework runner's session persistence step.
+type attachmentValidatingRunner struct {
+	base  runner.Runner
+	model *artifactHydratingModel
+}
+
+func (r *attachmentValidatingRunner) Run(
+	ctx context.Context,
+	userID string,
+	sessionID string,
+	message model.Message,
+	runOpts ...frameworkagent.RunOption,
+) (<-chan *frameworkevent.Event, error) {
+	if r == nil || r.base == nil {
+		return nil, errors.New("attachment validating runner is not initialized")
+	}
+	if r.model != nil {
+		if err := r.model.validateCurrentMessage(ctx, message); err != nil {
+			return nil, err
+		}
+	}
+	return r.base.Run(ctx, userID, sessionID, message, runOpts...)
+}
+
+func (r *attachmentValidatingRunner) Close() error {
+	if r == nil || r.base == nil {
+		return nil
+	}
+	return r.base.Close()
+}
+
+func (r *attachmentValidatingRunner) Cancel(requestID string) bool {
+	if r == nil || r.base == nil {
+		return false
+	}
+	managed, ok := r.base.(runner.ManagedRunner)
+	if !ok {
+		return false
+	}
+	return managed.Cancel(requestID)
+}
+
+func (r *attachmentValidatingRunner) RunStatus(requestID string) (runner.RunStatus, bool) {
+	if r == nil || r.base == nil {
+		return runner.RunStatus{}, false
+	}
+	managed, ok := r.base.(runner.ManagedRunner)
+	if !ok {
+		return runner.RunStatus{}, false
+	}
+	return managed.RunStatus(requestID)
+}
+
+var _ runner.ManagedRunner = (*attachmentValidatingRunner)(nil)
 
 func visibleTools(policy tenant.ToolPolicy, tools []frameworktool.Tool) ([]frameworktool.Tool, error) {
 	visible := make([]frameworktool.Tool, 0, len(tools))

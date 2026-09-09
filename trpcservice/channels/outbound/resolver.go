@@ -5,8 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
-	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/feishu"
@@ -16,20 +14,19 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
 
-// Resolver selects the concrete provider for one durable Reply Outbox row.
-type Resolver struct {
-	store   *postgres.Store
-	secrets platformsecret.SecretProvider
-	limiter worker.ReplyRateLimiter
-	mu      sync.Mutex
-	wecom   map[replyBindingKey]*wecom.OutboundClient
+// WeComMessageSenderResolver returns the single live sender owned by the
+// WeCom Channel adapter. Creating a second long connection for the same BotID
+// causes WeCom to evict the inbound connection.
+type WeComMessageSenderResolver interface {
+	ResolveOutboundSender(context.Context, channels.BindingSnapshot) (wecom.MessageSender, error)
 }
 
-type replyBindingKey struct {
-	tenantID        string
-	appID           string
-	bindingID       string
-	bindingRevision int64
+// Resolver selects the concrete provider for one durable Reply Outbox row.
+type Resolver struct {
+	store         *postgres.Store
+	secrets       platformsecret.SecretProvider
+	limiter       worker.ReplyRateLimiter
+	wecomResolver WeComMessageSenderResolver
 }
 
 // NewResolver creates an IM outbound resolver for the single Channel owner.
@@ -39,15 +36,23 @@ func NewResolver(
 	store *postgres.Store,
 	secrets platformsecret.SecretProvider,
 	limiter worker.ReplyRateLimiter,
+	wecomResolvers ...WeComMessageSenderResolver,
 ) (*Resolver, error) {
 	if store == nil || secrets == nil {
 		return nil, errors.New("reply provider dependencies are required")
 	}
+	if len(wecomResolvers) > 1 {
+		return nil, errors.New("only one wecom sender resolver is supported")
+	}
+	var wecomResolver WeComMessageSenderResolver
+	if len(wecomResolvers) == 1 {
+		wecomResolver = wecomResolvers[0]
+	}
 	return &Resolver{
-		store:   store,
-		secrets: secrets,
-		limiter: limiter,
-		wecom:   make(map[replyBindingKey]*wecom.OutboundClient),
+		store:         store,
+		secrets:       secrets,
+		limiter:       limiter,
+		wecomResolver: wecomResolver,
 	}, nil
 }
 
@@ -72,26 +77,22 @@ func (r *Resolver) ResolveReplyProvider(
 	if binding.Status != channels.BindingActive {
 		return worker.ReplyProvider{}, worker.ErrReplyBindingInactive
 	}
-	if binding.Channel != delivery.Reply.Channel || binding.BindingRevision != delivery.Reply.BindingRevision {
+	if binding.Channel != delivery.Reply.Channel {
+		return worker.ReplyProvider{}, worker.ErrReplyBindingChanged
+	}
+	if binding.BindingRevision != delivery.Reply.BindingRevision {
 		return worker.ReplyProvider{}, worker.ErrReplyBindingChanged
 	}
 	switch binding.Channel {
 	case channels.ChannelWeCom:
-		key := replyBindingKey{
-			tenantID:        binding.TenantID,
-			appID:           binding.AppID,
-			bindingID:       binding.BindingID,
-			bindingRevision: binding.BindingRevision,
+		if r.wecomResolver == nil {
+			return worker.ReplyProvider{}, errors.New("wecom shared sender resolver is required")
 		}
-		r.mu.Lock()
-		client := r.wecom[key]
-		if client == nil {
-			client, err = wecom.NewOutboundClient(ctx, r.secrets, binding.Snapshot())
-			if err == nil {
-				r.wecom[key] = client
-			}
+		sender, err := r.wecomResolver.ResolveOutboundSender(ctx, binding.Snapshot())
+		if err != nil {
+			return worker.ReplyProvider{}, fmt.Errorf("resolve shared wecom sender: %w", err)
 		}
-		r.mu.Unlock()
+		client, err := wecom.NewOutboundClientWithSender(sender)
 		if err != nil {
 			return worker.ReplyProvider{}, err
 		}
@@ -107,24 +108,8 @@ func (r *Resolver) ResolveReplyProvider(
 	}
 }
 
-// Close stops cached binding-scoped WeCom senders. Reply Outbox state remains
-// owned by ReplySender; this only releases provider connections.
+// Close releases no provider connection. The WeCom Channel adapter owns the
+// shared long connection; Reply Outbox only creates lightweight wrappers.
 func (r *Resolver) Close() error {
-	if r == nil {
-		return nil
-	}
-	r.mu.Lock()
-	clients := make([]*wecom.OutboundClient, 0, len(r.wecom))
-	for _, client := range r.wecom {
-		clients = append(clients, client)
-	}
-	r.wecom = make(map[replyBindingKey]*wecom.OutboundClient)
-	r.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	var result error
-	for _, client := range clients {
-		result = errors.Join(result, client.Close(ctx))
-	}
-	return result
+	return nil
 }
