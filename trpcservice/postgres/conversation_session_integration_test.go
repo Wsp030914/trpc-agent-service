@@ -332,22 +332,34 @@ func TestNewSessionReplyRetryDoesNotRollbackCommittedSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read active session before reply retry: %v", err)
 	}
-	deliveries, err := p.store.ClaimReplies(p.ctx, "new-session-retry-owner", time.Minute, 1)
-	if err != nil {
-		t.Fatalf("claim command reply: %v", err)
-	}
-	if len(deliveries) != 1 {
-		t.Fatalf("claimed command replies = %d, want 1", len(deliveries))
-	}
-	target, err := p.store.ResolveReplyTarget(p.ctx, deliveries[0])
-	if err != nil {
-		t.Fatalf("resolve command reply target: %v", err)
-	}
-	if target != "sender-target" {
-		t.Fatalf("command reply target = %q, want %q", target, "sender-target")
-	}
-	if err := p.store.RetryReply(p.ctx, deliveries[0], "provider_transient", time.Hour, errors.New("provider unavailable")); err != nil {
-		t.Fatalf("retry command reply: %v", err)
+	claimedCommand := false
+	for !claimedCommand {
+		deliveries, err := p.store.ClaimReplies(p.ctx, "new-session-retry-owner", time.Minute, 32)
+		if err != nil {
+			t.Fatalf("claim command reply: %v", err)
+		}
+		if len(deliveries) == 0 {
+			t.Fatal("command reply was not claimable")
+		}
+		for _, delivery := range deliveries {
+			if delivery.Reply.RequestID == command.RequestID {
+				target, err := p.store.ResolveReplyTarget(p.ctx, delivery)
+				if err != nil {
+					t.Fatalf("resolve command reply target: %v", err)
+				}
+				if target != "sender-target" {
+					t.Fatalf("command reply target = %q, want %q", target, "sender-target")
+				}
+				if err := p.store.RetryReply(p.ctx, delivery, "provider_transient", time.Hour, errors.New("provider unavailable")); err != nil {
+					t.Fatalf("retry command reply: %v", err)
+				}
+				claimedCommand = true
+				continue
+			}
+			if err := p.store.CompleteReply(p.ctx, delivery, channels.ProviderReceipt{ProviderMessageID: "integration-test-drain"}); err != nil {
+				t.Fatalf("complete unrelated reply: %v", err)
+			}
+		}
 	}
 	activeAfterRetry, err := p.store.ResolveActiveSession(p.ctx, p.scope, p.binding.BindingID, principalID)
 	if err != nil {
