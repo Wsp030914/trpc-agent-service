@@ -347,8 +347,8 @@ func TestNewSessionReplyRetryDoesNotRollbackCommittedSwitch(t *testing.T) {
 				if err != nil {
 					t.Fatalf("resolve command reply target: %v", err)
 				}
-				if target != "sender-target" {
-					t.Fatalf("command reply target = %q, want %q", target, "sender-target")
+				if target != "user-target-1" {
+					t.Fatalf("command reply target = %q, want %q", target, "user-target-1")
 				}
 				if err := p.store.RetryReply(p.ctx, delivery, "provider_transient", time.Hour, errors.New("provider unavailable")); err != nil {
 					t.Fatalf("retry command reply: %v", err)
