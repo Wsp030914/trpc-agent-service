@@ -17,12 +17,22 @@ func readManifest(t *testing.T, name ...string) string {
 	return string(data)
 }
 
-func TestWorkerAndChannelDoNotMountAdminSecret(t *testing.T) {
+func TestWorkerAndChannelClearControlPlaneTokens(t *testing.T) {
+	controlPlaneTokens := []string{
+		"TRPC_AGENT_SERVICE_ADMIN_TOKEN",
+		"TRPC_AGENT_SERVICE_OPERATOR_TOKEN",
+		"TRPC_AGENT_SERVICE_AUDITOR_TOKEN",
+	}
 	for _, name := range []string{"worker-deployment.yaml", "channel-deployment.yaml"} {
 		manifest := readManifest(t, name)
-		if strings.Contains(manifest, "trpc-agent-service-admin-secrets") ||
-			strings.Contains(manifest, "TRPC_AGENT_SERVICE_ADMIN_TOKEN") {
-			t.Errorf("%s exposes the admin secret", name)
+		if strings.Contains(manifest, "trpc-agent-service-admin-secrets") {
+			t.Errorf("%s mounts the admin secret", name)
+		}
+		for _, token := range controlPlaneTokens {
+			declaration := "            - name: " + token + "\n              value: \"\""
+			if !strings.Contains(manifest, declaration) {
+				t.Errorf("%s does not clear %s", name, token)
+			}
 		}
 	}
 }

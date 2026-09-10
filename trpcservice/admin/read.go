@@ -39,7 +39,9 @@ func (o ListOptions) validate(requireApp bool) error {
 
 // AppConfigView is a safe immutable configuration view. Opaque provider
 // options and model parameters are omitted because their values may contain
-// credentials even when their keys do not identify them as secrets.
+// credentials even when their keys do not identify them as secrets. External
+// SecretRef metadata is retained so the view can be edited and republished;
+// secret values are resolved outside the configuration payload.
 type AppConfigView struct {
 	Config    tenant.AppConfig `json:"config"`
 	Status    string           `json:"status"`
@@ -47,29 +49,10 @@ type AppConfigView struct {
 	CreatedAt time.Time        `json:"created_at"`
 }
 
-// MarshalJSON removes credential references from the wire representation while
+// MarshalJSON applies the same safe projection at the wire boundary while
 // keeping Config as a typed value for in-process repository consumers.
 func (v AppConfigView) MarshalJSON() ([]byte, error) {
-	encoded, err := json.Marshal(v.Config)
-	if err != nil {
-		return nil, err
-	}
-	var config map[string]any
-	if err := json.Unmarshal(encoded, &config); err != nil {
-		return nil, err
-	}
-	delete(config, "secret_refs")
-	if modelConfig, ok := config["model"].(map[string]any); ok {
-		delete(modelConfig, "api_key_ref")
-	}
-	if backendConfig, ok := config["backend_config"].(map[string]any); ok {
-		for _, name := range []string{"session", "memory", "knowledge", "artifact"} {
-			if backend, ok := backendConfig[name].(map[string]any); ok {
-				delete(backend, "secret_ref")
-			}
-		}
-	}
-	safeConfig, err := json.Marshal(config)
+	safeConfig, err := json.Marshal(sanitizeAppConfig(v.Config))
 	if err != nil {
 		return nil, err
 	}
@@ -312,12 +295,6 @@ func (a API) ListAppConfigsForPrincipal(
 
 func sanitizeAppConfig(value tenant.AppConfig) tenant.AppConfig {
 	value = value.Clone()
-	value.Model.APIKeyRef = tenant.SecretRef{}
-	value.BackendConfig.Session.SecretRef = tenant.SecretRef{}
-	value.BackendConfig.Memory.SecretRef = tenant.SecretRef{}
-	value.BackendConfig.Knowledge.SecretRef = tenant.SecretRef{}
-	value.BackendConfig.Artifact.SecretRef = tenant.SecretRef{}
-	value.SecretRefs = nil
 	value.Model.Parameters = sanitizeModelParameters(value.Model.Parameters)
 	value.BackendConfig.Session.Options = sanitizeOptions(value.BackendConfig.Session.Options, "schema")
 	value.BackendConfig.Memory.Options = nil

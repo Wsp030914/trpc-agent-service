@@ -40,6 +40,13 @@ spec:
               value: worker
             - name: TRPC_AGENT_SERVICE_HTTP_ADDR
               value: :8080
+            # envFrom must not expose control-plane credentials to workers.
+            - name: TRPC_AGENT_SERVICE_ADMIN_TOKEN
+              value: ""
+            - name: TRPC_AGENT_SERVICE_OPERATOR_TOKEN
+              value: ""
+            - name: TRPC_AGENT_SERVICE_AUDITOR_TOKEN
+              value: ""
             - name: TRPC_AGENT_SERVICE_WORKER_ID
               valueFrom:
                 fieldRef:

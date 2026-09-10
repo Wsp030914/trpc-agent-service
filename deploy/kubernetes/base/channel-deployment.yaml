@@ -39,6 +39,13 @@ spec:
               value: channel
             - name: TRPC_AGENT_SERVICE_HTTP_ADDR
               value: :8080
+            # envFrom must not expose control-plane credentials to channels.
+            - name: TRPC_AGENT_SERVICE_ADMIN_TOKEN
+              value: ""
+            - name: TRPC_AGENT_SERVICE_OPERATOR_TOKEN
+              value: ""
+            - name: TRPC_AGENT_SERVICE_AUDITOR_TOKEN
+              value: ""
           volumeMounts:
             - name: platform-secrets
               mountPath: /var/run/secrets/trpc-agent-service
