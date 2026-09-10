@@ -156,6 +156,58 @@ func TestExecutorLeavesDurablePhaseOpenForRetryableBackendFailure(t *testing.T) 
 	}
 }
 
+func TestExecutorRetryConvergesAfterPartialCopy(t *testing.T) {
+	record := migration.Record{
+		ID:                  "migration-partial-copy",
+		TenantID:            "tenant-1",
+		AppID:               "app-1",
+		SourceConfigVersion: "v1",
+		TargetConfigVersion: "v2",
+		Status:              migration.StatusCopying,
+		LeaseOwner:          "worker-1",
+		LeaseUntil:          time.Now().Add(time.Minute),
+		RunToken:            "run-1",
+	}
+	keys := []session.Key{
+		{AppName: "app", UserID: "user", SessionID: "session-1"},
+		{AppName: "app", UserID: "user", SessionID: "session-2"},
+	}
+	repository := &checkpointMigrationRepository{}
+	copier := &retryAfterPartialSessionCopier{}
+	executor := migration.Executor{
+		Catalog:    testSessionCatalog{keys: keys},
+		Repository: repository,
+		Copier:     copier,
+	}
+
+	if err := executor.Run(context.Background(), record); !errors.Is(err, errMigrationBackendUnavailable) {
+		t.Fatalf("first run error = %v, want backend unavailable", err)
+	}
+	if len(repository.checkpoints) == 0 {
+		t.Fatal("partial-copy checkpoint was not persisted")
+	}
+	resume := repository.checkpoints[len(repository.checkpoints)-1]
+	if resume.Status != migration.StatusCopying || resume.CopyProgress != 1 {
+		t.Fatalf("resume checkpoint = %+v, want COPYING with one copied session", resume)
+	}
+	if len(copier.copied) != 1 || copier.copied[0].SessionID != "session-1" {
+		t.Fatalf("partial target copied sessions = %v, want session-1", copier.copied)
+	}
+
+	if err := executor.Run(context.Background(), resume); err != nil {
+		t.Fatalf("retry run: %v", err)
+	}
+	if len(copier.copied) != 2 || copier.copied[1].SessionID != "session-2" {
+		t.Fatalf("retry copied sessions = %v, want only session-2 appended", copier.copied)
+	}
+	if len(copier.verified) != len(keys) {
+		t.Fatalf("verified sessions = %d, want %d", len(copier.verified), len(keys))
+	}
+	if got := repository.transitions[len(repository.transitions)-1]; got != migration.StatusSucceeded {
+		t.Fatalf("final transition = %s, want SUCCEEDED", got)
+	}
+}
+
 func TestExecutorResumesFromCheckpoint(t *testing.T) {
 	record := migration.Record{
 		ID:                  "migration-resume",
@@ -303,6 +355,26 @@ func (*retryingSessionCopier) CopySession(_ context.Context, _ session.Key) erro
 }
 
 func (*retryingSessionCopier) VerifySession(_ context.Context, _ session.Key) error { return nil }
+
+type retryAfterPartialSessionCopier struct {
+	copied   []session.Key
+	verified []session.Key
+	failed   bool
+}
+
+func (c *retryAfterPartialSessionCopier) CopySession(_ context.Context, key session.Key) error {
+	if key.SessionID == "session-2" && !c.failed {
+		c.failed = true
+		return migration.NewRetryableError(errMigrationBackendUnavailable)
+	}
+	c.copied = append(c.copied, key)
+	return nil
+}
+
+func (c *retryAfterPartialSessionCopier) VerifySession(_ context.Context, key session.Key) error {
+	c.verified = append(c.verified, key)
+	return nil
+}
 
 func (c *testSessionCopier) CopySession(_ context.Context, _ session.Key) error {
 	c.copied++

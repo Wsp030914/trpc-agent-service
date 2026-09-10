@@ -115,6 +115,51 @@ func TestConfigFromEnvironmentParsesWorkerConcurrency(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvironmentParsesAdmissionControls(t *testing.T) {
+	config, err := configFromEnvironment(environmentReader(map[string]string{
+		envRole:                 string(roleGateway),
+		envPostgresDSN:          "postgres://example",
+		envRedisURL:             "redis://example:6379/0",
+		envAdminToken:           "admin-token",
+		envDispatcherID:         "gateway-1",
+		envAdmissionRateLimit:   "7",
+		envAdmissionRateWindow:  "2s",
+		envAdmissionConcurrency: "3",
+		envHTTPEventWaitTimeout: "4s",
+	}))
+	if err != nil {
+		t.Fatalf("admission configuration: %v", err)
+	}
+	if config.AdmissionRateLimit != 7 || config.AdmissionRateWindow != 2*time.Second ||
+		config.AdmissionConcurrency != 3 || config.HTTPEventWaitTimeout != 4*time.Second {
+		t.Fatalf("admission controls = %#v", config)
+	}
+	for _, test := range []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{name: "zero rate", env: envAdmissionRateLimit, value: "0"},
+		{name: "zero window", env: envAdmissionRateWindow, value: "0s"},
+		{name: "zero concurrency", env: envAdmissionConcurrency, value: "0"},
+		{name: "zero HTTP wait", env: envHTTPEventWaitTimeout, value: "0s"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := configFromEnvironment(environmentReader(map[string]string{
+				envRole:         string(roleGateway),
+				envPostgresDSN:  "postgres://example",
+				envRedisURL:     "redis://example:6379/0",
+				envAdminToken:   "admin-token",
+				envDispatcherID: "gateway-1",
+				test.env:        test.value,
+			}))
+			if err == nil {
+				t.Fatalf("invalid %s=%q was accepted", test.env, test.value)
+			}
+		})
+	}
+}
+
 func TestConfigFromEnvironmentParsesFaultPauseAfterClaim(t *testing.T) {
 	config, err := configFromEnvironment(environmentReader(map[string]string{
 		envRole:                 string(roleWorker),

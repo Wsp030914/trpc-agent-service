@@ -75,6 +75,59 @@ func TestConsumerRetriesAndAcknowledgesFailedRun(t *testing.T) {
 	}
 }
 
+func TestConsumerReleasesLocalOwnershipWhenAckFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claim := testQueueClaim(t, "request-consumer-ack-failure")
+	stream := &testStream{
+		delivery: queue.Delivery{ID: "ack-failure-0", Dispatch: queue.Dispatch{
+			OutboxID: 3, TenantID: "tenant-a", AppID: "support", RequestID: claim.Job.RequestID(),
+		}},
+		ackErr: errors.New("redis unavailable"),
+		cancel: cancel,
+	}
+	consumer, err := worker.NewConsumer(&consumerExecutor{result: worker.RunResult{RunnerCompleted: true}}, stream, &testExecutionStore{claim: claim}, "worker-1")
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v, want context canceled", err)
+	}
+	if stream.releases != 1 {
+		t.Fatalf("local ownership releases = %d, want 1", stream.releases)
+	}
+}
+
+func TestConsumerBoundsAckRetriesWhileKeepingDeliveryPending(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claim := testQueueClaim(t, "request-consumer-ack-retry-limit")
+	stream := &testStream{
+		delivery: queue.Delivery{ID: "ack-retry-limit-0", Dispatch: queue.Dispatch{
+			OutboxID: 4, TenantID: "tenant-a", AppID: "support", RequestID: claim.Job.RequestID(),
+		}},
+		ackErr:         errors.New("redis unavailable"),
+		ackCancelAfter: 5,
+		cancel:         cancel,
+	}
+	consumer, err := worker.NewConsumerWithOptions(
+		&consumerExecutor{result: worker.RunResult{RunnerCompleted: true}},
+		stream,
+		&testExecutionStore{claim: claim},
+		"worker-1",
+		worker.ConsumerOptions{RetryDelay: func(int) time.Duration { return time.Nanosecond }},
+	)
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v, want context canceled", err)
+	}
+	if stream.acks != 5 || stream.releases != 5 {
+		t.Fatalf("ack attempts=%d releases=%d, want five of each", stream.acks, stream.releases)
+	}
+}
+
 func TestConsumerHonorsExecutionFailureClassification(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -347,11 +400,14 @@ func (e *consumerExecutor) Run(ctx context.Context, _ execution.Job) (worker.Run
 }
 
 type testStream struct {
-	mu        sync.Mutex
-	delivery  queue.Delivery
-	delivered bool
-	acks      int
-	cancel    context.CancelFunc
+	mu             sync.Mutex
+	delivery       queue.Delivery
+	delivered      bool
+	acks           int
+	ackErr         error
+	releases       int
+	ackCancelAfter int
+	cancel         context.CancelFunc
 }
 
 type malformedStream struct {
@@ -370,6 +426,7 @@ func (s *malformedStream) Receive(ctx context.Context, _ string, _ time.Duration
 	return queue.Delivery{}, ctx.Err()
 }
 func (s *malformedStream) Ack(context.Context, queue.Delivery) error { return nil }
+func (s *malformedStream) Release(queue.Delivery)                    {}
 func (s *malformedStream) Dead(_ context.Context, delivery queue.Delivery, _ error) error {
 	s.dead++
 	s.deadID = delivery.ID
@@ -391,11 +448,18 @@ func (s *testStream) Receive(ctx context.Context, _ string, _ time.Duration) (qu
 func (s *testStream) Ack(_ context.Context, _ queue.Delivery) error {
 	s.mu.Lock()
 	s.acks++
+	err := s.ackErr
+	shouldCancel := s.cancel != nil && (s.ackCancelAfter == 0 || s.acks >= s.ackCancelAfter)
 	s.mu.Unlock()
-	if s.cancel != nil {
+	if shouldCancel {
 		s.cancel()
 	}
-	return nil
+	return err
+}
+func (s *testStream) Release(queue.Delivery) {
+	s.mu.Lock()
+	s.releases++
+	s.mu.Unlock()
 }
 func (s *testStream) Dead(context.Context, queue.Delivery, error) error { return nil }
 

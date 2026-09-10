@@ -31,6 +31,9 @@ var (
 	// ErrIdentityInactive means a provider identity is not allowed to enter
 	// admission. Suspended identities must not be reused by provider retries.
 	ErrIdentityInactive = errors.New("channel identity is not active")
+	// ErrChannelNotProvisionable means the control plane must not create or
+	// activate a channel without a running adapter/ingress entry point.
+	ErrChannelNotProvisionable = errors.New("channel has no active ingress")
 )
 
 // Channel identifies an external IM platform.
@@ -49,6 +52,19 @@ const (
 func (c Channel) Validate() error {
 	if !validChannel(c) {
 		return errors.New("channel is invalid")
+	}
+	return nil
+}
+
+// ValidateProvisionable checks that a channel has a live ingress adapter.
+// Validate intentionally remains broader so legacy persisted bindings can be
+// read and suspended without making an unimplemented channel configurable.
+func (c Channel) ValidateProvisionable() error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	if c == ChannelWeChatCustomer {
+		return ErrChannelNotProvisionable
 	}
 	return nil
 }

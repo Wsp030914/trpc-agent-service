@@ -58,9 +58,13 @@ type Publisher interface {
 	Publish(context.Context, Dispatch) error
 }
 
-// Stream provides Consumer Group delivery, acknowledgement, and dead-lettering.
+// Stream provides Consumer Group delivery, local ownership release,
+// acknowledgement, and dead-lettering.
 type Stream interface {
 	Receive(context.Context, string, time.Duration) (Delivery, error)
+	// Release removes only this process's local ownership marker. The durable
+	// stream entry remains pending for a later reclaim.
+	Release(Delivery)
 	Ack(context.Context, Delivery) error
 	Dead(context.Context, Delivery, error) error
 }

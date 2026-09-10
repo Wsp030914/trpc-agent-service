@@ -120,8 +120,8 @@ func TestBudgetCallbacksPreserveModelErrorWithoutUsage(t *testing.T) {
 	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{Error: providerErr}); err != nil {
 		t.Fatalf("after-model callback replaced model error with: %v", err)
 	}
-	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
-		t.Fatalf("budget was not released after model error: %v", err)
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("follow-up model call error = %v, want ErrBudgetExceeded", err)
 	}
 }
 
@@ -137,6 +137,9 @@ func TestBudgetCallbacksPreserveResponseErrorWithoutUsage(t *testing.T) {
 		Response: &model.Response{Error: &model.ResponseError{Message: "provider rejected request"}},
 	}); err != nil {
 		t.Fatalf("response error was replaced by budget error: %v", err)
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("follow-up model call error = %v, want ErrBudgetExceeded", err)
 	}
 }
 

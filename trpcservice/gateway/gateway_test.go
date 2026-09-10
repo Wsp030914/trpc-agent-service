@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
@@ -33,6 +34,12 @@ type staticTenantResolver struct {
 
 type tenantOnlyResolver struct {
 	tenant tenant.RuntimeContext
+}
+
+type admissionRateLimiterFunc func(context.Context, gateway.AdmissionIdentity) error
+
+func (f admissionRateLimiterFunc) Allow(ctx context.Context, identity gateway.AdmissionIdentity) error {
+	return f(ctx, identity)
 }
 
 func (r tenantOnlyResolver) ResolveTenant(_ context.Context) (
@@ -93,6 +100,69 @@ func TestGatewaySubmitsAtomicAdmission(t *testing.T) {
 	}
 	if admitter.request.Identity.SourceID != identity.SourceID {
 		t.Fatalf("admission source ID = %q, want %q", admitter.request.Identity.SourceID, identity.SourceID)
+	}
+}
+
+func TestGatewayRejectsBeforeBackendWhenSharedAdmissionRateIsExhausted(t *testing.T) {
+	admitter := &captureAdmitter{result: gateway.AdmissionResult{
+		RequestID: "request-rate", ConfigVersion: "v1", TurnSeq: 1,
+	}}
+	gw := gateway.New(admitter)
+	want := &gateway.AdmissionRateLimitError{RetryAfter: time.Second}
+	gw.RateLimiter = admissionRateLimiterFunc(func(context.Context, gateway.AdmissionIdentity) error {
+		return want
+	})
+	identity := validAdmissionIdentity()
+	_, err := gw.Handle(context.Background(), gateway.Request{
+		RequestID: "request-rate", IdempotencyKey: "key-rate",
+		Tenant:  staticTenantResolver{tenant: identity.Tenant, source: identity.Source, identity: identity, withIdentity: true},
+		Message: gateway.Message{Text: "hello"},
+	})
+	if !errors.Is(err, gateway.ErrAdmissionRateLimited) {
+		t.Fatalf("rate-limited error = %v", err)
+	}
+	if admitter.request.RequestID != "" {
+		t.Fatal("rate-limited request reached backend admission")
+	}
+}
+
+func TestGatewayAdmissionConcurrencyIsLocalAndReleasedAfterAdmission(t *testing.T) {
+	admitter := &captureAdmitter{result: gateway.AdmissionResult{
+		RequestID: "request-concurrency", ConfigVersion: "v1", TurnSeq: 1,
+	}}
+	slots, err := gateway.NewAdmissionConcurrency(1)
+	if err != nil {
+		t.Fatalf("new admission concurrency: %v", err)
+	}
+	gw := gateway.New(admitter)
+	gw.AdmissionConcurrency = slots
+	rateCalls := 0
+	gw.RateLimiter = admissionRateLimiterFunc(func(context.Context, gateway.AdmissionIdentity) error {
+		rateCalls++
+		return nil
+	})
+	identity := validAdmissionIdentity()
+	request := gateway.Request{
+		RequestID: "request-concurrency", IdempotencyKey: "key-concurrency",
+		Tenant:  staticTenantResolver{tenant: identity.Tenant, source: identity.Source, identity: identity, withIdentity: true},
+		Message: gateway.Message{Text: "hello"},
+	}
+	release, err := slots.Acquire()
+	if err != nil {
+		t.Fatalf("occupy admission slot: %v", err)
+	}
+	if _, err := gw.Handle(context.Background(), request); !errors.Is(err, gateway.ErrAdmissionConcurrencyLimit) {
+		t.Fatalf("busy admission error = %v", err)
+	}
+	if rateCalls != 0 {
+		t.Fatalf("shared rate limiter calls while local admission was full = %d, want 0", rateCalls)
+	}
+	release()
+	if _, err := gw.Handle(context.Background(), request); err != nil {
+		t.Fatalf("admission after slot release: %v", err)
+	}
+	if rateCalls != 1 {
+		t.Fatalf("shared rate limiter calls after local admission = %d, want 1", rateCalls)
 	}
 }
 

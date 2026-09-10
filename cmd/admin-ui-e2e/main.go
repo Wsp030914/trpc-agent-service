@@ -139,7 +139,8 @@ func run(parent context.Context) error {
 	if err := postJSON(ctx, client, gatewayURL+"/admin/v1/channel-bindings", adminToken, map[string]any{
 		"binding": channels.Binding{
 			TenantID: tenantID, AppID: appID, BindingID: bindingID,
-			Channel: channels.ChannelWeChatCustomer, ExternalAccount: "admin-ui-e2e-external",
+			Channel: channels.ChannelWeCom, ExternalAccount: "admin-ui-e2e-external",
+			Secret: tenant.SecretRef{Name: "admin-ui-e2e-secret", Version: "v1"},
 			Status: channels.BindingActive,
 		},
 	}); err != nil {

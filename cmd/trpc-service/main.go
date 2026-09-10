@@ -66,21 +66,29 @@ const (
 	envPrometheusURL                    = "TRPC_AGENT_SERVICE_PROMETHEUS_URL"
 	envGrafanaURL                       = "TRPC_AGENT_SERVICE_GRAFANA_URL"
 	envIMReplyMode                      = "TRPC_AGENT_SERVICE_IM_REPLY_MODE"
+	envAdmissionRateLimit               = "TRPC_AGENT_SERVICE_ADMISSION_RATE_LIMIT"
+	envAdmissionRateWindow              = "TRPC_AGENT_SERVICE_ADMISSION_RATE_WINDOW"
+	envAdmissionConcurrency             = "TRPC_AGENT_SERVICE_ADMISSION_CONCURRENCY"
+	envHTTPEventWaitTimeout             = "TRPC_AGENT_SERVICE_HTTP_EVENT_WAIT_TIMEOUT"
 
-	defaultHTTPAddr          = ":8080"
-	defaultRedisStream       = "trpc-agent-service:dispatch"
-	defaultRedisGroup        = "workers"
-	dispatchLeaseDuration    = 30 * time.Second
-	sessionLeaseDuration     = 30 * time.Second
-	defaultShutdownTimeout   = 30 * time.Second
-	defaultModelTimeout      = time.Minute
-	defaultWorkerConcurrency = 4
-	defaultArtifactRetention = 30 * 24 * time.Hour
-	defaultJaegerURL         = "http://localhost:16686"
-	defaultPrometheusURL     = "http://localhost:19090"
-	defaultGrafanaURL        = "http://localhost:13000"
-	dataMigrationLease       = 30 * time.Second
-	dataMigrationPoll        = time.Second
+	defaultHTTPAddr             = ":8080"
+	defaultRedisStream          = "trpc-agent-service:dispatch"
+	defaultRedisGroup           = "workers"
+	dispatchLeaseDuration       = 30 * time.Second
+	sessionLeaseDuration        = 30 * time.Second
+	defaultShutdownTimeout      = 30 * time.Second
+	defaultModelTimeout         = time.Minute
+	defaultWorkerConcurrency    = 4
+	defaultArtifactRetention    = 30 * 24 * time.Hour
+	defaultJaegerURL            = "http://localhost:16686"
+	defaultPrometheusURL        = "http://localhost:19090"
+	defaultGrafanaURL           = "http://localhost:13000"
+	defaultAdmissionRateLimit   = 60
+	defaultAdmissionRateWindow  = time.Minute
+	defaultAdmissionConcurrency = 64
+	defaultHTTPEventWaitTimeout = 2 * time.Minute
+	dataMigrationLease          = 30 * time.Second
+	dataMigrationPoll           = time.Second
 )
 
 var errWorkerShutdownTimeout = errors.New("worker did not stop before shutdown deadline")
@@ -112,6 +120,10 @@ type serviceConfig struct {
 	ModelTimeout                time.Duration
 	ArtifactRetention           time.Duration
 	WorkerConcurrency           int
+	AdmissionRateLimit          int
+	AdmissionRateWindow         time.Duration
+	AdmissionConcurrency        int
+	HTTPEventWaitTimeout        time.Duration
 	PauseAfterClaim             time.Duration
 	PauseAfterMigrationCopy     time.Duration
 	PauseAfterMigrationCopyItem time.Duration
@@ -150,27 +162,31 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 		return serviceConfig{}, errors.New("environment reader is required")
 	}
 	config := serviceConfig{
-		Role:              serviceRole(getenv(envRole)),
-		PostgresDSN:       getenv(envPostgresDSN),
-		RedisURL:          getenv(envRedisURL),
-		RedisStream:       getenv(envRedisStream),
-		RedisGroup:        getenv(envRedisGroup),
-		DispatcherID:      getenv(envDispatcherID),
-		HTTPAddr:          getenv(envHTTPAddr),
-		WorkerID:          getenv(envWorkerID),
-		AdminToken:        getenv(envAdminToken),
-		OperatorToken:     getenv(envOperatorToken),
-		OperatorTenantIDs: splitCommaSeparated(getenv(envOperatorTenantIDs)),
-		AuditorToken:      getenv(envAuditorToken),
-		AuditorTenantIDs:  splitCommaSeparated(getenv(envAuditorTenantIDs)),
-		ShutdownTimeout:   defaultShutdownTimeout,
-		ModelTimeout:      defaultModelTimeout,
-		ArtifactRetention: defaultArtifactRetention,
-		WorkerConcurrency: defaultWorkerConcurrency,
-		JaegerURL:         defaultJaegerURL,
-		PrometheusURL:     defaultPrometheusURL,
-		GrafanaURL:        defaultGrafanaURL,
-		IMReplyMode:       worker.ReplyMode(getenv(envIMReplyMode)),
+		Role:                 serviceRole(getenv(envRole)),
+		PostgresDSN:          getenv(envPostgresDSN),
+		RedisURL:             getenv(envRedisURL),
+		RedisStream:          getenv(envRedisStream),
+		RedisGroup:           getenv(envRedisGroup),
+		DispatcherID:         getenv(envDispatcherID),
+		HTTPAddr:             getenv(envHTTPAddr),
+		WorkerID:             getenv(envWorkerID),
+		AdminToken:           getenv(envAdminToken),
+		OperatorToken:        getenv(envOperatorToken),
+		OperatorTenantIDs:    splitCommaSeparated(getenv(envOperatorTenantIDs)),
+		AuditorToken:         getenv(envAuditorToken),
+		AuditorTenantIDs:     splitCommaSeparated(getenv(envAuditorTenantIDs)),
+		ShutdownTimeout:      defaultShutdownTimeout,
+		ModelTimeout:         defaultModelTimeout,
+		ArtifactRetention:    defaultArtifactRetention,
+		WorkerConcurrency:    defaultWorkerConcurrency,
+		AdmissionRateLimit:   defaultAdmissionRateLimit,
+		AdmissionRateWindow:  defaultAdmissionRateWindow,
+		AdmissionConcurrency: defaultAdmissionConcurrency,
+		HTTPEventWaitTimeout: defaultHTTPEventWaitTimeout,
+		JaegerURL:            defaultJaegerURL,
+		PrometheusURL:        defaultPrometheusURL,
+		GrafanaURL:           defaultGrafanaURL,
+		IMReplyMode:          worker.ReplyMode(getenv(envIMReplyMode)),
 		Telemetry: platformtelemetry.Config{
 			Protocol:       getenv(envOTELProtocol),
 			TraceEndpoint:  getenv(envOTELTracesEndpoint),
@@ -242,6 +258,34 @@ func configFromEnvironment(getenv func(string) string) (serviceConfig, error) {
 			return serviceConfig{}, fmt.Errorf("%s must be a positive integer", envWorkerConcurrency)
 		}
 		config.WorkerConcurrency = concurrency
+	}
+	if value := getenv(envAdmissionRateLimit); value != "" {
+		limit, err := strconv.Atoi(value)
+		if err != nil || limit <= 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a positive integer", envAdmissionRateLimit)
+		}
+		config.AdmissionRateLimit = limit
+	}
+	if value := getenv(envAdmissionRateWindow); value != "" {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 || duration.Milliseconds() <= 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a positive duration", envAdmissionRateWindow)
+		}
+		config.AdmissionRateWindow = duration
+	}
+	if value := getenv(envAdmissionConcurrency); value != "" {
+		concurrency, err := strconv.Atoi(value)
+		if err != nil || concurrency <= 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a positive integer", envAdmissionConcurrency)
+		}
+		config.AdmissionConcurrency = concurrency
+	}
+	if value := getenv(envHTTPEventWaitTimeout); value != "" {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 {
+			return serviceConfig{}, fmt.Errorf("%s must be a positive duration", envHTTPEventWaitTimeout)
+		}
+		config.HTTPEventWaitTimeout = duration
 	}
 	if value := getenv(envFaultPauseAfterClaim); value != "" {
 		duration, err := time.ParseDuration(value)
@@ -378,7 +422,15 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	var wecomAdapter *wecom.Adapter
 	var feishuAdapter *feishu.Adapter
 	if config.Role.runsGateway() || config.Role.runsChannel() {
-		gatewayHandler, wecom, feishu, handlerErr := newGatewayHandler(store, artifacts)
+		admissionLimiter, limiterErr := platformredis.NewAdmissionRateLimiter(
+			redisClient, config.AdmissionRateLimit, config.AdmissionRateWindow,
+		)
+		if limiterErr != nil {
+			return fmt.Errorf("create admission rate limiter: %w", limiterErr)
+		}
+		gatewayHandler, wecom, feishu, handlerErr := newGatewayHandler(
+			store, artifacts, admissionLimiter, config.AdmissionConcurrency, config.HTTPEventWaitTimeout,
+		)
 		if handlerErr != nil {
 			return handlerErr
 		}
@@ -516,9 +568,22 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	return errors.Join(result, awaitProviderExit(providerDone, config.ShutdownTimeout))
 }
 
-func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (http.Handler, *wecom.Adapter, *feishu.Adapter, error) {
+func newGatewayHandler(
+	store *postgres.Store,
+	artifacts *artifactcos.Resolver,
+	rateLimiter gateway.AdmissionRateLimiter,
+	admissionConcurrency int,
+	durableEventWaitTimeout time.Duration,
+) (http.Handler, *wecom.Adapter, *feishu.Adapter, error) {
 	if store == nil || artifacts == nil {
 		return nil, nil, nil, errors.New("gateway dependencies are required")
+	}
+	if rateLimiter == nil {
+		return nil, nil, nil, errors.New("admission rate limiter is required")
+	}
+	admissionSlots, err := gateway.NewAdmissionConcurrency(admissionConcurrency)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	events, err := postgres.NewExecutionEventJournal(store)
 	if err != nil {
@@ -526,6 +591,8 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 	}
 	admitter := gateway.New(store)
 	admitter.Metrics = store.Metrics()
+	admitter.RateLimiter = rateLimiter
+	admitter.AdmissionConcurrency = admissionSlots
 	queued, err := gateway.NewQueuedRunner(
 		admitter,
 		events,
@@ -533,10 +600,10 @@ func newGatewayHandler(store *postgres.Store, artifacts *artifactcos.Resolver) (
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	openAIHandler, err := ingress.NewOpenAIHandler(auth.HTTPAPIKeyResolver{
+	openAIHandler, err := ingress.NewOpenAIHandlerWithOptions(auth.HTTPAPIKeyResolver{
 		Credentials: store,
 		Directory:   store,
-	}, queued)
+	}, queued, ingress.WithDurableEventWaitTimeout(durableEventWaitTimeout))
 	if err != nil {
 		return nil, nil, nil, err
 	}

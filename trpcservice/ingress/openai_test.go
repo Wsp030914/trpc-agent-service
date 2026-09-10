@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
@@ -262,6 +264,8 @@ func TestOpenAIHandlerMapsAdmissionErrors(t *testing.T) {
 	}{
 		{name: "revoked credential", err: auth.ErrCredentialInactive, code: http.StatusForbidden},
 		{name: "idempotency conflict", err: gateway.ErrIdempotencyConflict, code: http.StatusConflict},
+		{name: "shared rate limit", err: &gateway.AdmissionRateLimitError{RetryAfter: 2 * time.Second}, code: http.StatusTooManyRequests},
+		{name: "local admission concurrency", err: gateway.ErrAdmissionConcurrencyLimit, code: http.StatusTooManyRequests},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -275,6 +279,98 @@ func TestOpenAIHandlerMapsAdmissionErrors(t *testing.T) {
 				t.Fatalf("response status = %d, want %d", response.Code, tt.code)
 			}
 		})
+	}
+}
+
+func TestOpenAIHandlerTimeoutCancelsOnlyDurableEventWait(t *testing.T) {
+	credentials := &recordingCredentialStore{credential: auth.Credential{
+		ID: "credential-1", TenantID: "tenant-a", AppID: "support", Status: auth.CredentialActive,
+	}}
+	directory := testDirectory{
+		tenant: tenant.Tenant{ID: "tenant-a", Name: "Tenant A", Status: tenant.StatusActive},
+		app:    tenant.AgentApp{TenantID: "tenant-a", AppID: "support", Name: "Support", ActiveConfigVersion: "v1", Status: tenant.StatusActive},
+	}
+	admitter := &recordingAdmitter{}
+	source := &recordingEventSource{block: true}
+	queued, err := gateway.NewQueuedRunner(gateway.New(admitter), source)
+	if err != nil {
+		t.Fatalf("new queued runner: %v", err)
+	}
+	handler, err := NewOpenAIHandlerWithOptions(
+		auth.HTTPAPIKeyResolver{Credentials: credentials, Directory: directory},
+		queued,
+		WithDurableEventWaitTimeout(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("new OpenAI handler: %v", err)
+	}
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	request := validOpenAIRequest().WithContext(parent)
+	response := httptest.NewRecorder()
+	started := time.Now()
+	handler.ServeHTTP(response, request)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("HTTP durable wait exceeded timeout bound: %s", elapsed)
+	}
+	if !admitter.called {
+		t.Fatalf("request was not durably admitted before event wait: status=%d body=%q credentials=%t", response.Code, response.Body.String(), credentials.called)
+	}
+	if admitter.ctx == nil {
+		t.Fatal("admission context was not captured")
+	}
+	if admitter.ctx.Err() != nil {
+		t.Fatalf("admission context was canceled by HTTP wait timeout: %v", admitter.ctx.Err())
+	}
+}
+
+func TestOpenAIHandlerBoundsActiveStreamingAndReleasesOnDisconnect(t *testing.T) {
+	handler, admitter, source, _ := newTestOpenAIHandlerWithOptions(t,
+		WithActiveStreamingLimit(1),
+		WithDurableEventWaitTimeout(5*time.Second),
+	)
+	source.block = true
+	source.started = make(chan struct{})
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	first := validOpenAIStreamRequest().WithContext(parent)
+	firstDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(httptest.NewRecorder(), first)
+		close(firstDone)
+	}()
+	select {
+	case <-source.started:
+	case <-time.After(time.Second):
+		t.Fatal("first stream did not enter durable event wait")
+	}
+
+	second := validOpenAIStreamRequest()
+	second.Header.Set(headerRequestID, "request-2")
+	second.Header.Set(headerIdempotencyKey, "idempotency-2")
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, second)
+	if secondResponse.Code != http.StatusTooManyRequests {
+		t.Fatalf("second stream status = %d, want %d", secondResponse.Code, http.StatusTooManyRequests)
+	}
+	if admitter.request.RequestID != "request-1" {
+		t.Fatalf("stream limit request reached admission: %#v", admitter.request)
+	}
+
+	cancelParent()
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first stream did not exit after client disconnect")
+	}
+	source.block = false
+	third := validOpenAIStreamRequest()
+	third.Header.Set(headerRequestID, "request-3")
+	third.Header.Set(headerIdempotencyKey, "idempotency-3")
+	thirdResponse := httptest.NewRecorder()
+	handler.ServeHTTP(thirdResponse, third)
+	if thirdResponse.Code == http.StatusTooManyRequests {
+		t.Fatal("stream slot was not released after disconnect")
 	}
 }
 
@@ -309,7 +405,22 @@ func validOpenAIRequest() *http.Request {
 	return request
 }
 
+func validOpenAIStreamRequest() *http.Request {
+	request := validOpenAIRequest()
+	request.Body = io.NopCloser(strings.NewReader(`{"model":"ignored","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	return request
+}
+
 func newTestOpenAIHandler(t *testing.T) (
+	http.Handler,
+	*recordingAdmitter,
+	*recordingEventSource,
+	*recordingCredentialStore,
+) {
+	return newTestOpenAIHandlerWithOptions(t)
+}
+
+func newTestOpenAIHandlerWithOptions(t *testing.T, opts ...OpenAIHandlerOption) (
 	http.Handler,
 	*recordingAdmitter,
 	*recordingEventSource,
@@ -338,10 +449,10 @@ func newTestOpenAIHandler(t *testing.T) (
 	if err != nil {
 		t.Fatalf("new queued runner: %v", err)
 	}
-	handler, err := NewOpenAIHandler(auth.HTTPAPIKeyResolver{
+	handler, err := NewOpenAIHandlerWithOptions(auth.HTTPAPIKeyResolver{
 		Credentials: credentials,
 		Directory:   directory,
-	}, queued)
+	}, queued, opts...)
 	if err != nil {
 		t.Fatalf("new OpenAI handler: %v", err)
 	}
@@ -377,15 +488,17 @@ func (d testDirectory) ResolveAgentApp(context.Context, string, string) (tenant.
 
 type recordingAdmitter struct {
 	called  bool
+	ctx     context.Context
 	request gateway.AdmissionRequest
 	err     error
 }
 
 func (a *recordingAdmitter) Admit(
-	_ context.Context,
+	ctx context.Context,
 	request gateway.AdmissionRequest,
 ) (gateway.AdmissionResult, error) {
 	a.called = true
+	a.ctx = ctx
 	a.request = request
 	if a.err != nil {
 		return gateway.AdmissionResult{}, a.err
@@ -401,14 +514,24 @@ type recordingEventSource struct {
 	scope     tenant.Scope
 	requestID string
 	events    []gateway.ExecutionEvent
+	block     bool
+	started   chan struct{}
+	startOnce sync.Once
 }
 
 func (s *recordingEventSource) SubscribeExecutionEvents(
-	_ context.Context,
+	ctx context.Context,
 	scope tenant.Scope,
 	requestID string,
 	_ int64,
 ) (<-chan gateway.ExecutionEvent, error) {
+	if s.started != nil {
+		s.startOnce.Do(func() { close(s.started) })
+	}
+	if s.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	s.scope = scope
 	s.requestID = requestID
 	items := s.events

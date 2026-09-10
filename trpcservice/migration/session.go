@@ -211,9 +211,6 @@ func getCompleteSession(
 	if len(value.Events) > 0 {
 		loaded, err := summaries.GetSessionSummaries(ctx, key)
 		if err != nil {
-			if errors.Is(err, ErrSummaryImportRequired) {
-				return value, nil
-			}
 			return nil, fmt.Errorf("read session summaries: %w", err)
 		}
 		value.Summaries = loaded

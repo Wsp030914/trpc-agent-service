@@ -487,6 +487,23 @@ func (s *Store) AdvanceDataMigration(ctx context.Context, record migration.Recor
 	}
 	defer func() { rollback(tx) }()
 	if next == migration.StatusSucceeded {
+		var totalSessions, copyProgress, verifyProgress int64
+		if err := tx.QueryRow(ctx, `
+SELECT total_sessions, copy_progress, verify_progress
+FROM platform.data_migration
+WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3
+  AND status = $4 AND lease_owner = $5 AND run_token = $6
+  AND lease_until > clock_timestamp()
+FOR UPDATE`, record.ID, record.TenantID, record.AppID, record.Status, record.LeaseOwner, record.RunToken).
+			Scan(&totalSessions, &copyProgress, &verifyProgress); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("validate data migration cutover: %w", migration.ErrLeaseLost)
+			}
+			return fmt.Errorf("validate data migration cutover: %w", err)
+		}
+		if err := validateMigrationCutoverProgress(totalSessions, copyProgress, verifyProgress); err != nil {
+			return err
+		}
 		app, err := lockAgentApp(ctx, tx, record.TenantID, record.AppID)
 		if err != nil {
 			return err
@@ -494,8 +511,16 @@ func (s *Store) AdvanceDataMigration(ctx context.Context, record migration.Recor
 		if app.ActiveConfigVersion != record.SourceConfigVersion {
 			return errors.New("data migration source config is no longer active")
 		}
-		if _, err := resolveAppConfigFrom(ctx, tx, record.TenantID, record.AppID, record.TargetConfigVersion); err != nil {
-			return err
+		source, err := resolveAppConfigFrom(ctx, tx, record.TenantID, record.AppID, record.SourceConfigVersion)
+		if err != nil {
+			return fmt.Errorf("resolve data migration source config: %w", err)
+		}
+		target, err := resolveAppConfigFrom(ctx, tx, record.TenantID, record.AppID, record.TargetConfigVersion)
+		if err != nil {
+			return fmt.Errorf("resolve data migration target config: %w", err)
+		}
+		if err := validateMigrationCutoverConfig(record, source, target); err != nil {
+			return fmt.Errorf("validate data migration cutover config: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE platform.agent_app
 SET active_config_version = $3, updated_at = clock_timestamp()
@@ -546,6 +571,16 @@ WHERE migration_id = $1 AND tenant_id = $2 AND app_id = $3
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit data migration transition: %w", err)
+	}
+	return nil
+}
+
+func validateMigrationCutoverProgress(totalSessions, copyProgress, verifyProgress int64) error {
+	if totalSessions < 0 || copyProgress < 0 || verifyProgress < 0 {
+		return errors.New("data migration checkpoint is invalid")
+	}
+	if copyProgress != totalSessions || verifyProgress != totalSessions {
+		return errors.New("data migration cannot cut over before copy and verification complete")
 	}
 	return nil
 }
@@ -771,15 +806,34 @@ func sameMigrationBehavior(source, target tenant.AppConfig) bool {
 		source.AppID == target.AppID &&
 		reflect.DeepEqual(source.Model, target.Model) &&
 		reflect.DeepEqual(source.Tools, target.Tools) &&
+		reflect.DeepEqual(source.IMAccess, target.IMAccess) &&
+		reflect.DeepEqual(source.Budget, target.Budget) &&
+		reflect.DeepEqual(source.Audit, target.Audit) &&
 		reflect.DeepEqual(source.KnowledgeBaseIDs, target.KnowledgeBaseIDs) &&
 		reflect.DeepEqual(source.SecretRefs, target.SecretRefs) &&
 		reflect.DeepEqual(source.ChannelBinding, target.ChannelBinding)
 }
 
+func validateMigrationCutoverConfig(record migration.Record, source, target tenant.AppConfig) error {
+	if !sameMigrationBehavior(source, target) {
+		return errors.New("data migration target changes behavior outside backend_config")
+	}
+	switch record.EffectiveDomain() {
+	case migration.DomainSession:
+		return validateSupportedDataMigration(source.BackendConfig, target.BackendConfig)
+	case migration.DomainKnowledge:
+		return validateSupportedKnowledgeMigration(source.BackendConfig, target.BackendConfig)
+	default:
+		return errors.New("data migration domain is invalid")
+	}
+}
+
 // validateSupportedDataMigration rejects backend transitions that the worker
 // cannot copy without silently leaving one authoritative backend behind.
 func validateSupportedDataMigration(source, target tenant.BackendConfig) error {
-	if !sameBackendRef(source.Memory, target.Memory) || !sameBackendRef(source.Artifact, target.Artifact) {
+	if !sameBackendRef(source.Memory, target.Memory) ||
+		!sameBackendRef(source.Knowledge, target.Knowledge) ||
+		!sameBackendRef(source.Artifact, target.Artifact) {
 		return errors.New("data migration only supports session backend changes")
 	}
 	if source.Session.Kind != tenant.BackendRedis || source.Session.Provider != "redis" {

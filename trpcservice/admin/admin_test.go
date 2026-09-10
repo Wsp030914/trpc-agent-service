@@ -80,6 +80,29 @@ func TestAPIProvisionLongConnectionBindingDoesNotCreatePublicRoute(t *testing.T)
 	}
 }
 
+func TestAPIRejectsWeChatCustomerBindingWithoutIngress(t *testing.T) {
+	binding := testBinding()
+	binding.Channel = channels.ChannelWeChatCustomer
+	binding.PublicRouteID = ""
+	binding.BindingRevision = 0
+	if _, err := (admin.API{Repository: &recordingRepository{}}).ProvisionChannelBinding(context.Background(), binding); !errors.Is(err, channels.ErrChannelNotProvisionable) {
+		t.Fatalf("provision wechat customer binding error = %v, want no-ingress error", err)
+	}
+}
+
+func TestAPIRejectsActivatingLegacyWeChatCustomerBinding(t *testing.T) {
+	repository := &recordingRepository{binding: testBinding()}
+	repository.binding.Channel = channels.ChannelWeChatCustomer
+	repository.binding.Status = channels.BindingSuspended
+	_, err := (admin.API{Repository: repository}).SetChannelBindingStatus(
+		context.Background(), tenant.Scope{TenantID: repository.binding.TenantID, AppID: repository.binding.AppID},
+		repository.binding.BindingID, channels.BindingActive,
+	)
+	if !errors.Is(err, channels.ErrChannelNotProvisionable) {
+		t.Fatalf("activate legacy wechat customer binding error = %v, want no-ingress error", err)
+	}
+}
+
 func TestAPIIssueCredentialRejectsExpiredCredential(t *testing.T) {
 	api := admin.API{Repository: &recordingRepository{}}
 	_, err := api.IssueCredential(
@@ -181,6 +204,17 @@ func (r *recordingRepository) CreateAgentApp(
 func (r *recordingRepository) CreateChannelBinding(_ context.Context, binding channels.Binding) error {
 	r.binding = binding
 	return nil
+}
+
+func (r *recordingRepository) SetChannelBindingStatus(
+	_ context.Context,
+	_ string,
+	_ string,
+	_ string,
+	status channels.BindingStatus,
+) (channels.Binding, error) {
+	r.binding.Status = status
+	return r.binding, nil
 }
 
 func (r *recordingRepository) ResolveBinding(

@@ -93,6 +93,35 @@ func TestCopySessionRequiresSummaryImporter(t *testing.T) {
 	}
 }
 
+func TestCopySessionDoesNotIgnoreUnavailableSummaries(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	sourceBase := inmemory.NewSessionService()
+	target := inmemory.NewSessionService()
+	t.Cleanup(func() { _ = sourceBase.Close() })
+	t.Cleanup(func() { _ = target.Close() })
+	key := session.Key{AppName: "tenant:tenant-a:app:support:runner", UserID: "user-a", SessionID: "session-summary-error"}
+	sourceSession := session.NewSession(key.AppName, key.UserID, key.SessionID,
+		session.WithSessionEvents([]event.Event{{
+			ID:       "event-1",
+			Response: &model.Response{Choices: []model.Choice{{Message: model.NewUserMessage("history")}}},
+		}}),
+	)
+	source := summarySessionService{
+		Service:    sourceBase,
+		value:      sourceSession,
+		summaryErr: migration.ErrSummaryImportRequired,
+	}
+
+	err := (migration.RedisPostgresCopier{Source: source, Target: target}).CopySession(ctx, key)
+	if !errors.Is(err, migration.ErrSummaryImportRequired) {
+		t.Fatalf("copy session error = %v, want summary import error", err)
+	}
+	if value, getErr := target.GetSession(ctx, key, session.WithEventNum(math.MaxInt)); getErr != nil || value != nil {
+		t.Fatalf("target after summary error = %#v, %v; want no committed target", value, getErr)
+	}
+}
+
 func TestCopyZeroEventSessionUsesExplicitSummarySource(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -231,7 +260,8 @@ type summaryImportSpy struct {
 
 type summarySessionService struct {
 	session.Service
-	value *session.Session
+	value      *session.Session
+	summaryErr error
 }
 
 type explicitSummarySource struct {
@@ -277,6 +307,13 @@ func (s summarySessionService) GetSession(
 	_ ...session.Option,
 ) (*session.Session, error) {
 	return s.value.Clone(), nil
+}
+
+func (s summarySessionService) GetSessionSummaries(
+	context.Context,
+	session.Key,
+) (map[string]*session.Summary, error) {
+	return nil, s.summaryErr
 }
 
 func (s *summaryImportSpy) ReplaceSessionSummaries(

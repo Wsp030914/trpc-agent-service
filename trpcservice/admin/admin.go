@@ -82,6 +82,10 @@ type channelStatusRepository interface {
 	SetChannelBindingStatus(context.Context, string, string, string, channels.BindingStatus) (channels.Binding, error)
 }
 
+type channelBindingReader interface {
+	ResolveBinding(context.Context, string, string, string) (channels.Binding, error)
+}
+
 type inputError struct {
 	cause error
 }
@@ -102,9 +106,8 @@ func invalidInput(err error) error {
 }
 
 // ProvisionChannelBinding is the canonical channel binding creation path. It
-// generates a public route only for the remaining HTTP channel and sets the
-// initial revision before persisting the tenant-owned binding. Callers must
-// not provide either generated field.
+// sets the initial revision before persisting a binding with a running
+// adapter. Callers must not provide generated fields.
 func (a API) ProvisionChannelBinding(
 	ctx context.Context,
 	binding channels.Binding,
@@ -145,6 +148,17 @@ func (a API) SetChannelBindingStatus(
 	if !ok {
 		return channels.Binding{}, errors.New("admin repository does not support channel status")
 	}
+	if status == channels.BindingActive {
+		if reader, ok := repository.(channelBindingReader); ok {
+			binding, resolveErr := reader.ResolveBinding(ctx, scope.TenantID, scope.AppID, bindingID)
+			if resolveErr != nil {
+				return channels.Binding{}, fmt.Errorf("resolve channel binding: %w", resolveErr)
+			}
+			if err := binding.Channel.ValidateProvisionable(); err != nil {
+				return channels.Binding{}, invalidInput(err)
+			}
+		}
+	}
 	value, err := statusRepository.SetChannelBindingStatus(ctx, scope.TenantID, scope.AppID, bindingID, status)
 	if err != nil {
 		return channels.Binding{}, fmt.Errorf("set channel binding status: %w", err)
@@ -163,12 +177,8 @@ func prepareChannelBinding(binding channels.Binding) (channels.Binding, error) {
 			cause: errors.New("binding_revision must be omitted when creating a channel binding"),
 		}
 	}
-	if binding.Channel == channels.ChannelWeChatCustomer {
-		publicRouteID, err := channels.NewPublicRouteID()
-		if err != nil {
-			return channels.Binding{}, err
-		}
-		binding.PublicRouteID = publicRouteID
+	if err := binding.Channel.ValidateProvisionable(); err != nil {
+		return channels.Binding{}, &inputError{cause: err}
 	}
 	binding.BindingRevision = 1
 	if err := binding.Validate(); err != nil {

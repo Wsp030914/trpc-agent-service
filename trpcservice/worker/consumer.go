@@ -22,6 +22,7 @@ const (
 	consumerCompletionTimeout    = 5 * time.Second
 	consumerRetryInitial         = 250 * time.Millisecond
 	consumerRetryMax             = 30 * time.Second
+	consumerAckMaxAttempts       = 5
 )
 
 // JobExecutor executes one durable execution claimed by a Consumer.
@@ -255,11 +256,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 				if ackErr := c.ackDelivery(runContext, delivery); ackErr != nil && runContext.Err() == nil {
 					log.Printf("ack execution %s failed: %s", claim.Job.RequestID(), platformlog.SafeError(ackErr))
 				}
-			} else if releaser, ok := c.stream.(interface{ Release(queue.Delivery) }); ok {
+			} else {
 				// Keep the Redis delivery pending when its durable transition was
 				// not completed, but allow this process to reclaim it after the
 				// local execution attempt has ended.
-				releaser.Release(delivery)
+				c.stream.Release(delivery)
 			}
 		}(deliveryCtx, claim, delivery)
 	}
@@ -298,18 +299,32 @@ func (c *Consumer) claimExecution(ctx context.Context, dispatch queue.Dispatch) 
 }
 
 func (c *Consumer) ackDelivery(ctx context.Context, delivery queue.Delivery) error {
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt < consumerAckMaxAttempts; attempt++ {
 		if err := c.stream.Ack(ctx, delivery); err == nil {
 			return nil
 		} else if ctx.Err() != nil {
+			c.releaseDelivery(delivery)
 			return ctx.Err()
 		} else {
+			c.releaseDelivery(delivery)
 			log.Printf("ack dispatch %s failed: %s", delivery.ID, platformlog.SafeError(err))
+			if attempt == consumerAckMaxAttempts-1 {
+				return fmt.Errorf("ack dispatch %s failed after %d attempts: %w", delivery.ID, consumerAckMaxAttempts, err)
+			}
 		}
 		if err := waitForConsumerRetry(ctx, c.backoff(attempt)); err != nil {
 			return err
 		}
 	}
+	return errors.New("ack dispatch retry limit reached")
+}
+
+func (c *Consumer) releaseDelivery(delivery queue.Delivery) {
+	// XACK failure leaves the Redis entry pending. Drop only this process's
+	// ownership marker so XAUTOCLAIM can hand it to a live consumer instead
+	// of permanently skipping it until process restart. Releasing before the
+	// bounded-backoff retry is safe because the durable transition is idempotent.
+	c.stream.Release(delivery)
 }
 
 func (c *Consumer) deadDelivery(ctx context.Context, delivery queue.Delivery, cause error) error {

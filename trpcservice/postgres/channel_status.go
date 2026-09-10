@@ -37,6 +37,11 @@ func (s *Store) SetChannelBindingStatus(
 	if err != nil {
 		return channels.Binding{}, err
 	}
+	if status == channels.BindingActive {
+		if err := binding.Channel.ValidateProvisionable(); err != nil {
+			return channels.Binding{}, err
+		}
+	}
 	if binding.Status == status {
 		if err := tx.Commit(ctx); err != nil {
 			return channels.Binding{}, fmt.Errorf("commit unchanged channel binding status: %w", err)

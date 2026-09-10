@@ -59,8 +59,17 @@ func newBudgetCallbacks(policy tenant.BudgetPolicy) *model.Callbacks {
 		// Preserve the model/provider failure. A failed call without usage is
 		// not the same as a successful call whose usage cannot be trusted.
 		if args != nil && (args.Error != nil || (args.Response != nil && args.Response.Error != nil)) {
+			total, metered := modelResponseUsage(args)
 			budget.mu.Lock()
 			budget.reserved = 0
+			if metered {
+				budget.used += total
+			} else {
+				// A failed model call without trusted usage is still an unknown
+				// spend. Keep the execution fail-closed so a retry cannot create
+				// unbounded unmetered model calls.
+				budget.unmetered = true
+			}
 			budget.mu.Unlock()
 			return nil, nil
 		}

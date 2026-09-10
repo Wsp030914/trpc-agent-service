@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
@@ -55,7 +56,65 @@ var (
 	// reference. It is distinct from admission backend failures so protocol
 	// adapters can return a client error instead of a server error.
 	ErrInvalidArtifactRef = errors.New("invalid artifact ref")
+	// ErrAdmissionRateLimited means the shared admission rate has been
+	// exhausted. It is intentionally separate from backend availability so
+	// transports can return a retryable overload response.
+	ErrAdmissionRateLimited = errors.New("admission rate limit exceeded")
+	// ErrAdmissionConcurrencyLimit means this Gateway instance has no local
+	// admission slot available. The slot covers only the admission path and
+	// is released after the durable admission call returns.
+	ErrAdmissionConcurrencyLimit = errors.New("admission concurrency limit exceeded")
 )
+
+// AdmissionRateLimitError carries the retry delay returned by the shared
+// limiter without exposing its implementation to protocol adapters.
+type AdmissionRateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *AdmissionRateLimitError) Error() string {
+	if e == nil || e.RetryAfter <= 0 {
+		return ErrAdmissionRateLimited.Error()
+	}
+	return fmt.Sprintf("%s; retry after %s", ErrAdmissionRateLimited, e.RetryAfter)
+}
+
+func (e *AdmissionRateLimitError) Unwrap() error { return ErrAdmissionRateLimited }
+
+// AdmissionRateLimiter is the shared ingress admission budget. Production
+// implementations use Redis so separate Gateway nodes consume one budget.
+type AdmissionRateLimiter interface {
+	Allow(context.Context, AdmissionIdentity) error
+}
+
+// AdmissionConcurrency bounds work performed by one Gateway process while it
+// is validating, pinning, preparing, and durably admitting a request.
+type AdmissionConcurrency struct {
+	slots chan struct{}
+}
+
+// NewAdmissionConcurrency creates a process-local admission semaphore.
+func NewAdmissionConcurrency(limit int) (*AdmissionConcurrency, error) {
+	if limit <= 0 {
+		return nil, errors.New("admission concurrency limit must be positive")
+	}
+	return &AdmissionConcurrency{slots: make(chan struct{}, limit)}, nil
+}
+
+// Acquire takes one local slot without waiting behind an overloaded request.
+// The returned release function must be called exactly once when the admission
+// path returns.
+func (c *AdmissionConcurrency) Acquire() (func(), error) {
+	if c == nil || c.slots == nil {
+		return func() {}, nil
+	}
+	select {
+	case c.slots <- struct{}{}:
+		return func() { <-c.slots }, nil
+	default:
+		return nil, ErrAdmissionConcurrencyLimit
+	}
+}
 
 // Message is the normalized user input passed from gateway to workers.
 type Message struct {
@@ -401,8 +460,10 @@ type ChannelAttachmentPreparer func(
 
 // Gateway converts trusted requests into atomic admission commands.
 type Gateway struct {
-	admitter Admitter
-	Metrics  *platformmetrics.Recorder
+	admitter             Admitter
+	Metrics              *platformmetrics.Recorder
+	RateLimiter          AdmissionRateLimiter
+	AdmissionConcurrency *AdmissionConcurrency
 }
 
 // New creates a Gateway backed by the authoritative admission store.
@@ -521,6 +582,18 @@ func (g Gateway) handle(
 	}
 	if err := admissionRequest.Validate(); err != nil {
 		return AdmissionResult{}, err
+	}
+	if g.AdmissionConcurrency != nil {
+		release, err := g.AdmissionConcurrency.Acquire()
+		if err != nil {
+			return AdmissionResult{}, err
+		}
+		defer release()
+	}
+	if g.RateLimiter != nil {
+		if err := g.RateLimiter.Allow(admitCtx, identity); err != nil {
+			return AdmissionResult{}, err
+		}
 	}
 	if channelInput != nil {
 		defer func() {

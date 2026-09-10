@@ -77,6 +77,20 @@ func TestBindingValidateAllowsLongConnectionWithoutPublicRoute(t *testing.T) {
 	}
 }
 
+func TestChannelValidateProvisionableRejectsMissingIngress(t *testing.T) {
+	if err := channels.ChannelWeChatCustomer.Validate(); err != nil {
+		t.Fatalf("legacy channel should remain readable: %v", err)
+	}
+	if err := channels.ChannelWeChatCustomer.ValidateProvisionable(); err == nil {
+		t.Fatal("channel without an ingress was accepted for provisioning")
+	}
+	for _, channel := range []channels.Channel{channels.ChannelWeCom, channels.ChannelFeishu} {
+		if err := channel.ValidateProvisionable(); err != nil {
+			t.Fatalf("provisionable channel %s was rejected: %v", channel, err)
+		}
+	}
+}
+
 func TestNewPublicRouteIDIsURLSafeAndUnpredictable(t *testing.T) {
 	first, err := channels.NewPublicRouteID()
 	if err != nil {

@@ -24,11 +24,14 @@ const (
 	defaultWebSocketReconnectMax     = 30 * time.Second
 	defaultWebSocketHeartbeat        = 30 * time.Second
 	defaultWebSocketAckTimeout       = 10 * time.Second
+	defaultWebSocketHandlerQueueSize = 64
+	defaultWebSocketHandlerWorkers   = 2
 )
 
 var (
-	errWebSocketAlreadyStarted = errors.New("wecom websocket client is already started")
-	errWebSocketClosed         = errors.New("wecom websocket client is closed")
+	errWebSocketAlreadyStarted   = errors.New("wecom websocket client is already started")
+	errWebSocketClosed           = errors.New("wecom websocket client is closed")
+	errWebSocketHandlerQueueFull = errors.New("wecom inbound handler queue is full")
 )
 
 // MessageHandler receives an authenticated message frame from WeCom.
@@ -46,6 +49,7 @@ type clientConfig struct {
 	ackTimeout       time.Duration
 	handler          MessageHandler
 	onError          func(error)
+	handlerQueueSize int
 }
 
 // WithWebSocketURL is intended for a protocol-compatible test endpoint. The
@@ -91,6 +95,19 @@ func WithMessageHandler(handler MessageHandler) ClientOption {
 	}
 }
 
+// WithMessageQueueSize bounds authenticated callbacks waiting for the
+// adapter. The read loop never performs provider media downloads or durable
+// admission itself.
+func WithMessageQueueSize(size int) ClientOption {
+	return func(config *clientConfig) error {
+		if size <= 0 {
+			return errors.New("wecom message queue size must be positive")
+		}
+		config.handlerQueueSize = size
+		return nil
+	}
+}
+
 // WithOnError receives non-fatal handler errors. Provider payloads are not
 // included in the error text by this package.
 func WithOnError(handler func(error)) ClientOption {
@@ -119,6 +136,14 @@ type WebSocketClient struct {
 	runCancel     context.CancelFunc
 	pending       map[string]chan requestResult
 	writeMu       sync.Mutex
+	messageQueue  chan queuedMessage
+}
+
+type queuedMessage struct {
+	ctx     context.Context
+	message Message
+	cmd     string
+	body    []byte
 }
 
 type requestResult struct {
@@ -158,6 +183,7 @@ func NewClient(botID, botSecret string, opts ...ClientOption) (*WebSocketClient,
 		reconnectMax:     defaultWebSocketReconnectMax,
 		heartbeat:        defaultWebSocketHeartbeat,
 		ackTimeout:       defaultWebSocketAckTimeout,
+		handlerQueueSize: defaultWebSocketHandlerQueueSize,
 	}
 	for _, opt := range opts {
 		if opt == nil {
@@ -168,11 +194,12 @@ func NewClient(botID, botSecret string, opts ...ClientOption) (*WebSocketClient,
 		}
 	}
 	return &WebSocketClient{
-		botID:     botID,
-		botSecret: botSecret,
-		config:    config,
-		done:      make(chan struct{}),
-		pending:   make(map[string]chan requestResult),
+		botID:        botID,
+		botSecret:    botSecret,
+		config:       config,
+		done:         make(chan struct{}),
+		pending:      make(map[string]chan requestResult),
+		messageQueue: make(chan queuedMessage, config.handlerQueueSize),
 	}, nil
 }
 
@@ -198,11 +225,14 @@ func (c *WebSocketClient) Run(ctx context.Context) error {
 	c.startMu.Unlock()
 
 	runCtx, cancel := context.WithCancel(ctx)
+	handlerDone := make(chan struct{})
+	go c.dispatchMessages(runCtx, handlerDone)
 	c.stateMu.Lock()
 	c.runCancel = cancel
 	c.stateMu.Unlock()
 	defer func() {
 		cancel()
+		<-handlerDone
 		c.clearConnection(nil)
 		c.failPending(errWebSocketClosed)
 		c.stateMu.Lock()
@@ -297,10 +327,49 @@ func (c *WebSocketClient) runConnection(ctx context.Context, conn *websocket.Con
 			message.MessageType = "event"
 		}
 		if c.config.handler != nil {
-			if err := c.config.handler(ctx, message); err != nil && c.config.onError != nil {
-				c.config.onError(fmt.Errorf("%w (wecom frame shape: %s)", err, safeMessageShape(frame.Cmd, frame.Body)))
+			if err := c.enqueueMessage(queuedMessage{
+				ctx: ctx, message: message, cmd: frame.Cmd, body: append([]byte(nil), frame.Body...),
+			}); err != nil {
+				return err
 			}
 		}
+	}
+}
+
+func (c *WebSocketClient) dispatchMessages(ctx context.Context, done chan<- struct{}) {
+	defer close(done)
+	var workers sync.WaitGroup
+	workers.Add(defaultWebSocketHandlerWorkers)
+	for range defaultWebSocketHandlerWorkers {
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case item := <-c.messageQueue:
+					if c.config.handler == nil {
+						continue
+					}
+					if err := c.config.handler(item.ctx, item.message); err != nil && c.config.onError != nil {
+						c.config.onError(fmt.Errorf("%w (wecom frame shape: %s)", err, safeMessageShape(item.cmd, item.body)))
+					}
+				}
+			}
+		}()
+	}
+	workers.Wait()
+}
+
+func (c *WebSocketClient) enqueueMessage(item queuedMessage) error {
+	select {
+	case c.messageQueue <- item:
+		return nil
+	default:
+		if c.config.onError != nil {
+			c.config.onError(fmt.Errorf("wecom inbound handler queue is full (wecom frame shape: %s)", safeMessageShape(item.cmd, item.body)))
+		}
+		return errWebSocketHandlerQueueFull
 	}
 }
 

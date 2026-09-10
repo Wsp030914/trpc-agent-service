@@ -432,6 +432,9 @@ func (s *Store) CreateChannelBinding(ctx context.Context, binding channels.Bindi
 	if err := binding.Validate(); err != nil {
 		return fmt.Errorf("channel binding: %w", err)
 	}
+	if err := binding.Channel.ValidateProvisionable(); err != nil {
+		return err
+	}
 	secret, err := marshalBindingSecretRef(binding)
 	if err != nil {
 		return err

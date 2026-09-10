@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
@@ -26,24 +28,57 @@ const (
 	maxOpenAIRequestBytes  = 1 << 20
 	maxOpenAIIdentityBytes = 256
 
-	headerRequestID        = "X-Request-ID"
-	headerIdempotencyKey   = "Idempotency-Key"
-	headerSessionID        = "X-Session-ID"
-	headerUserID           = "X-User-ID"
-	headerSessionPrincipal = "X-Session-Principal-ID"
-	headerTraceID          = "X-Trace-ID"
-	retryAfterSeconds      = "60"
-	openAIChatPath         = "/v1/chat/completions"
+	headerRequestID                = "X-Request-ID"
+	headerIdempotencyKey           = "Idempotency-Key"
+	headerSessionID                = "X-Session-ID"
+	headerUserID                   = "X-User-ID"
+	headerSessionPrincipal         = "X-Session-Principal-ID"
+	headerTraceID                  = "X-Trace-ID"
+	retryAfterSeconds              = "60"
+	openAIChatPath                 = "/v1/chat/completions"
+	defaultDurableEventWaitTimeout = 2 * time.Minute
+	defaultActiveStreamingLimit    = 64
 )
 
 var errInvalidRequestIdentity = errors.New("invalid request identity")
 var errOpenAIExecutionFailed = errors.New("execution failed")
+var errActiveStreamingLimit = errors.New("active streaming limit exceeded")
 
 type openAIStreamStateKey struct{}
 type openAIStreamRequestKey struct{}
 
 type openAIStreamState struct {
 	terminal atomic.Bool
+}
+
+// OpenAIHandlerOption configures the HTTP wait boundary after durable
+// admission. It must not be used to cancel the already admitted execution.
+type OpenAIHandlerOption func(*openAIHandler) error
+
+// WithDurableEventWaitTimeout bounds how long HTTP waits for persisted
+// execution events after admission. A disconnected/expired HTTP request does
+// not remove the durable execution from the dispatch queue.
+func WithDurableEventWaitTimeout(timeout time.Duration) OpenAIHandlerOption {
+	return func(handler *openAIHandler) error {
+		if timeout <= 0 {
+			return errors.New("durable event wait timeout must be positive")
+		}
+		handler.durableEventWaitTimeout = timeout
+		return nil
+	}
+}
+
+// WithActiveStreamingLimit bounds active streaming HTTP lifecycles in one
+// Gateway process. It is intentionally separate from durable admission: a
+// rejected stream must not consume an admission slot.
+func WithActiveStreamingLimit(limit int) OpenAIHandlerOption {
+	return func(handler *openAIHandler) error {
+		if limit <= 0 {
+			return errors.New("active streaming limit must be positive")
+		}
+		handler.activeStreamingSlots = make(chan struct{}, limit)
+		return nil
+	}
 }
 
 // NewOpenAIHandler creates the OpenAI-compatible endpoint at
@@ -56,6 +91,16 @@ type openAIStreamState struct {
 // text message and no client-declared tools or conversation history because
 // the durable backend owns those concerns.
 func NewOpenAIHandler(authenticator auth.HTTPAPIKeyResolver, queued *gateway.QueuedRunner) (http.Handler, error) {
+	return NewOpenAIHandlerWithOptions(authenticator, queued)
+}
+
+// NewOpenAIHandlerWithOptions creates the OpenAI-compatible handler with
+// explicit HTTP wait-boundary options.
+func NewOpenAIHandlerWithOptions(
+	authenticator auth.HTTPAPIKeyResolver,
+	queued *gateway.QueuedRunner,
+	opts ...OpenAIHandlerOption,
+) (http.Handler, error) {
 	if authenticator.Credentials == nil {
 		return nil, errors.New("credential store is required")
 	}
@@ -69,13 +114,30 @@ func NewOpenAIHandler(authenticator auth.HTTPAPIKeyResolver, queued *gateway.Que
 	if err != nil {
 		return nil, err
 	}
-	return openAIHandler{authenticator: authenticator, queued: queued, next: server.Handler()}, nil
+	handler := openAIHandler{
+		authenticator:           authenticator,
+		queued:                  queued,
+		next:                    server.Handler(),
+		durableEventWaitTimeout: defaultDurableEventWaitTimeout,
+		activeStreamingSlots:    make(chan struct{}, defaultActiveStreamingLimit),
+	}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		if err := opt(&handler); err != nil {
+			return nil, err
+		}
+	}
+	return handler, nil
 }
 
 type openAIHandler struct {
-	authenticator auth.HTTPAPIKeyResolver
-	queued        *gateway.QueuedRunner
-	next          http.Handler
+	authenticator           auth.HTTPAPIKeyResolver
+	queued                  *gateway.QueuedRunner
+	next                    http.Handler
+	durableEventWaitTimeout time.Duration
+	activeStreamingSlots    chan struct{}
 }
 
 func (h openAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -110,15 +172,43 @@ func (h openAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAuthenticationError(w, err)
 		return
 	}
+	if stream {
+		release, err := h.acquireStreaming(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			writeAdmissionError(w, err)
+			return
+		}
+		defer release()
+	}
 	ctx, err = h.queued.Admit(ctx, gateway.Message{Text: message})
 	if err != nil {
 		writeAdmissionError(w, err)
 		return
 	}
+	waitCtx, cancelWait := context.WithTimeout(ctx, h.durableEventWaitTimeout)
+	defer cancelWait()
+	ctx = waitCtx
 	state := &openAIStreamState{}
 	ctx = context.WithValue(ctx, openAIStreamStateKey{}, state)
 	ctx = context.WithValue(ctx, openAIStreamRequestKey{}, stream)
 	h.next.ServeHTTP(&openAIResponseWriter{ResponseWriter: w, state: state}, r.WithContext(ctx))
+}
+
+func (h openAIHandler) acquireStreaming(ctx context.Context) (func(), error) {
+	if h.activeStreamingSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case h.activeStreamingSlots <- struct{}{}:
+		return func() { <-h.activeStreamingSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		return nil, errActiveStreamingLimit
+	}
 }
 
 type queuedOpenAIRequest struct {
@@ -434,6 +524,15 @@ func writeAdmissionError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, gateway.ErrInvalidArtifactRef):
 		http.Error(w, "invalid artifact reference", http.StatusBadRequest)
+	case errors.Is(err, gateway.ErrAdmissionRateLimited):
+		w.Header().Set("Retry-After", admissionRetryAfter(err))
+		http.Error(w, "request admission rate limited", http.StatusTooManyRequests)
+	case errors.Is(err, gateway.ErrAdmissionConcurrencyLimit):
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "request admission is busy", http.StatusTooManyRequests)
+	case errors.Is(err, errActiveStreamingLimit):
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "active streaming limit reached", http.StatusTooManyRequests)
 	case errors.Is(err, gateway.ErrAdmissionDraining):
 		w.Header().Set("Retry-After", retryAfterSeconds)
 		http.Error(w, "request admission is draining", http.StatusServiceUnavailable)
@@ -447,4 +546,16 @@ func writeAdmissionError(w http.ResponseWriter, err error) {
 	default:
 		http.Error(w, "request admission unavailable", http.StatusServiceUnavailable)
 	}
+}
+
+func admissionRetryAfter(err error) string {
+	var rateErr *gateway.AdmissionRateLimitError
+	if !errors.As(err, &rateErr) || rateErr == nil || rateErr.RetryAfter <= 0 {
+		return "1"
+	}
+	seconds := int64((rateErr.RetryAfter + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return strconv.FormatInt(seconds, 10)
 }
