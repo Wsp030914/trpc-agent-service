@@ -77,10 +77,11 @@ func (s *tracedSessionService) finish(
 		errorType = "session"
 	}
 	s.metrics.RecordSession(ctx, platformmetrics.Labels{
-		TenantID: s.exec.Tenant.TenantID,
-		AppID:    s.exec.Tenant.AppID,
-		Channel:  s.exec.Tenant.Channel,
-		Provider: s.exec.Config.BackendConfig.Session.Provider,
+		TenantID:      s.exec.Tenant.TenantID,
+		AppID:         s.exec.Tenant.AppID,
+		ConfigVersion: s.exec.Tenant.ConfigVersion,
+		Channel:       s.exec.Tenant.Channel,
+		Provider:      s.exec.Config.BackendConfig.Session.Provider,
 	}, time.Since(started), errorType)
 }
 
@@ -313,10 +314,11 @@ func (i *tracedSessionIngestor) IngestSession(
 		span.End()
 		if i.metrics != nil {
 			i.metrics.RecordMemoryOperation(opCtx, platformmetrics.Labels{
-				TenantID: i.exec.Tenant.TenantID,
-				AppID:    i.exec.Tenant.AppID,
-				Channel:  i.exec.Tenant.Channel,
-				Provider: i.exec.Config.BackendConfig.Memory.Provider,
+				TenantID:      i.exec.Tenant.TenantID,
+				AppID:         i.exec.Tenant.AppID,
+				ConfigVersion: i.exec.Tenant.ConfigVersion,
+				Channel:       i.exec.Tenant.Channel,
+				Provider:      i.exec.Config.BackendConfig.Memory.Provider,
 			}, "ingest", time.Since(started), errorType)
 		}
 	}()
@@ -352,10 +354,11 @@ func (k *tracedKnowledge) Search(
 		span.End()
 		if k.metrics != nil {
 			k.metrics.RecordKnowledge(opCtx, platformmetrics.Labels{
-				TenantID: k.exec.Tenant.TenantID,
-				AppID:    k.exec.Tenant.AppID,
-				Channel:  k.exec.Tenant.Channel,
-				Provider: k.exec.Config.BackendConfig.Knowledge.Provider,
+				TenantID:      k.exec.Tenant.TenantID,
+				AppID:         k.exec.Tenant.AppID,
+				ConfigVersion: k.exec.Tenant.ConfigVersion,
+				Channel:       k.exec.Tenant.Channel,
+				Provider:      k.exec.Config.BackendConfig.Knowledge.Provider,
 			}, time.Since(started), errorType)
 		}
 	}()

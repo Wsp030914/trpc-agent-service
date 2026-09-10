@@ -327,9 +327,10 @@ func (s *Store) Admit(
 			}
 			if s.metrics != nil {
 				s.metrics.RecordGovernanceRejected(ctx, platformmetrics.Labels{
-					TenantID: admission.runtimeContext.TenantID,
-					AppID:    admission.runtimeContext.AppID,
-					Channel:  admission.runtimeContext.Channel,
+					TenantID:      admission.runtimeContext.TenantID,
+					AppID:         admission.runtimeContext.AppID,
+					ConfigVersion: admission.configVersion,
+					Channel:       admission.runtimeContext.Channel,
 				}, platformaudit.IMAccessDenied)
 			}
 			return gateway.AdmissionResult{
@@ -770,9 +771,10 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 		if errors.Is(err, tenant.ErrQuotaExceeded) {
 			if a.metrics != nil {
 				a.metrics.RecordGovernanceRejected(a.ctx, platformmetrics.Labels{
-					TenantID: a.credential.TenantID,
-					AppID:    a.credential.AppID,
-					Channel:  a.runtimeContext.Channel,
+					TenantID:      a.credential.TenantID,
+					AppID:         a.credential.AppID,
+					ConfigVersion: a.configVersion,
+					Channel:       a.runtimeContext.Channel,
 				}, "quota_exceeded")
 			}
 			return gateway.AdmissionResult{}, fmt.Errorf("%w: %w", gateway.ErrAdmissionQuotaExceeded, err)

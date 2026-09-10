@@ -148,8 +148,9 @@ RETURNING lease_until, attempt`, stored.tenantID, stored.appID, stored.requestID
 			lag = 0
 		}
 		s.metrics.RecordQueueLag(ctx, platformmetrics.Labels{
-			TenantID: stored.tenantID,
-			AppID:    stored.appID,
+			TenantID:      stored.tenantID,
+			AppID:         stored.appID,
+			ConfigVersion: stored.configVersion,
 		}, lag)
 	}
 	return claim, true, nil
@@ -392,9 +393,10 @@ func (s *Store) Retry(ctx context.Context, claim queue.Claim, cause error) error
 	}
 	if retryScheduled && s.metrics != nil {
 		s.metrics.RecordRetry(ctx, platformmetrics.Labels{
-			TenantID: claim.Job.Tenant().TenantID,
-			AppID:    claim.Job.Tenant().AppID,
-			Channel:  claim.Job.Tenant().Channel,
+			TenantID:      claim.Job.Tenant().TenantID,
+			AppID:         claim.Job.Tenant().AppID,
+			ConfigVersion: claim.Job.Tenant().ConfigVersion,
+			Channel:       claim.Job.Tenant().Channel,
 		}, "execution_retry")
 	}
 	return nil

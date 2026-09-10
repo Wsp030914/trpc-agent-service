@@ -236,11 +236,12 @@ func addModelObservabilityCallbacks(
 		}
 		if metrics != nil {
 			metrics.RecordModel(ctx, platformmetrics.Labels{
-				TenantID:  exec.Tenant.TenantID,
-				AppID:     exec.Tenant.AppID,
-				Channel:   exec.Tenant.Channel,
-				Result:    resultForError(errType),
-				ErrorType: errType,
+				TenantID:      exec.Tenant.TenantID,
+				AppID:         exec.Tenant.AppID,
+				ConfigVersion: exec.Tenant.ConfigVersion,
+				Channel:       exec.Tenant.Channel,
+				Result:        resultForError(errType),
+				ErrorType:     errType,
 			}, exec.Config.Model.Provider, exec.Config.Model.Model, time.Since(state.started), inputTokens, outputTokens)
 		}
 		return nil, nil
@@ -323,10 +324,11 @@ func (r *Runtime) toolCallbacks(exec worker.Execution) *frameworktool.Callbacks 
 		}
 		if r.metrics != nil {
 			r.metrics.RecordTool(ctx, platformmetrics.Labels{
-				TenantID: exec.Tenant.TenantID,
-				AppID:    exec.Tenant.AppID,
-				Channel:  exec.Tenant.Channel,
-				Result:   resultForError(errType),
+				TenantID:      exec.Tenant.TenantID,
+				AppID:         exec.Tenant.AppID,
+				ConfigVersion: exec.Tenant.ConfigVersion,
+				Channel:       exec.Tenant.Channel,
+				Result:        resultForError(errType),
 			}, time.Since(started), errType)
 		}
 		if exec.Config.Audit.Enabled && exec.Config.Audit.RecordToolDecisions {

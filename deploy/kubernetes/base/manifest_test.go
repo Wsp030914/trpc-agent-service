@@ -67,3 +67,20 @@ func TestComposePassesSecretBackendConfigurationToAllAppRoles(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkerHPAUsesQueueBacklogBusinessMetric(t *testing.T) {
+	manifest := readManifest(t, "hpa.yaml")
+	workerStart := strings.Index(manifest, "name: trpc-agent-service-worker")
+	if workerStart < 0 {
+		t.Fatal("worker HPA is missing")
+	}
+	worker := manifest[workerStart:]
+	if !strings.Contains(worker, "type: External") ||
+		!strings.Contains(worker, "name: trpc_agent_service_queue_backlog") ||
+		!strings.Contains(worker, "value: \"10\"") {
+		t.Fatal("worker HPA does not contain the queue backlog external metric")
+	}
+	if strings.Contains(manifest[:workerStart], "trpc_agent_service_queue_backlog") {
+		t.Fatal("gateway HPA must not scale on the worker queue backlog metric")
+	}
+}

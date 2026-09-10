@@ -248,25 +248,44 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		result.ApprovalPending, result.ApprovalID = approval.snapshot()
 	}()
 	executionStartedAt := time.Now()
-	if exec.Config.Audit.Enabled {
+	if w.Metrics != nil {
 		defer func() {
-			if !errors.Is(err, tenant.ErrBudgetExceeded) {
-				return
+			pending, _ := approval.snapshot()
+			resultLabel := "success"
+			if pending {
+				resultLabel = "waiting_approval"
+			} else if err != nil {
+				resultLabel = "failure"
 			}
+			w.Metrics.RecordExecution(ctx, platformmetrics.Labels{
+				TenantID:      exec.Tenant.TenantID,
+				AppID:         exec.Tenant.AppID,
+				ConfigVersion: exec.Tenant.ConfigVersion,
+				Channel:       exec.Tenant.Channel,
+				Result:        resultLabel,
+			}, time.Since(executionStartedAt), executionErrorType(err))
+		}()
+	}
+	defer func() {
+		if !errors.Is(err, tenant.ErrBudgetExceeded) {
+			return
+		}
+		if exec.Config.Audit.Enabled {
 			w.recordAudit(ctx, exec, platformaudit.Event{
 				Decision:  "rejected",
 				ErrorType: "budget_exceeded",
 				EventType: platformaudit.BudgetRejected,
 			})
-			if w.Metrics != nil {
-				w.Metrics.RecordGovernanceRejected(ctx, platformmetrics.Labels{
-					TenantID: exec.Tenant.TenantID,
-					AppID:    exec.Tenant.AppID,
-					Channel:  exec.Tenant.Channel,
-				}, platformaudit.BudgetRejected)
-			}
-		}()
-	}
+		}
+		if w.Metrics != nil {
+			w.Metrics.RecordGovernanceRejected(ctx, platformmetrics.Labels{
+				TenantID:      exec.Tenant.TenantID,
+				AppID:         exec.Tenant.AppID,
+				ConfigVersion: exec.Tenant.ConfigVersion,
+				Channel:       exec.Tenant.Channel,
+			}, platformaudit.BudgetRejected)
+		}
+	}()
 	if exec.Config.Audit.Enabled && exec.Config.Audit.RecordExecutions {
 		w.recordAudit(ctx, exec, platformaudit.Event{
 			Decision:  "started",

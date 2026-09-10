@@ -76,7 +76,7 @@ Compose 中 Gateway/Worker 的默认 `stop_grace_period` 是 45s，模型超时�
 - `trpc-agent-service-channel` 单副本 Deployment；没有 Service/HPA，更新策略为 `Recreate`，避免新旧 Pod 同时枚举 active binding。
 - `trpc-agent-service-worker` Deployment 和 ClusterIP Service。
 - Gateway/Worker 默认 replicas=2，RollingUpdate `maxUnavailable=0/maxSurge=1`，termination grace=45s；Channel 默认 replicas=1、`Recreate`。
-- Gateway/Worker 两个 HPA 按 CPU 70% 扩缩，base 为 2–10 副本，缩容稳定窗口 300s；两个 PDB `minAvailable: 1`。Channel 不挂 HPA/PDB，单 owner 是当前明确边界。
+- Gateway/Worker 两个 HPA 默认按 CPU 70% 扩缩，Worker 额外按 `trpc_agent_service_queue_backlog` 外部指标（目标 backlog=10）扩缩；base 为 2–10 副本，缩容稳定窗口 300s。该业务指标需要 Prometheus Adapter 或其它 External Metrics Provider 暴露给 Kubernetes；未部署 provider 时 CPU 指标仍是可用的保底信号。两个 PDB `minAvailable: 1`。Channel 不挂 HPA/PDB，单 owner 是当前明确边界。
 - Gateway/Worker 请求资源均为 500m CPU/512Mi，限制为 2 CPU/2Gi。
 
 环境 overlay 是当前仓库实际提供的三个选择：
@@ -87,7 +87,7 @@ Compose 中 Gateway/Worker 的默认 `stop_grace_period` 是 45s，模型超时�
 | `staging` | Gateway/Worker base replicas 2、HPA max 6；Channel 1 | OTLP/Qdrant example endpoint，需要替换 |
 | `production` | Gateway/Worker 3；HPA 3–20；Channel 1；缩容窗口 600s | Channel 仍 `Recreate`；termination grace 75s；请求 1 CPU/1Gi；限制 4 CPU/4Gi；Worker concurrency 8；shutdown timeout 60s；发布前必须把 fail-closed 占位镜像替换为已发布镜像的 SHA-256 digest |
 
-HPA 只按 CPU；当前没有基于 queue lag 的 Kubernetes custom metric。Worker 扩容能增加 execution claim capacity，但不会并行执行同一 Session；Gateway 扩容能增加 HTTP capacity，且不会启动 IM 长连接。Channel Adapter 保持单 owner；跨 Gateway 不存在重复 binding connection，代价是 Channel rollout/owner 故障期间可能有短暂 IM 接入窗口，见[风险登记](risk-register.md)。
+Worker 的 queue backlog 业务指标来自固定低基数 OTel gauge；Prometheus Adapter 规则应把 `trpc_agent_service_queue_backlog` 映射为 External Metric，并对多个 scrape instance 使用 `max` 聚合（每个实例可能发布同一 PostgreSQL 聚合快照，不能直接 `sum`）。Worker 扩容能增加 execution claim capacity，但不会并行执行同一 Session；Gateway 扩容能增加 HTTP capacity，且不会启动 IM 长连接。Channel Adapter 保持单 owner；跨 Gateway 不存在重复 binding connection，代价是 Channel rollout/owner 故障期间可能有短暂 IM 接入窗口，见[风险登记](risk-register.md)。
 
 ## Probe、readiness 和 graceful shutdown
 
@@ -147,6 +147,39 @@ Kubernetes 将这两项作为 `trpc-agent-service-secrets` 的额外 key 由外�
 
 ## 灰度、回滚和实际边界
 
-应用层灰度由 Admin API 的 ConfigVersion canary 完成：按稳定 Session principal/session hash 分流，支持 pause/disable/rollback/promote。Kubernetes overlay 使用普通 RollingUpdate 和不可变 image digest；代码镜像回滚与 Backend 数据回滚分开处理，target Backend 切换后按数据迁移策略完成 authority 对账。Admin UI 的 Jaeger 链接由构建参数 `VITE_JAEGER_URL` 注入；未配置时只显示 Trace ID，不猜测 `localhost` 地址。
+应用层灰度由 Admin API 的 ConfigVersion canary 完成：按稳定 Session principal/session hash 分流，支持 pause/disable/rollback/promote。现在也提供最小指标驱动入口 `POST /admin/v1/configs/canary/evaluate`：调用方提交候选版本、聚合样本数、错误率、P95 execution latency、budget rejection 数和阈值规则；样本不足只返回 `NONE`，超阈值才按规则触发 `PAUSE` 或 `ROLLBACK`。PostgreSQL 以候选 `ConfigVersion` 做 CAS/行锁校验，旧告警迟到时返回冲突而不会影响新候选；动作写入控制面审计。Prometheus 告警规则见 `deploy/otel/alerts.yml`，告警编排仍是外部运维责任，不引入复杂发布平台。
+
+示例（5 分钟窗口已由 Prometheus/Alertmanager 聚合）：
+
+```json
+{
+  "tenant_id": "tenant-a",
+  "app_id": "support",
+  "version": "v2",
+  "samples": 120,
+  "error_rate": 0.12,
+  "p95_latency_ms": 4200,
+  "budget_rejections": 0,
+  "minimum_samples": 20,
+  "max_error_rate": 0.10,
+  "max_p95_latency_ms": 5000,
+  "max_budget_rejections": 0,
+  "action": "ROLLBACK"
+}
+```
+
+Kubernetes overlay 使用普通 RollingUpdate 和不可变 image digest；代码镜像回滚与 Backend 数据回滚分开处理，target Backend 切换后按数据迁移策略完成 authority 对账。Admin UI 的 Jaeger 链接由构建参数 `VITE_JAEGER_URL` 注入；未配置时只显示 Trace ID，不猜测 `localhost` 地址。
+
+## 生产边界验收清单
+
+以下项目是目标生产环境的验收证据，不由仓库内 Compose 或 Kustomize 渲染结果替代：
+
+- HA PostgreSQL：主库故障切换、连接重建、事务/锁恢复、备份恢复和 RTO/RPO 报告；验证旧 execution 的 pinned ConfigVersion 不变。
+- HA Redis：主从/故障切换或托管服务重启；验证 Stream Outbox、Consumer Group PEL reclaim、Session lease/lock 恢复和重复投递幂等。
+- Ingress：TLS、真实负载均衡、readiness 摘除、超时/请求体限制、Admin 鉴权和 trace/request ID 透传证据。
+- SecretProvider/KMS：SecretRef scope、解密、滚动重启可见性、轮换和旧版本撤销；证据不能包含 secret 原文。
+- HPA business metric：Prometheus Adapter 以 `max` 聚合查询到 `trpc_agent_service_queue_backlog`，backlog 增长触发 Worker 扩容，恢复后按 stabilization window 缩容；保存 HPA Events、metrics API 和 Pod 数变化。
+
+Channel 继续保持单 owner；本次补强不扩展到 Channel 多副本、binding lease 或 sharding。
 
 部署 Workflow 覆盖可渲染清单、Compose golden path、一次 Worker restart 后继续服务和敏感证据扫描；本机 Compose 与真实 IM/观测链路已有外部验收证据。生产 Kubernetes admission、Ingress、secret 注入、Provider 网络、HA PostgreSQL/Redis/Qdrant 和发布恢复仍不由这些证据直接证明。Gateway 可多副本；Channel Adapter 是单副本 `Recreate` owner，不能随 Gateway HPA 一起扩展。当前没有 distributed binding lease/leader election/channel sharding；若需要多 Channel owner，需另行设计并验证。

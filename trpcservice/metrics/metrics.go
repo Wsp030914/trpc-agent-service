@@ -74,13 +74,14 @@ func (p PricingCatalog) Estimate(provider, model string, inputTokens, outputToke
 
 // Labels is the only information accepted as metric attributes.
 type Labels struct {
-	TenantID  string
-	AppID     string
-	Channel   string
-	Provider  string
-	Operation string
-	Result    string
-	ErrorType string
+	TenantID      string
+	AppID         string
+	ConfigVersion string
+	Channel       string
+	Provider      string
+	Operation     string
+	Result        string
+	ErrorType     string
 }
 
 func (l Labels) attributes() []attribute.KeyValue {
@@ -90,6 +91,7 @@ func (l Labels) attributes() []attribute.KeyValue {
 	}{
 		{"tenant_id", l.TenantID},
 		{"app_id", l.AppID},
+		{"config_version", l.ConfigVersion},
 		{"channel", l.Channel},
 		{"provider", l.Provider},
 		{"operation", l.Operation},
@@ -139,6 +141,9 @@ type OperationsSnapshot struct {
 type Recorder struct {
 	requestCount        metric.Int64Counter
 	errorCount          metric.Int64Counter
+	executionCount      metric.Int64Counter
+	executionErrors     metric.Int64Counter
+	executionLatency    metric.Float64Histogram
 	modelLatency        metric.Float64Histogram
 	modelInputTokens    metric.Int64Counter
 	modelOutputTokens   metric.Int64Counter
@@ -191,6 +196,24 @@ func (r *Recorder) EstimateCost(provider, model string, inputTokens, outputToken
 	return &cost
 }
 
+// RecordExecution records one worker attempt with its pinned config version.
+// It is independent of audit policy so rollout health cannot disappear when
+// execution audit is disabled.
+func (r *Recorder) RecordExecution(ctx context.Context, labels Labels, latency time.Duration, errType string) {
+	if r == nil {
+		return
+	}
+	labels.Operation = "execution"
+	labels.ErrorType = errType
+	setResultForError(&labels, "success", errType)
+	attrs := labels.attributes()
+	r.executionCount.Add(ctx, 1, metric.WithAttributes(attrs...))
+	r.executionLatency.Record(ctx, nonNegativeDuration(latency).Seconds(), metric.WithAttributes(attrs...))
+	if errType != "" {
+		r.executionErrors.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
 // New creates fixed instruments from a standard OTel MeterProvider.
 func New(provider metric.MeterProvider, pricing PricingCatalog) (*Recorder, error) {
 	if provider == nil {
@@ -209,6 +232,15 @@ func New(provider metric.MeterProvider, pricing PricingCatalog) (*Recorder, erro
 		return nil, err
 	}
 	if r.errorCount, err = newCounter("trpc_agent_service.error.count"); err != nil {
+		return nil, err
+	}
+	if r.executionCount, err = newCounter("trpc_agent_service.execution.count"); err != nil {
+		return nil, err
+	}
+	if r.executionErrors, err = newCounter("trpc_agent_service.execution.error.count"); err != nil {
+		return nil, err
+	}
+	if r.executionLatency, err = newHistogram("trpc_agent_service.execution.latency"); err != nil {
 		return nil, err
 	}
 	if r.modelLatency, err = newHistogram("trpc_agent_service.model.latency"); err != nil {
@@ -413,6 +445,13 @@ func (r *Recorder) operationsSnapshot() OperationsSnapshot {
 }
 
 func nonNegative(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func nonNegativeDuration(value time.Duration) time.Duration {
 	if value < 0 {
 		return 0
 	}

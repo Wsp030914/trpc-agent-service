@@ -534,10 +534,11 @@ func (g Gateway) handle(
 			return
 		}
 		labels := platformmetrics.Labels{
-			TenantID: identity.Tenant.TenantID,
-			AppID:    identity.Tenant.AppID,
-			Channel:  identity.Tenant.Channel,
-			Result:   "accepted",
+			TenantID:      identity.Tenant.TenantID,
+			AppID:         identity.Tenant.AppID,
+			ConfigVersion: result.ConfigVersion,
+			Channel:       identity.Tenant.Channel,
+			Result:        "accepted",
 		}
 		errorType := ""
 		if err != nil {

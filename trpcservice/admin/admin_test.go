@@ -127,6 +127,59 @@ func TestAPIListAuditEventsRejectsInvalidLimit(t *testing.T) {
 	}
 }
 
+func TestAPIEvaluateAppCanaryAppliesVersionGuardedDecision(t *testing.T) {
+	repository := &recordingRepository{}
+	maxErrorRate := 0.1
+	result, err := (admin.API{Repository: repository}).EvaluateAppCanary(
+		context.Background(),
+		tenant.Scope{TenantID: "tenant-a", AppID: "support"},
+		"v2",
+		tenant.CanaryObservations{Samples: 20, ErrorRate: 0.2},
+		tenant.CanaryRule{
+			MinimumSamples: 20,
+			MaxErrorRate:   &maxErrorRate,
+			Action:         tenant.CanaryActionRollback,
+		},
+	)
+	if err != nil {
+		t.Fatalf("evaluate app canary: %v", err)
+	}
+	if !result.Applied || result.Decision.Action != tenant.CanaryActionRollback {
+		t.Fatalf("canary evaluation result = %#v", result)
+	}
+	if repository.canaryExpectedVersion != "v2" ||
+		repository.canaryAction != tenant.CanaryActionRollback ||
+		repository.canaryReason != "error_rate" {
+		t.Fatalf("applied canary decision = version %q action %q reason %q",
+			repository.canaryExpectedVersion, repository.canaryAction, repository.canaryReason)
+	}
+}
+
+func TestAPIEvaluateAppCanaryDoesNotMutateBeforeMinimumSamples(t *testing.T) {
+	repository := &recordingRepository{}
+	maxErrorRate := 0.1
+	result, err := (admin.API{Repository: repository}).EvaluateAppCanary(
+		context.Background(),
+		tenant.Scope{TenantID: "tenant-a", AppID: "support"},
+		"v2",
+		tenant.CanaryObservations{Samples: 19, ErrorRate: 1},
+		tenant.CanaryRule{
+			MinimumSamples: 20,
+			MaxErrorRate:   &maxErrorRate,
+			Action:         tenant.CanaryActionPause,
+		},
+	)
+	if err != nil {
+		t.Fatalf("evaluate app canary: %v", err)
+	}
+	if result.Applied || result.Decision.Action != tenant.CanaryActionNone {
+		t.Fatalf("insufficient-sample result = %#v", result)
+	}
+	if repository.canaryAction != "" {
+		t.Fatalf("canary action applied with insufficient samples: %q", repository.canaryAction)
+	}
+}
+
 func testAppConfig() tenant.AppConfig {
 	return tenant.AppConfig{
 		TenantID: "tenant-a",
@@ -166,24 +219,28 @@ func testBinding() channels.Binding {
 }
 
 type recordingRepository struct {
-	tenant              tenant.Tenant
-	app                 tenant.AgentApp
-	binding             channels.Binding
-	initial             tenant.AppConfig
-	published           tenant.AppConfig
-	activatedTenantID   string
-	activatedAppID      string
-	activatedVersion    string
-	digest              auth.APIKeyDigest
-	credential          auth.Credential
-	revokedTenantID     string
-	revokedAppID        string
-	revokedCredentialID string
-	auditEvents         []platformaudit.Event
-	auditTenantID       string
-	auditAppID          string
-	auditLimit          int
-	auditWrites         []platformaudit.Event
+	tenant                tenant.Tenant
+	app                   tenant.AgentApp
+	binding               channels.Binding
+	initial               tenant.AppConfig
+	published             tenant.AppConfig
+	activatedTenantID     string
+	activatedAppID        string
+	activatedVersion      string
+	digest                auth.APIKeyDigest
+	credential            auth.Credential
+	revokedTenantID       string
+	revokedAppID          string
+	revokedCredentialID   string
+	auditEvents           []platformaudit.Event
+	auditTenantID         string
+	auditAppID            string
+	auditLimit            int
+	auditWrites           []platformaudit.Event
+	canaryAction          tenant.CanaryAction
+	canaryExpectedVersion string
+	canaryReason          string
+	canaryErr             error
 }
 
 func (r *recordingRepository) CreateTenant(_ context.Context, value tenant.Tenant) error {
@@ -282,4 +339,21 @@ func (r *recordingRepository) ListAuditEvents(
 func (r *recordingRepository) Record(_ context.Context, event platformaudit.Event) error {
 	r.auditWrites = append(r.auditWrites, event)
 	return nil
+}
+
+func (r *recordingRepository) ApplyCanaryDecision(
+	_ context.Context,
+	_ string,
+	_ string,
+	expectedVersion string,
+	action tenant.CanaryAction,
+	reason string,
+) (tenant.AgentApp, error) {
+	if r.canaryErr != nil {
+		return tenant.AgentApp{}, r.canaryErr
+	}
+	r.canaryExpectedVersion = expectedVersion
+	r.canaryAction = action
+	r.canaryReason = reason
+	return r.app, nil
 }

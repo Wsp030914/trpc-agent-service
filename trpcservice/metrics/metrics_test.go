@@ -3,6 +3,7 @@ package metrics_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -105,5 +106,68 @@ func TestOperationsSnapshotExportsRequiredGauges(t *testing.T) {
 	}
 	if backendValues["postgres"] != 1 || backendValues["redis"] != 0 {
 		t.Fatalf("backend readiness = %#v, want postgres=1 redis=0", backendValues)
+	}
+}
+
+func TestExecutionMetricsKeepPinnedConfigVersion(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	recorder, err := platformmetrics.New(provider, platformmetrics.PricingCatalog{})
+	if err != nil {
+		t.Fatalf("new metrics recorder: %v", err)
+	}
+	recorder.RecordExecution(context.Background(), platformmetrics.Labels{
+		TenantID:      "tenant-a",
+		AppID:         "support",
+		ConfigVersion: "v2",
+	}, 1500*time.Millisecond, "timeout")
+	recorder.RecordGovernanceRejected(context.Background(), platformmetrics.Labels{
+		TenantID:      "tenant-a",
+		AppID:         "support",
+		ConfigVersion: "v2",
+	}, "budget_rejected")
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	foundCount := false
+	foundError := false
+	foundLatency := false
+	foundBudgetRejection := false
+	for _, scope := range data.ScopeMetrics {
+		for _, value := range scope.Metrics {
+			switch points := value.Data.(type) {
+			case metricdata.Sum[int64]:
+				for _, point := range points.DataPoints {
+					version, ok := point.Attributes.Value("config_version")
+					if !ok || version.AsString() != "v2" {
+						continue
+					}
+					switch value.Name {
+					case "trpc_agent_service.execution.count":
+						foundCount = point.Value == 1
+					case "trpc_agent_service.execution.error.count":
+						foundError = point.Value == 1
+					case "trpc_agent_service.governance.rejected":
+						errorType, ok := point.Attributes.Value("error_type")
+						foundBudgetRejection = ok && errorType.AsString() == "budget_rejected" && point.Value == 1
+					}
+				}
+			case metricdata.Histogram[float64]:
+				if value.Name != "trpc_agent_service.execution.latency" {
+					continue
+				}
+				for _, point := range points.DataPoints {
+					version, ok := point.Attributes.Value("config_version")
+					if ok && version.AsString() == "v2" && point.Count == 1 && point.Sum == 1.5 {
+						foundLatency = true
+					}
+				}
+			}
+		}
+	}
+	if !foundCount || !foundError || !foundLatency || !foundBudgetRejection {
+		t.Fatalf("candidate metrics missing pinned version: count=%t error=%t latency=%t budget=%t", foundCount, foundError, foundLatency, foundBudgetRejection)
 	}
 }

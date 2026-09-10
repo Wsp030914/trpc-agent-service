@@ -41,6 +41,80 @@ func (s *Store) RollbackAppCanary(ctx context.Context, tenantID, appID string) (
 	return s.updateCanary(ctx, tenantID, appID, "", 0, tenant.CanaryDisabled)
 }
 
+// ApplyCanaryDecision applies an automated health decision only when the
+// observed candidate is still the current candidate. The row lock and version
+// predicate make stale Prometheus/Alertmanager decisions harmless.
+func (s *Store) ApplyCanaryDecision(
+	ctx context.Context,
+	tenantID, appID, expectedVersion string,
+	action tenant.CanaryAction,
+	reason string,
+) (tenant.AgentApp, error) {
+	if err := s.validate(); err != nil {
+		return tenant.AgentApp{}, err
+	}
+	if tenantID == "" || appID == "" || expectedVersion == "" {
+		return tenant.AgentApp{}, errors.New("tenant_id, app_id, and expected canary version are required")
+	}
+	if action != tenant.CanaryActionPause && action != tenant.CanaryActionRollback {
+		return tenant.AgentApp{}, errors.New("automated canary action must be PAUSE or ROLLBACK")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return tenant.AgentApp{}, fmt.Errorf("begin automated canary decision: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	app, err := lockAgentApp(ctx, tx, tenantID, appID)
+	if err != nil {
+		return tenant.AgentApp{}, fmt.Errorf("lock agent app for automated canary decision: %w", err)
+	}
+	if app.CanaryConfigVersion != expectedVersion || app.CanaryStatus == tenant.CanaryDisabled {
+		return tenant.AgentApp{}, tenant.ErrCanaryDecisionStale
+	}
+	if action == tenant.CanaryActionPause && app.CanaryStatus == tenant.CanaryPaused {
+		return app, nil
+	}
+	candidateVersion := app.CanaryConfigVersion
+	eventType := platformaudit.ConfigCanaryPaused
+	decision := "paused"
+	if action == tenant.CanaryActionRollback {
+		eventType = platformaudit.ConfigCanaryRolledBack
+		decision = "rolled_back"
+	}
+	if action == tenant.CanaryActionPause {
+		if _, err := tx.Exec(ctx, `
+UPDATE platform.agent_app
+SET canary_status = 'PAUSED', updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND canary_config_version = $3`, tenantID, appID, expectedVersion); err != nil {
+			return tenant.AgentApp{}, fmt.Errorf("pause automated app canary: %w", err)
+		}
+		app.CanaryStatus = tenant.CanaryPaused
+	} else {
+		if _, err := tx.Exec(ctx, `
+UPDATE platform.agent_app
+SET canary_config_version = NULL,
+    canary_percentage = 0,
+    canary_status = 'DISABLED',
+    updated_at = clock_timestamp()
+WHERE tenant_id = $1 AND app_id = $2 AND canary_config_version = $3`, tenantID, appID, expectedVersion); err != nil {
+			return tenant.AgentApp{}, fmt.Errorf("rollback automated app canary: %w", err)
+		}
+		app.CanaryConfigVersion = ""
+		app.CanaryPercentage = 0
+		app.CanaryStatus = tenant.CanaryDisabled
+	}
+	event := controlPlaneAuditEvent(ctx, tenantID, appID, candidateVersion, eventType, decision)
+	event.PolicyRuleID = "canary_metric_threshold"
+	event.PolicyReason = platformaudit.SafePolicyReason(reason)
+	if err := recordControlPlaneAuditTx(ctx, tx, event); err != nil {
+		return tenant.AgentApp{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return tenant.AgentApp{}, fmt.Errorf("commit automated canary decision: %w", err)
+	}
+	return app, nil
+}
+
 // PromoteAppCanary makes the current candidate the stable version and clears
 // the canary state in one transaction.
 func (s *Store) PromoteAppCanary(ctx context.Context, tenantID, appID string) (tenant.AgentApp, error) {

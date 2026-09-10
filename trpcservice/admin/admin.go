@@ -78,6 +78,20 @@ type canaryRepository interface {
 	PromoteAppCanary(context.Context, string, string) (tenant.AgentApp, error)
 }
 
+type canaryDecisionRepository interface {
+	ApplyCanaryDecision(context.Context, string, string, string, tenant.CanaryAction, string) (tenant.AgentApp, error)
+}
+
+// CanaryEvaluationResult is the control-plane result of one already-aggregated
+// candidate metric window. Metric collection stays outside this API.
+type CanaryEvaluationResult struct {
+	Decision        tenant.CanaryDecision     `json:"decision"`
+	Applied         bool                      `json:"applied"`
+	ExpectedVersion string                    `json:"expected_version"`
+	Observations    tenant.CanaryObservations `json:"observations"`
+	App             *tenant.AgentApp          `json:"app,omitempty"`
+}
+
 type channelStatusRepository interface {
 	SetChannelBindingStatus(context.Context, string, string, string, channels.BindingStatus) (channels.Binding, error)
 }
@@ -384,6 +398,57 @@ func (a API) RollbackAppCanary(ctx context.Context, scope tenant.Scope) (tenant.
 
 func (a API) PromoteAppCanary(ctx context.Context, scope tenant.Scope) (tenant.AgentApp, error) {
 	return a.canaryMutation(ctx, scope, "promote")
+}
+
+// EvaluateAppCanary evaluates one candidate metric window and, when a rule is
+// breached, applies a version-guarded Pause or Rollback in PostgreSQL.
+func (a API) EvaluateAppCanary(
+	ctx context.Context,
+	scope tenant.Scope,
+	expectedVersion string,
+	observations tenant.CanaryObservations,
+	rule tenant.CanaryRule,
+) (CanaryEvaluationResult, error) {
+	if err := scope.Validate(); err != nil {
+		return CanaryEvaluationResult{}, invalidInput(err)
+	}
+	if expectedVersion == "" {
+		return CanaryEvaluationResult{}, invalidInput(errors.New("expected canary version is required"))
+	}
+	decision, err := rule.Evaluate(observations)
+	if err != nil {
+		return CanaryEvaluationResult{}, invalidInput(err)
+	}
+	result := CanaryEvaluationResult{
+		Decision:        decision,
+		ExpectedVersion: expectedVersion,
+		Observations:    observations,
+	}
+	if decision.Action == tenant.CanaryActionNone {
+		return result, nil
+	}
+	repository, err := a.repository()
+	if err != nil {
+		return CanaryEvaluationResult{}, err
+	}
+	canary, ok := repository.(canaryDecisionRepository)
+	if !ok {
+		return CanaryEvaluationResult{}, errors.New("admin repository does not support automated canary decisions")
+	}
+	app, err := canary.ApplyCanaryDecision(
+		ctx,
+		scope.TenantID,
+		scope.AppID,
+		expectedVersion,
+		decision.Action,
+		decision.AuditReason(),
+	)
+	if err != nil {
+		return CanaryEvaluationResult{}, fmt.Errorf("apply canary decision: %w", err)
+	}
+	result.Applied = true
+	result.App = &app
+	return result, nil
 }
 
 func (a API) canaryMutation(ctx context.Context, scope tenant.Scope, action string) (tenant.AgentApp, error) {

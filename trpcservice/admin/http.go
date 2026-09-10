@@ -70,6 +70,7 @@ func NewHTTPHandlerWithAuth(api API, authConfig AdminAuthConfig) (http.Handler, 
 	mux.HandleFunc("/admin/v1/configs/canary/disable", methodHandler(http.MethodPost, handler.requireRoles(handler.disableAppCanary, RoleSystemAdmin, RoleOperator)))
 	mux.HandleFunc("/admin/v1/configs/canary/rollback", methodHandler(http.MethodPost, handler.requireRoles(handler.rollbackAppCanary, RoleSystemAdmin, RoleOperator)))
 	mux.HandleFunc("/admin/v1/configs/canary/promote", methodHandler(http.MethodPost, handler.requireRoles(handler.promoteAppCanary, RoleSystemAdmin, RoleOperator)))
+	mux.HandleFunc("/admin/v1/configs/canary/evaluate", methodHandler(http.MethodPost, handler.requireRoles(handler.evaluateAppCanary, RoleSystemAdmin, RoleOperator)))
 	mux.HandleFunc("/admin/v1/data-migrations", methodRouter(map[string]http.HandlerFunc{
 		http.MethodGet:  handler.requireRoles(handler.listDataMigrations, RoleSystemAdmin, RoleOperator, RoleAuditor),
 		http.MethodPost: handler.requireRoles(handler.createDataMigration, RoleSystemAdmin, RoleOperator),
@@ -157,6 +158,21 @@ type canaryRequest struct {
 	AppID      string `json:"app_id"`
 	Version    string `json:"version,omitempty"`
 	Percentage int    `json:"percentage,omitempty"`
+}
+
+type canaryEvaluationRequest struct {
+	TenantID            string   `json:"tenant_id"`
+	AppID               string   `json:"app_id"`
+	Version             string   `json:"version"`
+	Samples             int64    `json:"samples"`
+	ErrorRate           float64  `json:"error_rate"`
+	P95LatencyMS        int64    `json:"p95_latency_ms"`
+	BudgetRejections    int64    `json:"budget_rejections"`
+	MinimumSamples      int64    `json:"minimum_samples"`
+	MaxErrorRate        *float64 `json:"max_error_rate,omitempty"`
+	MaxP95LatencyMS     *int64   `json:"max_p95_latency_ms,omitempty"`
+	MaxBudgetRejections *int64   `json:"max_budget_rejections,omitempty"`
+	Action              string   `json:"action"`
 }
 
 type revokeCredentialRequest struct {
@@ -634,6 +650,67 @@ func (h adminHTTPHandler) promoteAppCanary(w http.ResponseWriter, r *http.Reques
 	h.mutateAppCanary(w, r, h.api.PromoteAppCanary, "promote app canary failed")
 }
 
+func (h adminHTTPHandler) evaluateAppCanary(w http.ResponseWriter, r *http.Request) {
+	var request canaryEvaluationRequest
+	if !decodeJSON(w, r, &request) {
+		writeJSONError(w, http.StatusBadRequest, "invalid canary evaluation request")
+		return
+	}
+	scope := tenant.Scope{TenantID: request.TenantID, AppID: request.AppID}
+	if !h.authorizeTenant(w, r, scope) {
+		return
+	}
+	p95Latency, err := durationFromMilliseconds(request.P95LatencyMS)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid canary p95 latency")
+		return
+	}
+	var maxP95Latency *time.Duration
+	if request.MaxP95LatencyMS != nil {
+		value, durationErr := durationFromMilliseconds(*request.MaxP95LatencyMS)
+		if durationErr != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid canary p95 latency threshold")
+			return
+		}
+		maxP95Latency = &value
+	}
+	result, err := h.api.EvaluateAppCanary(
+		r.Context(),
+		scope,
+		request.Version,
+		tenant.CanaryObservations{
+			Samples:          request.Samples,
+			ErrorRate:        request.ErrorRate,
+			P95Latency:       p95Latency,
+			BudgetRejections: request.BudgetRejections,
+		},
+		tenant.CanaryRule{
+			MinimumSamples:      request.MinimumSamples,
+			MaxErrorRate:        request.MaxErrorRate,
+			MaxP95Latency:       maxP95Latency,
+			MaxBudgetRejections: request.MaxBudgetRejections,
+			Action:              tenant.CanaryAction(request.Action),
+		},
+	)
+	if err != nil {
+		writeAdminOperationError(w, err, "evaluate app canary failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func durationFromMilliseconds(value int64) (time.Duration, error) {
+	if value < 0 {
+		return 0, errors.New("duration must be non-negative")
+	}
+	const maxDurationMilliseconds = int64((1<<63 - 1) / int64(time.Millisecond))
+	if value > maxDurationMilliseconds {
+		return 0, errors.New("duration is too large")
+	}
+	duration := time.Duration(value) * time.Millisecond
+	return duration, nil
+}
+
 func (h adminHTTPHandler) mutateAppCanary(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -941,6 +1018,9 @@ func writeAdminOperationError(w http.ResponseWriter, err error, message string) 
 		status = http.StatusNotFound
 	}
 	if errors.Is(err, platformapproval.ErrAlreadyDecided) || errors.Is(err, platformapproval.ErrExpired) {
+		status = http.StatusConflict
+	}
+	if errors.Is(err, tenant.ErrCanaryDecisionStale) {
 		status = http.StatusConflict
 	}
 	writeJSONError(w, status, message)

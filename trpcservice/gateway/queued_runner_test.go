@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -223,6 +224,57 @@ func TestQueuedRunnerRejectsRuntimeOptions(t *testing.T) {
 	if admitter.request.RequestID != "" {
 		t.Fatal("queued runner admitted a request with runtime options")
 	}
+}
+
+func TestForwardExecutionEventsStopsWhenSourceNeverCloses(t *testing.T) {
+	base, cancel := context.WithCancel(context.Background())
+	identity := validAdmissionIdentity()
+	ctx, err := gateway.ContextWithAuthenticatedRequest(base, gateway.AuthenticatedRequest{
+		RequestID:      "request-queued-never-closes",
+		IdempotencyKey: "idempotency-queued-never-closes",
+		Tenant: staticTenantResolver{
+			tenant: identity.Tenant, source: identity.Source, identity: identity, withIdentity: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("attach authenticated request: %v", err)
+	}
+	persisted := make(chan gateway.ExecutionEvent)
+	queued, err := gateway.NewQueuedRunner(
+		gateway.New(&captureAdmitter{result: gateway.AdmissionResult{
+			RequestID: "request-queued-never-closes", ConfigVersion: "v1", TurnSeq: 1,
+		}}),
+		&neverClosingExecutionEventSource{events: persisted},
+	)
+	if err != nil {
+		t.Fatalf("new queued runner: %v", err)
+	}
+	forwarded, err := queued.Run(ctx, "", "", model.NewUserMessage("hello"))
+	if err != nil {
+		t.Fatalf("run queued request: %v", err)
+	}
+	cancel()
+	select {
+	case _, ok := <-forwarded:
+		if ok {
+			t.Fatal("forwarded event channel remained open after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forwarded event channel did not close after cancellation")
+	}
+}
+
+type neverClosingExecutionEventSource struct {
+	events <-chan gateway.ExecutionEvent
+}
+
+func (s *neverClosingExecutionEventSource) SubscribeExecutionEvents(
+	context.Context,
+	tenant.Scope,
+	string,
+	int64,
+) (<-chan gateway.ExecutionEvent, error) {
+	return s.events, nil
 }
 
 type staticExecutionEventSource struct {

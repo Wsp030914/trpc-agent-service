@@ -41,3 +41,14 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
+    # Prometheus Adapter (or another external metrics provider) must expose
+    # this Prometheus metric before the business-metric signal can scale the
+    # worker. The adapter must max duplicate scrape-instance samples; these
+    # are the same database aggregate, not per-worker queue shards.
+    - type: External
+      external:
+        metric:
+          name: trpc_agent_service_queue_backlog
+        target:
+          type: Value
+          value: "10"

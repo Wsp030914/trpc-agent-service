@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
 	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
@@ -224,6 +225,48 @@ func TestHTTPHandlerEnforcesTenantScopeBeforeMutation(t *testing.T) {
 	if response := post(testAdminToken, `{"tenant_id":"tenant-b","app_id":"support","version":"v1"}`); response.Code != http.StatusNoContent {
 		t.Fatalf("system admin mutation status = %d: %s", response.Code, response.Body.String())
 	}
+}
+
+func TestHTTPHandlerEvaluatesCanaryAndPassesMetricWindow(t *testing.T) {
+	repository := &recordingRepository{}
+	handler := newAdminHandler(t, repository)
+	var result admin.CanaryEvaluationResult
+	postAdminJSON(t, handler, "/admin/v1/configs/canary/evaluate", map[string]any{
+		"tenant_id":             "tenant-a",
+		"app_id":                "support",
+		"version":               "v2",
+		"samples":               20,
+		"error_rate":            0.2,
+		"p95_latency_ms":        4200,
+		"budget_rejections":     0,
+		"minimum_samples":       20,
+		"max_error_rate":        0.1,
+		"max_p95_latency_ms":    5000,
+		"max_budget_rejections": 0,
+		"action":                "ROLLBACK",
+	}, http.StatusOK, &result)
+	if !result.Applied || result.Decision.Action != tenant.CanaryActionRollback ||
+		result.Observations.P95Latency != 4200*time.Millisecond {
+		t.Fatalf("canary HTTP result = %#v", result)
+	}
+	if repository.canaryExpectedVersion != "v2" || repository.canaryReason != "error_rate" {
+		t.Fatalf("canary HTTP decision = version %q reason %q", repository.canaryExpectedVersion, repository.canaryReason)
+	}
+}
+
+func TestHTTPHandlerMapsStaleCanaryDecisionToConflict(t *testing.T) {
+	repository := &recordingRepository{canaryErr: tenant.ErrCanaryDecisionStale}
+	handler := newAdminHandler(t, repository)
+	postAdminJSON(t, handler, "/admin/v1/configs/canary/evaluate", map[string]any{
+		"tenant_id":       "tenant-a",
+		"app_id":          "support",
+		"version":         "v2",
+		"samples":         20,
+		"error_rate":      0.2,
+		"minimum_samples": 20,
+		"max_error_rate":  0.1,
+		"action":          "ROLLBACK",
+	}, http.StatusConflict, nil)
 }
 
 func newAdminHandler(t *testing.T, repository *recordingRepository) http.Handler {
