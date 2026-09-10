@@ -86,8 +86,11 @@
       "type": "timeseries",
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
       "targets": [
+        {"expr": "sum(rate(trpc_agent_service_im_callback_count_total[5m]))", "legendFormat": "callback/s", "refId": "C"},
         {"expr": "sum(rate(trpc_agent_service_im_reply_success_total[5m]))", "legendFormat": "success/s", "refId": "A"},
-        {"expr": "sum(rate(trpc_agent_service_im_reply_failure_total[5m]))", "legendFormat": "failure/s", "refId": "B"}
+        {"expr": "sum(rate(trpc_agent_service_im_reply_failure_total[5m]))", "legendFormat": "failure/s", "refId": "B"},
+        {"expr": "sum(rate(trpc_agent_service_im_reply_failure_total[5m])) / clamp_min(sum(rate(trpc_agent_service_im_reply_success_total[5m])) + sum(rate(trpc_agent_service_im_reply_failure_total[5m])), 1)", "legendFormat": "reply failure ratio", "refId": "D"},
+        {"expr": "sum(rate(trpc_agent_service_im_callback_count_total{result=\"failure\"}[5m])) / clamp_min(sum(rate(trpc_agent_service_im_callback_count_total[5m])), 1)", "legendFormat": "callback failure ratio", "refId": "E"}
       ],
       "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []}
     },

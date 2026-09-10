@@ -372,7 +372,10 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 	if err := pool.Ping(ctx); err != nil {
 		return fmt.Errorf("ping postgres: %w", err)
 	}
-	secrets := environmentSecretProvider{getenv: os.Getenv}
+	secrets, err := platformsecret.NewConfiguredProvider(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("configure secret backend: %w", err)
+	}
 	hasher, err := platformsecret.NewExternalIDHasher(secrets, "v1")
 	if err != nil {
 		return err
@@ -429,7 +432,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 			return fmt.Errorf("create admission rate limiter: %w", limiterErr)
 		}
 		gatewayHandler, wecom, feishu, handlerErr := newGatewayHandler(
-			store, artifacts, admissionLimiter, config.AdmissionConcurrency, config.HTTPEventWaitTimeout,
+			store, artifacts, secrets, admissionLimiter, config.AdmissionConcurrency, config.HTTPEventWaitTimeout,
 		)
 		if handlerErr != nil {
 			return handlerErr
@@ -476,7 +479,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 
 	var replies *replyRuntime
 	if config.Role.runsChannel() {
-		replies, err = newReplyRuntime(store, redisClient, channelReplyOwner(config), wecomAdapter, os.Getenv, metricsRecorder)
+		replies, err = newReplyRuntime(store, redisClient, channelReplyOwner(config), wecomAdapter, secrets, metricsRecorder)
 		if err != nil {
 			return err
 		}
@@ -502,6 +505,7 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 			stream:                      stream,
 			owner:                       config.WorkerID,
 			getenv:                      os.Getenv,
+			secrets:                     secrets,
 			artifacts:                   artifacts,
 			defaultSessionDSN:           config.PostgresDSN,
 			defaultRedisURL:             config.RedisURL,
@@ -571,11 +575,12 @@ func runService(ctx context.Context, config serviceConfig) (serviceErr error) {
 func newGatewayHandler(
 	store *postgres.Store,
 	artifacts *artifactcos.Resolver,
+	secrets platformsecret.SecretProvider,
 	rateLimiter gateway.AdmissionRateLimiter,
 	admissionConcurrency int,
 	durableEventWaitTimeout time.Duration,
 ) (http.Handler, *wecom.Adapter, *feishu.Adapter, error) {
-	if store == nil || artifacts == nil {
+	if store == nil || artifacts == nil || secrets == nil {
 		return nil, nil, nil, errors.New("gateway dependencies are required")
 	}
 	if rateLimiter == nil {
@@ -607,7 +612,6 @@ func newGatewayHandler(
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	secrets := environmentSecretProvider{getenv: os.Getenv}
 	attachmentIngestor, err := channelsattachments.NewIngestor(
 		store,
 		secrets,

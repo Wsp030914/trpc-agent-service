@@ -90,6 +90,9 @@ func TestPostgresMigrationFromEmptySchema(t *testing.T) {
 		"reply_outbox",
 		"audit_event",
 		"tool_approval",
+		"quota_usage",
+		"quota_reservation",
+		"quota_usage_record",
 	} {
 		var exists bool
 		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "platform."+table).Scan(&exists); err != nil {
@@ -141,6 +144,18 @@ WHERE table_schema = 'platform'
 	}
 	if artifactCleanupColumns != 7 {
 		t.Fatalf("artifact cleanup columns = %d, want 7", artifactCleanupColumns)
+	}
+	var quotaPolicyColumns int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*)
+FROM information_schema.columns
+WHERE table_schema = 'platform'
+  AND table_name = 'tenant'
+  AND column_name = 'quota_policy'`).Scan(&quotaPolicyColumns); err != nil {
+		t.Fatalf("check tenant quota policy column: %v", err)
+	}
+	if quotaPolicyColumns != 1 {
+		t.Fatalf("tenant quota policy columns = %d, want 1", quotaPolicyColumns)
 	}
 }
 

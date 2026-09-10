@@ -143,6 +143,66 @@ func TestBudgetCallbacksPreserveResponseErrorWithoutUsage(t *testing.T) {
 	}
 }
 
+func TestBudgetCallbacksEnforceCostLimit(t *testing.T) {
+	estimate := func(inputTokens, outputTokens int) (float64, bool) {
+		return float64(inputTokens + outputTokens), true
+	}
+	callbacks := newBudgetCallbacks(tenant.BudgetPolicy{MaxCostPerExecution: 3}, estimate)
+	if callbacks == nil {
+		t.Fatal("cost budget callbacks were not created")
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("first model call was rejected: %v", err)
+	}
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{
+		Response: &model.Response{Usage: &model.Usage{PromptTokens: 2, CompletionTokens: 1}},
+	}); err != nil {
+		t.Fatalf("cost usage was rejected at the limit: %v", err)
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("later model call error = %v, want ErrBudgetExceeded", err)
+	}
+}
+
+func TestBudgetCallbacksFailClosedForUnknownCost(t *testing.T) {
+	callbacks := newBudgetCallbacks(tenant.BudgetPolicy{MaxCostPerExecution: 1})
+	if callbacks == nil {
+		t.Fatal("cost budget callbacks were not created")
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("model call was rejected: %v", err)
+	}
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{
+		Response: &model.Response{Usage: &model.Usage{PromptTokens: 1, CompletionTokens: 1}},
+	}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("unknown cost error = %v, want ErrBudgetExceeded", err)
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("follow-up model call error = %v, want ErrBudgetExceeded", err)
+	}
+}
+
+func TestBudgetCallbacksFailClosedWhenCostUsageLacksTokenBreakdown(t *testing.T) {
+	estimate := func(inputTokens, outputTokens int) (float64, bool) {
+		return float64(inputTokens + outputTokens), true
+	}
+	callbacks := newBudgetCallbacks(tenant.BudgetPolicy{MaxCostPerExecution: 1}, estimate)
+	if callbacks == nil {
+		t.Fatal("cost budget callbacks were not created")
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); err != nil {
+		t.Fatalf("model call was rejected: %v", err)
+	}
+	if _, err := callbacks.RunAfterModel(context.Background(), &model.AfterModelArgs{
+		Response: &model.Response{Usage: &model.Usage{TotalTokens: 2}},
+	}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("incomplete cost usage error = %v, want ErrBudgetExceeded", err)
+	}
+	if _, err := callbacks.RunBeforeModel(context.Background(), &model.BeforeModelArgs{}); !errors.Is(err, tenant.ErrBudgetExceeded) {
+		t.Fatalf("follow-up model call error = %v, want ErrBudgetExceeded", err)
+	}
+}
+
 func TestDefaultEndpointPolicyRejectsNonPublicAddresses(t *testing.T) {
 	policy := DefaultEndpointPolicy{}
 	for _, endpoint := range []string{

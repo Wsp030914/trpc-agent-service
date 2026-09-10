@@ -13,6 +13,7 @@ import (
 	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/guardrail"
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
@@ -45,6 +46,16 @@ type ExecutionLeaseValidator interface {
 	ValidateExecutionLease(context.Context, Execution, queue.Lease) error
 }
 
+// ExecutionUsage is the cumulative model usage known when an event is
+// persisted. A terminal event can account this usage atomically with the
+// execution status transition.
+type ExecutionUsage struct {
+	InputTokens  int
+	OutputTokens int
+	TotalTokens  int
+	Cost         *float64
+}
+
 // Execution is the prepared context for running one tenant-scoped job.
 type Execution struct {
 	RequestID    string
@@ -59,6 +70,7 @@ type Execution struct {
 	// ApprovalPending marks a completion event that parks the execution for
 	// human review. It must not close an IM stream as a successful answer.
 	ApprovalPending bool
+	Usage           ExecutionUsage
 }
 
 // SessionLock owns an acquired session partition lock. Context is canceled
@@ -96,6 +108,9 @@ type RunResult struct {
 	OutputTokens    int
 	TotalTokens     int
 	Cost            *float64
+	// TerminalEventPersisted means the durable event sink committed a terminal
+	// execution status. Quota cleanup may therefore happen in that transaction.
+	TerminalEventPersisted bool
 	// CleanupError is diagnostic only. Runner/session cleanup happens after the
 	// business result has been durably projected and must not turn success into
 	// a retryable execution failure.
@@ -276,6 +291,22 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 			})
 		}()
 	}
+	if decision := guardrail.CheckInput(exec.Message.Text); decision.Blocked {
+		cause := guardrail.InputBlockedError{RuleID: decision.RuleID}
+		if exec.Config.Audit.Enabled {
+			w.recordAudit(ctx, exec, platformaudit.Event{
+				Decision:     "rejected",
+				PolicyRuleID: decision.RuleID,
+				PolicyReason: decision.Reason,
+				ErrorType:    "guardrail_input_blocked",
+				EventType:    platformaudit.ExecutionFailed,
+			})
+		}
+		if persistErr := w.persistRunnerFailure(ctx, exec, cause, &result); persistErr != nil {
+			return result, persistErr
+		}
+		return result, NewPermanentExecutionError(cause)
+	}
 	if w.Runner == nil {
 		return result, NewPermanentExecutionError(errors.New("runner builder is required"))
 	}
@@ -328,7 +359,7 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 	r, err := w.Runner(workerCtx, exec)
 	if err != nil {
 		if FinalAttemptFromContext(ctx) || IsPermanentExecutionError(err) {
-			if persistErr := w.persistRunnerFailure(runCtx, exec, err); persistErr != nil {
+			if persistErr := w.persistRunnerFailure(runCtx, exec, err, &result); persistErr != nil {
 				return result, persistErr
 			}
 		}
@@ -373,14 +404,14 @@ func (w Worker) Run(ctx context.Context, job execution.Job) (result RunResult, e
 		agent.WithDisableTracing(true),
 	)
 	if err != nil {
-		if persistErr := w.persistRunnerFailure(runCtx, exec, err); persistErr != nil {
+		if persistErr := w.persistRunnerFailure(runCtx, exec, err, &result); persistErr != nil {
 			return result, persistErr
 		}
 		return result, classifySessionLeaseFailure(runCtx, result.RunnerStarted, err)
 	}
 	if events == nil {
 		runnerErr := errors.New("runner event channel is nil")
-		if persistErr := w.persistRunnerFailure(runCtx, exec, runnerErr); persistErr != nil {
+		if persistErr := w.persistRunnerFailure(runCtx, exec, runnerErr, &result); persistErr != nil {
 			return result, persistErr
 		}
 		return result, NewSideEffectUncertainError(runnerErr)
@@ -440,10 +471,19 @@ drainLoop:
 			runnerErr = fmt.Errorf("runner event: %w", evt.Error)
 		}
 		w.accumulateUsage(&result, evt)
+		if modelAttempted && w.Metrics != nil {
+			result.Cost = w.Metrics.EstimateCost(
+				exec.Config.Model.Provider,
+				exec.Config.Model.Model,
+				result.InputTokens,
+				result.OutputTokens,
+			)
+		}
 		if w.Events == nil || sinkErr != nil || runnerCtx.Err() != nil {
 			continue
 		}
 		eventExec := exec
+		eventExec.Usage = executionUsage(result)
 		approvalPending, _ := approval.snapshot()
 		eventExec.ApprovalPending = approvalPending
 		if !approvalPending {
@@ -463,8 +503,9 @@ drainLoop:
 				cancelModel()
 				beginDrain()
 			}
-		} else if evt.IsTerminalError() {
+		} else if eventExec.TerminalStatus != "" {
 			terminalEventPersisted = true
+			result.TerminalEventPersisted = true
 		}
 		approvalPending, _ = approval.snapshot()
 		if approvalPending && evt.Response != nil && evt.Response.IsToolResultResponse() {
@@ -479,7 +520,7 @@ drainLoop:
 	}
 	if err := runnerCtx.Err(); err != nil {
 		if !terminalEventPersisted {
-			if persistErr := w.persistRunnerFailure(runCtx, exec, err); persistErr != nil {
+			if persistErr := w.persistRunnerFailure(runCtx, exec, err, &result); persistErr != nil {
 				return result, persistErr
 			}
 		}
@@ -487,7 +528,7 @@ drainLoop:
 	}
 	if runnerErr != nil {
 		if !terminalEventPersisted {
-			if persistErr := w.persistRunnerFailure(runCtx, exec, runnerErr); persistErr != nil {
+			if persistErr := w.persistRunnerFailure(runCtx, exec, runnerErr, &result); persistErr != nil {
 				return result, persistErr
 			}
 		}
@@ -497,7 +538,7 @@ drainLoop:
 	if !result.RunnerCompleted && !approvalPending {
 		missingCompletion := errors.New("runner completed without completion event")
 		if !terminalEventPersisted {
-			if persistErr := w.persistRunnerFailure(runCtx, exec, missingCompletion); persistErr != nil {
+			if persistErr := w.persistRunnerFailure(runCtx, exec, missingCompletion, &result); persistErr != nil {
 				return result, persistErr
 			}
 		}
@@ -506,7 +547,7 @@ drainLoop:
 	return result, nil
 }
 
-func (w Worker) persistRunnerFailure(ctx context.Context, exec Execution, cause error) error {
+func (w Worker) persistRunnerFailure(ctx context.Context, exec Execution, cause error, result *RunResult) error {
 	if w.Events == nil || cause == nil {
 		return nil
 	}
@@ -533,10 +574,16 @@ func (w Worker) persistRunnerFailure(ctx context.Context, exec Execution, cause 
 	} else if errors.Is(cause, context.Canceled) || errors.Is(cause, ErrExecutionCanceled) {
 		errorType = "execution_canceled"
 		errorMessage = "execution canceled"
+	} else if errors.Is(cause, guardrail.ErrInputBlocked) {
+		errorType = "guardrail_input_blocked"
+		errorMessage = "input rejected by safety policy"
 	}
 	synthetic := event.NewErrorEvent(exec.RequestID, "platform", errorType, errorMessage)
 	synthetic.RequestID = exec.RequestID
 	eventExec := exec
+	if result != nil {
+		eventExec.Usage = executionUsage(*result)
+	}
 	if IsSideEffectUncertainError(cause) {
 		eventExec.TerminalStatus = queue.CompletionUncertain
 	} else {
@@ -545,7 +592,19 @@ func (w Worker) persistRunnerFailure(ctx context.Context, exec Execution, cause 
 	if err := w.handleRunnerEvent(persistCtx, eventExec, synthetic); err != nil {
 		return NewSideEffectUncertainError(fmt.Errorf("persist terminal runner failure: %w", err))
 	}
+	if result != nil {
+		result.TerminalEventPersisted = true
+	}
 	return nil
+}
+
+func executionUsage(result RunResult) ExecutionUsage {
+	return ExecutionUsage{
+		InputTokens:  result.InputTokens,
+		OutputTokens: result.OutputTokens,
+		TotalTokens:  result.TotalTokens,
+		Cost:         result.Cost,
+	}
 }
 
 func shouldPersistRunnerFailure(cause error) bool {

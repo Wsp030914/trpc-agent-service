@@ -346,7 +346,9 @@ func (r *Runtime) BuildRunner(
 		llmagent.WithGenerationConfig(modelRuntime.GenerationConfig),
 	}
 	if callbacks := addModelObservabilityCallbacks(
-		newBudgetCallbacks(exec.Config.Budget),
+		newBudgetCallbacks(exec.Config.Budget, modelCostEstimator(
+			r.metrics, exec.Config.Model.Provider, exec.Config.Model.Model,
+		)),
 		exec,
 		r.metrics,
 	); callbacks != nil {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/guardrail"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -80,20 +81,33 @@ func (w Worker) recordToolDecision(
 	eventType := platformaudit.ToolAllowed
 	eventDecision := string(decision.Action)
 	errorType := ""
+	policyRuleID := ""
+	policyReason := ""
 	switch decision.Action {
 	case frameworktool.PermissionActionDeny:
 		eventType = platformaudit.ToolDenied
 		errorType = "policy_denied"
+		policyRuleID = "tool_policy.executable_tools"
+		policyReason = "tool_not_authorized"
 	case frameworktool.PermissionActionAsk:
 		eventType = platformaudit.ToolReviewRequired
 		errorType = "human_review_required"
+		policyRuleID = "tool_policy.review_required"
+		policyReason = "human_review_required"
+	case frameworktool.PermissionActionAllow:
+		if decision.Reason != "" {
+			policyRuleID = "tool_policy.review_required"
+			policyReason = "approval_granted"
+		}
 	}
 	w.recordAudit(ctx, exec, platformaudit.Event{
-		ToolName:  name,
-		Decision:  eventDecision,
-		Latency:   time.Since(started),
-		ErrorType: errorType,
-		EventType: eventType,
+		ToolName:     name,
+		Decision:     eventDecision,
+		PolicyRuleID: policyRuleID,
+		PolicyReason: policyReason,
+		Latency:      time.Since(started),
+		ErrorType:    errorType,
+		EventType:    eventType,
 	})
 }
 
@@ -123,6 +137,12 @@ func executionErrorType(err error) string {
 	}
 	if errors.Is(err, tenant.ErrBudgetExceeded) {
 		return "budget_exceeded"
+	}
+	if errors.Is(err, tenant.ErrQuotaExceeded) {
+		return "quota_exceeded"
+	}
+	if errors.Is(err, guardrail.ErrInputBlocked) {
+		return "guardrail_input_blocked"
 	}
 	if errors.Is(err, ErrExecutionCanceled) {
 		return "canceled"

@@ -17,6 +17,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/auth"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -530,6 +531,8 @@ func writeAdmissionError(w http.ResponseWriter, err error) {
 	case errors.Is(err, gateway.ErrAdmissionConcurrencyLimit):
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "request admission is busy", http.StatusTooManyRequests)
+	case errors.Is(err, gateway.ErrAdmissionQuotaExceeded), errors.Is(err, tenant.ErrQuotaExceeded):
+		http.Error(w, "request period quota exceeded", http.StatusTooManyRequests)
 	case errors.Is(err, errActiveStreamingLimit):
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "active streaming limit reached", http.StatusTooManyRequests)

@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/guardrail"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -96,6 +97,10 @@ func (j *ExecutionEventJournal) HandleRunnerEvent(
 	if err := exec.Tenant.Validate(); err != nil {
 		return fmt.Errorf("execution tenant context: %w", err)
 	}
+	// Keep the framework's original event for internal execution, but only
+	// externalize the sanitized copy to the durable journal and reply outbox.
+	sanitized, _ := guardrail.SanitizeEvent(evt)
+	evt = sanitized
 	lease, ok := worker.JobLeaseFromContext(ctx)
 	if !ok {
 		return errors.New("execution event requires a current execution lease")
@@ -117,6 +122,7 @@ func (j *ExecutionEventJournal) HandleRunnerEvent(
 	defer func() {
 		rollback(tx)
 	}()
+	var executionAttempt int
 	if err := tx.QueryRow(
 		ctx,
 		`SELECT 1
@@ -142,7 +148,7 @@ FOR UPDATE`,
 		exec.Tenant.SessionID,
 		exec.Tenant.UserID,
 		exec.Tenant.ConfigVersion,
-	).Scan(new(int)); err != nil {
+	).Scan(&executionAttempt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("lock execution for event append: %w", queue.ErrLeaseLost)
 		}
@@ -257,6 +263,18 @@ WHERE tenant_id = $1
 		}
 		if result.RowsAffected() != 1 {
 			return fmt.Errorf("update terminal execution: %w", queue.ErrLeaseLost)
+		}
+		if err := recordExecutionUsageTx(
+			ctx, tx,
+			exec.Tenant.TenantID,
+			exec.Tenant.AppID,
+			exec.RequestID,
+			exec.Tenant.ConfigVersion,
+			executionAttempt,
+			exec.Usage,
+			true,
+		); err != nil {
+			return fmt.Errorf("record terminal execution usage: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

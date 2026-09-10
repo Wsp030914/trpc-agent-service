@@ -83,6 +83,9 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3
   AND status IN ('PENDING', 'RUNNING')`, stored.tenantID, stored.appID, stored.requestID); err != nil {
 			return queue.Claim{}, false, fmt.Errorf("mark exhausted execution uncertain: %w", err)
 		}
+		if err := releaseExecutionQuotaTx(ctx, tx, stored.tenantID, stored.appID, stored.requestID); err != nil {
+			return queue.Claim{}, false, err
+		}
 		if err := consumeDispatch(ctx, tx, dispatch); err != nil {
 			return queue.Claim{}, false, err
 		}
@@ -188,7 +191,12 @@ func (s *Store) Complete(ctx context.Context, claim queue.Claim, status queue.Co
 	if err := status.Validate(); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE platform.execution SET status = $6, lease_owner = NULL, run_token = NULL,
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin complete execution: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	tag, err := tx.Exec(ctx, `UPDATE platform.execution SET status = $6, lease_owner = NULL, run_token = NULL,
 lease_until = NULL, finished_at = clock_timestamp(), updated_at = clock_timestamp()
 WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'RUNNING'
   AND lease_owner = $4 AND run_token = $5 AND lease_until > clock_timestamp()`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID(), claim.Lease.Owner, claim.Lease.Token, status)
@@ -196,7 +204,22 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'RUNNING'
 		return fmt.Errorf("complete execution: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
+		var currentStatus string
+		if err := tx.QueryRow(ctx, `SELECT status FROM platform.execution WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID()).Scan(&currentStatus); err == nil && isTerminalExecutionStatus(currentStatus) {
+			if err := releaseExecutionQuotaTx(ctx, tx, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID()); err != nil {
+				return err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit terminal quota cleanup: %w", err)
+			}
+		}
 		return fmt.Errorf("complete execution: %w", queue.ErrLeaseLost)
+	}
+	if err := releaseExecutionQuotaTx(ctx, tx, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID()); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit complete execution: %w", err)
 	}
 	return nil
 }
@@ -212,7 +235,12 @@ func (s *Store) CompleteUncertain(ctx context.Context, claim queue.Claim, cause 
 		return err
 	}
 	lastError := platformlog.SafeError(cause)
-	tag, err := s.pool.Exec(ctx, `UPDATE platform.execution
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin complete uncertain execution: %w", err)
+	}
+	defer func() { rollback(tx) }()
+	tag, err := tx.Exec(ctx, `UPDATE platform.execution
 SET status = 'UNCERTAIN', last_error = $6, lease_owner = NULL, run_token = NULL,
     lease_until = NULL, finished_at = clock_timestamp(), updated_at = clock_timestamp()
 WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'RUNNING'
@@ -223,7 +251,22 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'RUNNING'
 		return fmt.Errorf("complete uncertain execution: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
+		var currentStatus string
+		if err := tx.QueryRow(ctx, `SELECT status FROM platform.execution WHERE tenant_id=$1 AND app_id=$2 AND request_id=$3`, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID()).Scan(&currentStatus); err == nil && isTerminalExecutionStatus(currentStatus) {
+			if err := releaseExecutionQuotaTx(ctx, tx, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID()); err != nil {
+				return err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit terminal quota cleanup: %w", err)
+			}
+		}
 		return fmt.Errorf("complete uncertain execution: %w", queue.ErrLeaseLost)
+	}
+	if err := releaseExecutionQuotaTx(ctx, tx, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID()); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit complete uncertain execution: %w", err)
 	}
 	return nil
 }
@@ -338,6 +381,11 @@ func (s *Store) Retry(ctx context.Context, claim queue.Claim, cause error) error
 	}
 	if err != nil {
 		return fmt.Errorf("retry execution: %w", err)
+	}
+	if !retryScheduled {
+		if err := releaseExecutionQuotaTx(ctx, tx, claim.Job.Tenant().TenantID, claim.Job.Tenant().AppID, claim.Job.RequestID()); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit execution retry: %w", err)
@@ -498,6 +546,9 @@ JOIN platform.agent_app a ON a.tenant_id=e.tenant_id AND a.app_id=e.app_id
 WHERE e.status='PENDING' AND t.status='ACTIVE' AND a.status='ACTIVE'
   AND NOT EXISTS (SELECT 1 FROM platform.dispatch_outbox o WHERE o.tenant_id=e.tenant_id AND o.app_id=e.app_id AND o.request_id=e.request_id AND o.status IN ('PENDING','PUBLISHING','SENT'))`); err != nil {
 		return fmt.Errorf("fill missing dispatch outbox: %w", err)
+	}
+	if err = releaseTerminalQuotaReservationsTx(ctx, tx); err != nil {
+		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit dispatch recovery: %w", err)

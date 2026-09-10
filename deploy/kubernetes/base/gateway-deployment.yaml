@@ -35,6 +35,8 @@ spec:
                 name: trpc-agent-service-config
             - secretRef:
                 name: trpc-agent-service-secrets
+            - secretRef:
+                name: trpc-agent-service-admin-secrets
           env:
             - name: TRPC_AGENT_SERVICE_ROLE
               value: gateway
@@ -57,8 +59,12 @@ spec:
             - name: TRPC_AGENT_SERVICE_ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: trpc-agent-service-secrets
+                  name: trpc-agent-service-admin-secrets
                   key: TRPC_AGENT_SERVICE_ADMIN_TOKEN
+          volumeMounts:
+            - name: platform-secrets
+              mountPath: /var/run/secrets/trpc-agent-service
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /readyz
@@ -80,3 +86,7 @@ spec:
             limits:
               cpu: "2"
               memory: 2Gi
+      volumes:
+        - name: platform-secrets
+          secret:
+            secretName: trpc-agent-service-secrets

@@ -3,6 +3,7 @@ package worker_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync/atomic"
 	"testing"
@@ -10,8 +11,10 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/internal/execution"
 	platformapproval "github.com/liuzengh/trpc-agent-service/trpcservice/approval"
+	platformaudit "github.com/liuzengh/trpc-agent-service/trpcservice/audit"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/guardrail"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/queue"
 	platformruntime "github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
@@ -152,6 +155,9 @@ func TestWorkerRunCallsRunnerAndDrainsEvents(t *testing.T) {
 	if !result.RunnerCompleted {
 		t.Fatal("runner completion was not observed")
 	}
+	if !result.TerminalEventPersisted {
+		t.Fatal("durable terminal event was not recorded")
+	}
 	if len(sink.events) != 2 {
 		t.Fatalf("sink event count = %d, want 2", len(sink.events))
 	}
@@ -175,6 +181,35 @@ func TestWorkerMarksTerminalEventForAtomicProjection(t *testing.T) {
 	}
 	if projected.TerminalStatus != queue.CompletionSucceeded {
 		t.Fatalf("projected terminal status = %q, want %q", projected.TerminalStatus, queue.CompletionSucceeded)
+	}
+}
+
+func TestWorkerGuardrailRejectionHonorsAuditPolicy(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("audit-%t", enabled), func(t *testing.T) {
+			appConfig := testAppConfig("tenant-a", sharedBackendConfig())
+			appConfig.Audit.Enabled = enabled
+			configs, err := config.NewStaticResolver(appConfig)
+			if err != nil {
+				t.Fatalf("new config resolver: %v", err)
+			}
+			audit := &recordingAuditSink{}
+			w := *worker.New(configs, nil, testSessionLocker{}, nil, nil)
+			w.Audit = audit
+			_, err = w.Run(context.Background(), testJobWith("request-guardrail-audit", "tenant-a", "session-1", func(_ *tenant.RuntimeContext, message *gateway.Message) {
+				message.Text = "password: hunter2"
+			}))
+			if err == nil || !errors.Is(err, guardrail.ErrInputBlocked) {
+				t.Fatalf("guardrail error = %v", err)
+			}
+			want := 0
+			if enabled {
+				want = 1
+			}
+			if len(audit.events) != want {
+				t.Fatalf("audit events = %d, want %d", len(audit.events), want)
+			}
+		})
 	}
 }
 
@@ -1170,6 +1205,15 @@ func (f eventSinkFunc) HandleRunnerEvent(
 	evt *event.Event,
 ) error {
 	return f(ctx, exec, evt)
+}
+
+type recordingAuditSink struct {
+	events []platformaudit.Event
+}
+
+func (s *recordingAuditSink) Record(_ context.Context, event platformaudit.Event) error {
+	s.events = append(s.events, event)
+	return nil
 }
 
 type staticSecretProvider string

@@ -20,6 +20,33 @@ groups:
           summary: Queue lag is high
           description: The p95 execution queue wait has exceeded 30 seconds for five minutes.
 
+      - alert: TRPCAgentWorkerCapacitySaturated
+        expr: max(trpc_agent_service_worker_utilization) > 0.9 and max(trpc_agent_service_queue_backlog) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Worker capacity is saturated
+          description: Worker utilization is above 90 percent while executable queue backlog is non-zero.
+
+      - alert: TRPCAgentModelLatencyHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(trpc_agent_service_model_latency_bucket[5m]))) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Model latency is high
+          description: The p95 model call latency has exceeded five seconds for five minutes.
+
+      - alert: TRPCAgentToolFailureHigh
+        expr: sum(rate(trpc_agent_service_tool_errors_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Tool failures are high
+          description: Tool failures exceed 0.1 events per second for five minutes.
+
       - alert: TRPCAgentPostgresUnavailable
         expr: min(trpc_agent_service_backend_ready{provider="postgres"}) < 1
         for: 2m
@@ -79,3 +106,24 @@ groups:
         annotations:
           summary: IM delivery failure ratio is high
           description: More than 20 percent of observed IM replies have failed for five minutes.
+
+      - alert: TRPCAgentIMCallbackFailureSpike
+        expr: |
+          sum(rate(trpc_agent_service_im_callback_count_total{result="failure"}[5m]))
+            /
+          clamp_min(sum(rate(trpc_agent_service_im_callback_count_total[5m])), 1) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: IM callback failure ratio is high
+          description: More than 20 percent of observed inbound IM callbacks have failed for five minutes.
+
+      - alert: TRPCAgentQuotaRejections
+        expr: sum(rate(trpc_agent_service_governance_rejected_total{error_type="quota_exceeded"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: Period quota is rejecting traffic
+          description: Tenant or application period quotas have rejected requests for ten minutes.

@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -46,6 +47,40 @@ type AppConfigView struct {
 	CreatedAt time.Time        `json:"created_at"`
 }
 
+// MarshalJSON removes credential references from the wire representation while
+// keeping Config as a typed value for in-process repository consumers.
+func (v AppConfigView) MarshalJSON() ([]byte, error) {
+	encoded, err := json.Marshal(v.Config)
+	if err != nil {
+		return nil, err
+	}
+	var config map[string]any
+	if err := json.Unmarshal(encoded, &config); err != nil {
+		return nil, err
+	}
+	delete(config, "secret_refs")
+	if modelConfig, ok := config["model"].(map[string]any); ok {
+		delete(modelConfig, "api_key_ref")
+	}
+	if backendConfig, ok := config["backend_config"].(map[string]any); ok {
+		for _, name := range []string{"session", "memory", "knowledge", "artifact"} {
+			if backend, ok := backendConfig[name].(map[string]any); ok {
+				delete(backend, "secret_ref")
+			}
+		}
+	}
+	safeConfig, err := json.Marshal(config)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		Config    json.RawMessage `json:"config"`
+		Status    string          `json:"status"`
+		Active    bool            `json:"active"`
+		CreatedAt time.Time       `json:"created_at"`
+	}{Config: safeConfig, Status: v.Status, Active: v.Active, CreatedAt: v.CreatedAt})
+}
+
 // TenantView contains the metadata and bounded health summary needed by the
 // Admin UI. It never contains credentials or runtime payloads.
 type TenantView struct {
@@ -53,6 +88,7 @@ type TenantView struct {
 	Name          string             `json:"name"`
 	Status        tenant.Status      `json:"status"`
 	Audit         tenant.AuditPolicy `json:"audit"`
+	Quota         tenant.QuotaPolicy `json:"quota"`
 	AgentAppCount int                `json:"agent_app_count"`
 	AnomalyStatus string             `json:"anomaly_status"`
 	UpdatedAt     time.Time          `json:"updated_at"`
@@ -61,11 +97,13 @@ type TenantView struct {
 // BackendSummary is a safe app-level backend reference. Opaque endpoint
 // options are intentionally omitted.
 type BackendSummary struct {
-	Kind      tenant.BackendKind `json:"kind"`
-	Provider  string             `json:"provider"`
-	Name      string             `json:"name"`
-	Status    string             `json:"status"`
-	SecretRef tenant.SecretRef   `json:"secret_ref,omitempty"`
+	Kind     tenant.BackendKind `json:"kind"`
+	Provider string             `json:"provider"`
+	Name     string             `json:"name"`
+	Status   string             `json:"status"`
+	// SecretRef remains an empty compatibility field for in-process callers;
+	// it is never serialized by the Admin API.
+	SecretRef tenant.SecretRef `json:"-"`
 }
 
 // ChannelSummary is a safe app-level channel binding summary.
@@ -74,6 +112,55 @@ type ChannelSummary struct {
 	BindingID        string `json:"binding_id"`
 	Status           string `json:"status"`
 	ConnectionStatus string `json:"connection_status"`
+}
+
+// ChannelBindingView is the Admin read representation. Provider credentials
+// are write-only references and never cross this response boundary.
+type ChannelBindingView struct {
+	TenantID         string                    `json:"tenant_id"`
+	AppID            string                    `json:"app_id"`
+	BindingID        string                    `json:"binding_id"`
+	Channel          channels.Channel          `json:"channel"`
+	ExternalAccount  string                    `json:"external_account"`
+	PublicRouteID    string                    `json:"public_route_id,omitempty"`
+	BindingRevision  int64                     `json:"binding_revision"`
+	Status           channels.BindingStatus    `json:"status"`
+	ConnectionStatus channels.ConnectionStatus `json:"connection_status"`
+	LastConnectedAt  *time.Time                `json:"last_connected_at,omitempty"`
+	LastError        string                    `json:"last_error,omitempty"`
+}
+
+func safeErrorCategory(value string) string {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return ""
+	}
+	switch {
+	case strings.Contains(lower, "timeout"), strings.Contains(lower, "deadline"):
+		return "timeout"
+	case strings.Contains(lower, "auth"), strings.Contains(lower, "credential"), strings.Contains(lower, "secret"):
+		return "authentication"
+	case strings.Contains(lower, "lease"):
+		return "lease_lost"
+	case strings.Contains(lower, "quota"):
+		return "quota_exceeded"
+	case strings.Contains(lower, "policy"), strings.Contains(lower, "permission"):
+		return "policy_denied"
+	case strings.Contains(lower, "connect"), strings.Contains(lower, "database"), strings.Contains(lower, "redis"), strings.Contains(lower, "backend"):
+		return "backend_unavailable"
+	default:
+		return "execution_failed"
+	}
+}
+
+func sanitizeBinding(value channels.Binding) ChannelBindingView {
+	return ChannelBindingView{
+		TenantID: value.TenantID, AppID: value.AppID, BindingID: value.BindingID,
+		Channel: value.Channel, ExternalAccount: value.ExternalAccount,
+		PublicRouteID: value.PublicRouteID, BindingRevision: value.BindingRevision,
+		Status: value.Status, ConnectionStatus: value.ConnectionStatus,
+		LastConnectedAt: value.LastConnectedAt, LastError: safeErrorCategory(value.LastError),
+	}
 }
 
 // AgentAppView contains release state plus bounded backend/channel summaries.
@@ -225,6 +312,12 @@ func (a API) ListAppConfigsForPrincipal(
 
 func sanitizeAppConfig(value tenant.AppConfig) tenant.AppConfig {
 	value = value.Clone()
+	value.Model.APIKeyRef = tenant.SecretRef{}
+	value.BackendConfig.Session.SecretRef = tenant.SecretRef{}
+	value.BackendConfig.Memory.SecretRef = tenant.SecretRef{}
+	value.BackendConfig.Knowledge.SecretRef = tenant.SecretRef{}
+	value.BackendConfig.Artifact.SecretRef = tenant.SecretRef{}
+	value.SecretRefs = nil
 	value.Model.Parameters = sanitizeModelParameters(value.Model.Parameters)
 	value.BackendConfig.Session.Options = sanitizeOptions(value.BackendConfig.Session.Options, "schema")
 	value.BackendConfig.Memory.Options = nil
@@ -296,7 +389,7 @@ func (a API) ListChannelBindingsForPrincipal(
 	ctx context.Context,
 	principal AdminPrincipal,
 	options ListOptions,
-) ([]channels.Binding, error) {
+) ([]ChannelBindingView, error) {
 	if err := options.validate(false); err != nil {
 		return nil, invalidInput(err)
 	}
@@ -311,7 +404,11 @@ func (a API) ListChannelBindingsForPrincipal(
 	if err != nil {
 		return nil, fmt.Errorf("list channel bindings: %w", err)
 	}
-	return values, nil
+	result := make([]ChannelBindingView, 0, len(values))
+	for _, value := range values {
+		result = append(result, sanitizeBinding(value))
+	}
+	return result, nil
 }
 
 func (a API) ListExecutionsForPrincipal(
@@ -332,6 +429,9 @@ func (a API) ListExecutionsForPrincipal(
 	values, err := reader.ListExecutions(ctx, options)
 	if err != nil {
 		return nil, fmt.Errorf("list executions: %w", err)
+	}
+	for i := range values {
+		values[i].LastError = safeErrorCategory(values[i].LastError)
 	}
 	return values, nil
 }

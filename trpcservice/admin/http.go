@@ -223,7 +223,7 @@ type publishedAppConfigResponse struct {
 }
 
 type channelBindingsResponse struct {
-	Bindings []channels.Binding `json:"bindings"`
+	Bindings []ChannelBindingView `json:"bindings"`
 }
 
 type executionsResponse struct {
@@ -519,7 +519,7 @@ func (h adminHTTPHandler) createChannelBinding(w http.ResponseWriter, r *http.Re
 		writeAdminOperationError(w, err, "create channel binding failed")
 		return
 	}
-	writeJSON(w, http.StatusCreated, binding)
+	writeJSON(w, http.StatusCreated, sanitizeBinding(binding))
 }
 
 func (h adminHTTPHandler) enableChannelBinding(w http.ResponseWriter, r *http.Request) {
@@ -546,7 +546,7 @@ func (h adminHTTPHandler) setChannelBindingStatus(w http.ResponseWriter, r *http
 		writeAdminOperationError(w, err, "set channel binding status failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, binding)
+	writeJSON(w, http.StatusOK, sanitizeBinding(binding))
 }
 
 func (h adminHTTPHandler) publishAppConfig(w http.ResponseWriter, r *http.Request) {

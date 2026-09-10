@@ -108,6 +108,9 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'PENDING'`
 			return RecallResult{}, fmt.Errorf("cancel pending execution: %w", err)
 		}
 		result.ExecutionStatus = "CANCELED"
+		if err := releaseExecutionQuotaTx(ctx, tx, request.TenantID, request.AppID, inboxRequestID); err != nil {
+			return RecallResult{}, err
+		}
 	case "RUNNING":
 		if _, err := tx.Exec(ctx, `
 UPDATE platform.execution
@@ -121,6 +124,9 @@ WHERE tenant_id = $1 AND app_id = $2 AND request_id = $3 AND status = 'RUNNING'`
 			return RecallResult{}, fmt.Errorf("cancel running execution: %w", err)
 		}
 		result.ExecutionStatus = "CANCELED"
+		if err := releaseExecutionQuotaTx(ctx, tx, request.TenantID, request.AppID, inboxRequestID); err != nil {
+			return RecallResult{}, err
+		}
 	default:
 		// Completed and previously canceled executions are retained.
 	}

@@ -60,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           docker compose --env-file .env.example -f compose.yaml -f compose.deployment-e2e.yaml \
-            up -d --build --wait postgres redis qdrant gateway channel worker-1 worker-2
+            up -d --build --wait postgres redis qdrant otel-collector prometheus gateway channel worker-1 worker-2
           for attempt in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8080/readyz >/dev/null; then
               exit 0
@@ -130,6 +130,7 @@ jobs:
               "- Runtime peak: gateway cpu=" + (.runtime_metrics.gateway.cpu_peak_percent|tostring) + "%, memory=" + (.runtime_metrics.gateway.memory_peak_bytes|tostring) + " bytes; workers cpu=" + (.runtime_metrics.worker_cpu_peak_percent|tostring) + "%, memory=" + (.runtime_metrics.worker_memory_peak_bytes|tostring) + " bytes\n" +
               "- Redis: pending peak=" + (.redis_metrics.pending_peak|tostring) + ", lag peak=" + (.redis_metrics.lag_peak|tostring) + ", final pending=" + (.redis_metrics.final_pending|tostring) + ", final lag=" + (.redis_metrics.final_lag|tostring) + ", commands=" + (.redis_metrics.total_commands_delta|tostring) + " (" + (.redis_metrics.average_commands_per_second|tostring) + " / sec)\n" +
               "- PostgreSQL: transactions=" + (.postgres_metrics.transactions_delta|tostring) + ", writes=" + (.postgres_metrics.write_delta|tostring) + ", tx/sec=" + (.postgres_metrics.average_transactions_per_second|tostring) + ", writes/sec=" + (.postgres_metrics.average_write_operations_per_second|tostring) + "\n" +
+              "- Business metrics: tokens/s peak=" + (.business_metrics.peak.token_rate|tostring) + ", cost/s peak=" + (.business_metrics.peak.cost_rate|tostring) + ", model p95 peak=" + (.business_metrics.peak.model_latency_p95_seconds|tostring) + " sec, tool p95 peak=" + (.business_metrics.peak.tool_latency_p95_seconds|tostring) + " sec, queue lag p95 peak=" + (.business_metrics.peak.queue_lag_p95_seconds|tostring) + " sec, callback failure ratio peak=" + (.business_metrics.peak.callback_failure_ratio|tostring) + ", reply failure ratio peak=" + (.business_metrics.peak.reply_failure_ratio|tostring) + "\n" +
               "- Infrastructure metrics: " + (.infrastructure_metrics_status|tostring) + "\n" +
               "- Success criteria: " + (.success_criteria_passed|tostring)
             ' "$report")"; then

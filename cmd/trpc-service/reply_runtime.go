@@ -7,6 +7,7 @@ import (
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/postgres"
 	platformredis "github.com/liuzengh/trpc-agent-service/trpcservice/redis"
+	platformsecret "github.com/liuzengh/trpc-agent-service/trpcservice/secret"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
 
@@ -26,13 +27,12 @@ func newReplyRuntime(
 	redisClient *platformredis.Client,
 	owner string,
 	wecomResolver channeloutbound.WeComMessageSenderResolver,
-	getenv func(string) string,
+	secrets platformsecret.SecretProvider,
 	metrics *platformmetrics.Recorder,
 ) (*replyRuntime, error) {
-	if store == nil || redisClient == nil || owner == "" {
+	if store == nil || redisClient == nil || owner == "" || secrets == nil {
 		return nil, errors.New("reply runtime dependencies are required")
 	}
-	secrets := environmentSecretProvider{getenv: getenv}
 	limiter, err := platformredis.NewReplyRateLimiter(
 		redisClient,
 		defaultReplyRateLimit,

@@ -4,6 +4,7 @@ package tenant
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"slices"
 	"strings"
@@ -13,6 +14,10 @@ import (
 // token budget. It is deliberately owned by the tenant policy package so the
 // runtime callback and worker completion path share one stable error class.
 var ErrBudgetExceeded = errors.New("execution token budget exceeded")
+
+// ErrQuotaExceeded is returned when a tenant or application period quota is
+// exhausted. It is intentionally separate from the per-execution budget.
+var ErrQuotaExceeded = errors.New("period quota exceeded")
 
 // Status is the lifecycle state of a tenant or agent application.
 type Status string
@@ -41,6 +46,7 @@ type Tenant struct {
 	Name   string      `json:"name"`
 	Status Status      `json:"status"`
 	Audit  AuditPolicy `json:"audit"`
+	Quota  QuotaPolicy `json:"quota"`
 }
 
 // Validate checks the persisted tenant configuration. The zero value is invalid.
@@ -56,6 +62,9 @@ func (t Tenant) Validate() error {
 	}
 	if err := t.Audit.Validate(); err != nil {
 		return fmt.Errorf("audit policy: %w", err)
+	}
+	if err := t.Quota.Validate(); err != nil {
+		return fmt.Errorf("quota policy: %w", err)
 	}
 	return nil
 }
@@ -362,16 +371,71 @@ func (p IMAccessPolicy) Allows(userID, conversationID string) bool {
 		containsString(p.AllowedConversations, conversationID)
 }
 
-// BudgetPolicy controls the maximum model tokens consumed by one execution.
-// Zero means unlimited. The counter is per execution, never shared by tenant.
+// BudgetPolicy controls per-execution and application-period model budgets.
+// Zero means unlimited. Period quotas are durably accounted by the control
+// plane; Max*PerExecution also bounds the reservation at admission.
 type BudgetPolicy struct {
-	MaxTokensPerExecution int `json:"max_tokens_per_execution"`
+	MaxTokensPerExecution int     `json:"max_tokens_per_execution"`
+	MaxCostPerExecution   float64 `json:"max_cost_per_execution"`
+	DailyTokenQuota       int64   `json:"daily_token_quota"`
+	MonthlyTokenQuota     int64   `json:"monthly_token_quota"`
+	DailyCostQuota        float64 `json:"daily_cost_quota"`
+	MonthlyCostQuota      float64 `json:"monthly_cost_quota"`
 }
 
-// Validate checks the token limit. Zero disables the limit.
+// QuotaPolicy contains tenant-level daily and monthly token/cost limits.
+// Zero disables a limit.
+type QuotaPolicy struct {
+	DailyTokenQuota   int64   `json:"daily_token_quota"`
+	MonthlyTokenQuota int64   `json:"monthly_token_quota"`
+	DailyCostQuota    float64 `json:"daily_cost_quota"`
+	MonthlyCostQuota  float64 `json:"monthly_cost_quota"`
+}
+
+func (p QuotaPolicy) Validate() error {
+	if p.DailyTokenQuota < 0 || p.MonthlyTokenQuota < 0 {
+		return errors.New("token quotas must be non-negative")
+	}
+	if p.DailyCostQuota < 0 || p.MonthlyCostQuota < 0 ||
+		math.IsNaN(p.DailyCostQuota) || math.IsNaN(p.MonthlyCostQuota) ||
+		math.IsInf(p.DailyCostQuota, 0) || math.IsInf(p.MonthlyCostQuota, 0) {
+		return errors.New("cost quotas must be finite and non-negative")
+	}
+	return nil
+}
+
+func (p QuotaPolicy) HasLimit() bool {
+	return p.DailyTokenQuota > 0 || p.MonthlyTokenQuota > 0 ||
+		p.DailyCostQuota > 0 || p.MonthlyCostQuota > 0
+}
+
+func (p BudgetPolicy) QuotaPolicy() QuotaPolicy {
+	return QuotaPolicy{
+		DailyTokenQuota: p.DailyTokenQuota, MonthlyTokenQuota: p.MonthlyTokenQuota,
+		DailyCostQuota: p.DailyCostQuota, MonthlyCostQuota: p.MonthlyCostQuota,
+	}
+}
+
+// Validate checks the per-execution limits and requires a finite reservation
+// bound whenever an application period quota is configured.
 func (p BudgetPolicy) Validate() error {
 	if p.MaxTokensPerExecution < 0 {
 		return errors.New("max_tokens_per_execution must be non-negative")
+	}
+	if p.MaxCostPerExecution < 0 || math.IsNaN(p.MaxCostPerExecution) || math.IsInf(p.MaxCostPerExecution, 0) {
+		return errors.New("max_cost_per_execution must be finite and non-negative")
+	}
+	quota := p.QuotaPolicy()
+	if err := quota.Validate(); err != nil {
+		return err
+	}
+	if p.DailyTokenQuota > 0 && p.MaxTokensPerExecution == 0 ||
+		p.MonthlyTokenQuota > 0 && p.MaxTokensPerExecution == 0 {
+		return errors.New("token quota requires max_tokens_per_execution")
+	}
+	if p.DailyCostQuota > 0 && p.MaxCostPerExecution == 0 ||
+		p.MonthlyCostQuota > 0 && p.MaxCostPerExecution == 0 {
+		return errors.New("cost quota requires max_cost_per_execution")
 	}
 	return nil
 }

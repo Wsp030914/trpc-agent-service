@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/guardrail"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -95,6 +96,8 @@ func IsPermanentExecutionError(err error) bool {
 	var pointer *PermanentExecutionError
 	return errors.As(err, &pointer) ||
 		errors.Is(err, tenant.ErrBudgetExceeded) ||
+		errors.Is(err, tenant.ErrQuotaExceeded) ||
+		errors.Is(err, guardrail.ErrInputBlocked) ||
 		errors.Is(err, ErrExecutionCanceled) ||
 		errors.Is(err, context.Canceled)
 }

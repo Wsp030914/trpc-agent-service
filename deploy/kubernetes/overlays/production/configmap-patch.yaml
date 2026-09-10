@@ -3,6 +3,8 @@ kind: ConfigMap
 metadata:
   name: trpc-agent-service-config
 data:
+  TRPC_AGENT_SERVICE_SECRET_BACKEND: file
+  TRPC_AGENT_SERVICE_SECRET_DIR: /var/run/secrets/trpc-agent-service
   # Replace example endpoints before applying this overlay.
   TRPC_AGENT_SERVICE_OTEL_TRACES_ENDPOINT: otel-collector.production.example.com:4317
   TRPC_AGENT_SERVICE_OTEL_METRICS_ENDPOINT: otel-collector.production.example.com:4317

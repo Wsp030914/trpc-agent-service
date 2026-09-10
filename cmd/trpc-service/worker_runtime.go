@@ -52,6 +52,7 @@ type workerRuntimeDependencies struct {
 	stream                      *platformredis.Stream
 	owner                       string
 	getenv                      func(string) string
+	secrets                     platformsecret.SecretProvider
 	artifacts                   *artifactcos.Resolver
 	defaultSessionDSN           string
 	defaultRedisURL             string
@@ -79,7 +80,10 @@ func newWorkerRuntime(deps workerRuntimeDependencies) (*workerRuntime, error) {
 	if deps.store == nil || deps.redisClient == nil || deps.stream == nil || deps.owner == "" || deps.artifacts == nil {
 		return nil, errors.New("worker runtime dependencies are required")
 	}
-	secrets := environmentSecretProvider{getenv: deps.getenv}
+	secrets := deps.secrets
+	if secrets == nil {
+		secrets = environmentSecretProvider{getenv: deps.getenv}
+	}
 	qdrantEndpoints := environmentQdrantEndpointResolver{getenv: deps.getenv}
 	models, err := platformruntime.NewOpenAIModelResolver(
 		secrets,

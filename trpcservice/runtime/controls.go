@@ -21,18 +21,29 @@ import (
 )
 
 type tokenBudget struct {
-	limit     int
-	used      int
-	reserved  int
-	unmetered bool
-	mu        sync.Mutex
+	tokenLimit int
+	costLimit  float64
+	usedTokens int
+	usedCost   float64
+	reserved   bool
+	unmetered  bool
+	estimate   func(int, int) (float64, bool)
+	mu         sync.Mutex
 }
 
-func newBudgetCallbacks(policy tenant.BudgetPolicy) *model.Callbacks {
-	if policy.MaxTokensPerExecution <= 0 {
+func newBudgetCallbacks(policy tenant.BudgetPolicy, estimates ...func(int, int) (float64, bool)) *model.Callbacks {
+	if policy.MaxTokensPerExecution <= 0 && policy.MaxCostPerExecution <= 0 {
 		return nil
 	}
-	budget := &tokenBudget{limit: policy.MaxTokensPerExecution}
+	var estimate func(int, int) (float64, bool)
+	if len(estimates) > 0 {
+		estimate = estimates[0]
+	}
+	budget := &tokenBudget{
+		tokenLimit: policy.MaxTokensPerExecution,
+		costLimit:  policy.MaxCostPerExecution,
+		estimate:   estimate,
+	}
 	callbacks := model.NewCallbacks()
 	callbacks.RegisterBeforeModel(func(_ context.Context, _ *model.BeforeModelArgs) (*model.BeforeModelResult, error) {
 		budget.mu.Lock()
@@ -40,9 +51,11 @@ func newBudgetCallbacks(policy tenant.BudgetPolicy) *model.Callbacks {
 		// flight. Usage is only known in AfterModel, so allowing another
 		// concurrent call here could let both calls pass before either one
 		// charges its tokens.
-		depleted := budget.unmetered || budget.used >= budget.limit || budget.reserved > 0
+		depleted := budget.unmetered || budget.reserved ||
+			(budget.tokenLimit > 0 && budget.usedTokens >= budget.tokenLimit) ||
+			(budget.costLimit > 0 && budget.usedCost >= budget.costLimit)
 		if !depleted {
-			budget.reserved = budget.limit - budget.used
+			budget.reserved = true
 		}
 		budget.mu.Unlock()
 		if depleted {
@@ -60,31 +73,44 @@ func newBudgetCallbacks(policy tenant.BudgetPolicy) *model.Callbacks {
 		// not the same as a successful call whose usage cannot be trusted.
 		if args != nil && (args.Error != nil || (args.Response != nil && args.Response.Error != nil)) {
 			total, metered := modelResponseUsage(args)
+			cost, costMetered := modelResponseCost(args, budget.estimate)
 			budget.mu.Lock()
-			budget.reserved = 0
+			budget.reserved = false
 			if metered {
-				budget.used += total
+				budget.usedTokens += total
 			} else {
 				// A failed model call without trusted usage is still an unknown
 				// spend. Keep the execution fail-closed so a retry cannot create
 				// unbounded unmetered model calls.
 				budget.unmetered = true
 			}
+			if budget.costLimit > 0 {
+				if costMetered {
+					budget.usedCost += cost
+				} else {
+					budget.unmetered = true
+				}
+			}
 			budget.mu.Unlock()
 			return nil, nil
 		}
 		total, metered := modelResponseUsage(args)
+		cost, costMetered := modelResponseCost(args, budget.estimate)
 		budget.mu.Lock()
-		budget.reserved = 0
-		if !metered {
+		budget.reserved = false
+		if !metered || (budget.costLimit > 0 && !costMetered) {
 			// A successful model call without trusted usage must not leave the
 			// budget available for unlimited follow-up calls.
 			budget.unmetered = true
 			budget.mu.Unlock()
 			return nil, tenant.ErrBudgetExceeded
 		}
-		budget.used += total
-		depleted := budget.used > budget.limit
+		budget.usedTokens += total
+		if budget.costLimit > 0 {
+			budget.usedCost += cost
+		}
+		depleted := (budget.tokenLimit > 0 && budget.usedTokens > budget.tokenLimit) ||
+			(budget.costLimit > 0 && budget.usedCost > budget.costLimit)
 		budget.mu.Unlock()
 		if depleted {
 			return nil, tenant.ErrBudgetExceeded
@@ -104,11 +130,41 @@ func modelResponseUsage(args *model.AfterModelArgs) (int, bool) {
 		return 0, false
 	}
 	usage := args.Response.Usage
+	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+		return 0, false
+	}
 	total := usage.TotalTokens
 	if total <= 0 {
 		total = usage.PromptTokens + usage.CompletionTokens
 	}
 	return total, total > 0
+}
+
+func modelResponseCost(args *model.AfterModelArgs, estimate func(int, int) (float64, bool)) (float64, bool) {
+	if args == nil || args.Response == nil || args.Response.Usage == nil || estimate == nil {
+		return 0, false
+	}
+	usage := args.Response.Usage
+	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 {
+		return 0, false
+	}
+	if usage.TotalTokens > 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+		return 0, false
+	}
+	return estimate(usage.PromptTokens, usage.CompletionTokens)
+}
+
+func modelCostEstimator(metrics *platformmetrics.Recorder, provider, modelName string) func(int, int) (float64, bool) {
+	if metrics == nil {
+		return nil
+	}
+	return func(inputTokens, outputTokens int) (float64, bool) {
+		cost := metrics.EstimateCost(provider, modelName, inputTokens, outputTokens)
+		if cost == nil {
+			return 0, false
+		}
+		return *cost, true
+	}
 }
 
 type modelSpanState struct {

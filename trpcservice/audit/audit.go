@@ -103,6 +103,8 @@ type Event struct {
 	AgentName         string        `json:"agent_name"`
 	ToolName          string        `json:"tool_name"`
 	Decision          string        `json:"decision"`
+	PolicyRuleID      string        `json:"policy_rule_id,omitempty"`
+	PolicyReason      string        `json:"policy_reason,omitempty"`
 	Latency           time.Duration `json:"latency"`
 	ErrorType         string        `json:"error_type"`
 	Cost              *float64      `json:"cost,omitempty"`
@@ -152,6 +154,25 @@ func RedactString(value string) string {
 	return value
 }
 
+// SafePolicyReason keeps policy explanations useful without allowing a
+// permission callback to persist arbitrary model/tool text.
+func SafePolicyReason(value string) string {
+	value = strings.TrimSpace(strings.ToLower(RedactString(value)))
+	if value == "" {
+		return ""
+	}
+	if len([]rune(value)) > 128 {
+		return "policy_blocked"
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' || r == ' ' {
+			continue
+		}
+		return "policy_blocked"
+	}
+	return value
+}
+
 // RedactEvent returns an audit event with user-controlled identity metadata
 // redacted. Prompts and raw tool arguments are not part of Event.
 func RedactEvent(e Event) Event {
@@ -162,6 +183,8 @@ func RedactEvent(e Event) Event {
 	e.SessionID = RedactString(e.SessionID)
 	e.AgentName = RedactString(e.AgentName)
 	e.ToolName = RedactString(e.ToolName)
+	e.PolicyRuleID = SafePolicyReason(e.PolicyRuleID)
+	e.PolicyReason = SafePolicyReason(e.PolicyReason)
 	e.ErrorType = RedactString(e.ErrorType)
 	return e
 }

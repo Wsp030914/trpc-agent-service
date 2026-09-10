@@ -531,10 +531,26 @@ func (r *Recorder) RecordSession(ctx context.Context, labels Labels, latency tim
 
 // RecordMemory records an immutable-config-selected memory backend call.
 func (r *Recorder) RecordMemory(ctx context.Context, labels Labels, latency time.Duration, errType string) {
+	r.RecordMemoryOperation(ctx, labels, "ingest", latency, errType)
+}
+
+// RecordMemoryOperation records one low-cardinality memory operation. The
+// current TencentDB integration uses ingest; read/search/retrieve adapters can
+// use the same span/metric contract when those capabilities are added.
+func (r *Recorder) RecordMemoryOperation(
+	ctx context.Context,
+	labels Labels,
+	operation string,
+	latency time.Duration,
+	errType string,
+) {
 	if r == nil {
 		return
 	}
-	labels.Operation = "memory"
+	if strings.TrimSpace(operation) == "" {
+		operation = "unknown"
+	}
+	labels.Operation = "memory." + operation
 	labels.ErrorType = errType
 	setResultForError(&labels, "success", errType)
 	attrs := labels.attributes()

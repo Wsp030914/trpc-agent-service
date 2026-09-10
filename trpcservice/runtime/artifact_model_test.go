@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/guardrail"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
@@ -65,6 +66,45 @@ func TestArtifactHydratingModelLoadsReferenceBeforeProviderCall(t *testing.T) {
 	originalPart := request.Messages[0].ContentParts[0]
 	if originalPart.File != nil || originalPart.ContentRef == nil {
 		t.Fatalf("durable request was mutated with artifact bytes: %#v", originalPart)
+	}
+}
+
+func TestArtifactHydratingModelChecksHydratedBytesBeforeProvider(t *testing.T) {
+	storage := artifactmemory.NewService()
+	info := frameworkartifact.SessionInfo{
+		AppName:   "tenant-a/app-a/runner/v1",
+		UserID:    "principal-a",
+		SessionID: "guardrail-attachment",
+	}
+	if _, err := storage.SaveArtifact(context.Background(), info, "inbound/file", &frameworkartifact.Artifact{
+		Data:     []byte("password: hunter2"),
+		Name:     "notes.txt",
+		MimeType: "text/plain",
+	}); err != nil {
+		t.Fatalf("save artifact: %v", err)
+	}
+	provider := &capturingModel{}
+	hydrating := &artifactHydratingModel{
+		Model:        provider,
+		artifacts:    storage,
+		info:         info,
+		capabilities: tenant.ModelAttachmentCapabilities{File: true},
+	}
+	_, err := hydrating.GenerateContent(context.Background(), &frameworkmodel.Request{Messages: []frameworkmodel.Message{{
+		Role: frameworkmodel.RoleUser,
+		ContentParts: []frameworkmodel.ContentPart{{
+			Type:       frameworkmodel.ContentTypeFile,
+			ContentRef: &frameworkmodel.ContentRef{ArtifactRef: "artifact://inbound/file@0"},
+		}},
+	}}})
+	if !errors.Is(err, guardrail.ErrInputBlocked) {
+		t.Fatalf("error = %v, want hydrated attachment guardrail rejection", err)
+	}
+	if !worker.IsPermanentExecutionError(err) || worker.IsRetryableExecutionError(err) {
+		t.Fatalf("guardrail error classification = %v, want permanent and not retryable", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("provider was called with blocked hydrated attachment: %d", provider.calls)
 	}
 }
 

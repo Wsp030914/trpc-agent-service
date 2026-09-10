@@ -142,6 +142,9 @@ func (s *Store) Admit(
 		runtimeContext:   request.Identity.Tenant,
 		configVersion:    app.ActiveConfigVersion,
 		channelAdmission: request.ChannelInput != nil,
+		tenantQuota:      tnt.Quota,
+		appBudget:        appConfig.Budget,
+		metrics:          s.metrics,
 	}
 	if request.ChannelInput == nil {
 		if request.Identity.ConfigVersionPinned() {
@@ -162,6 +165,10 @@ func (s *Store) Admit(
 		}
 		admission.runtimeContext.ConfigVersion = admission.configVersion
 	}
+	// Canary and pinned-config selection above may replace the initially
+	// resolved active version. Quota reservation must use the pinned version's
+	// application budget.
+	admission.appBudget = appConfig.Budget
 	if request.ChannelInput != nil {
 		if s.identityMapper == nil {
 			return gateway.AdmissionResult{}, errors.New("channel identity mapper is required")
@@ -338,6 +345,7 @@ func (s *Store) Admit(
 			return gateway.AdmissionResult{}, err
 		}
 	}
+	admission.appBudget = appConfig.Budget
 	existing, found, err := findExecutionByIdempotency(
 		ctx,
 		tx,
@@ -577,6 +585,9 @@ type admissionTransaction struct {
 	runtimeContext   tenant.RuntimeContext
 	configVersion    string
 	channelAdmission bool
+	tenantQuota      tenant.QuotaPolicy
+	appBudget        tenant.BudgetPolicy
+	metrics          *platformmetrics.Recorder
 }
 
 func resolveAdmissionConfig(
@@ -754,6 +765,20 @@ func (a admissionTransaction) createExecution() (gateway.AdmissionResult, error)
 	if requestExists {
 		return gateway.AdmissionResult{}, fmt.Errorf("request_id already exists: %w", gateway.ErrIdempotencyConflict)
 	}
+	if err := reserveExecutionQuota(a.ctx, a.tx, a.credential.TenantID, a.credential.AppID,
+		a.request.RequestID, a.tenantQuota, a.appBudget); err != nil {
+		if errors.Is(err, tenant.ErrQuotaExceeded) {
+			if a.metrics != nil {
+				a.metrics.RecordGovernanceRejected(a.ctx, platformmetrics.Labels{
+					TenantID: a.credential.TenantID,
+					AppID:    a.credential.AppID,
+					Channel:  a.runtimeContext.Channel,
+				}, "quota_exceeded")
+			}
+			return gateway.AdmissionResult{}, fmt.Errorf("%w: %w", gateway.ErrAdmissionQuotaExceeded, err)
+		}
+		return gateway.AdmissionResult{}, err
+	}
 
 	runtimeContext := a.runtimeContext
 	if runtimeContext == (tenant.RuntimeContext{}) {
@@ -913,21 +938,24 @@ func validateAdmissionCredential(
 
 func lockTenant(ctx context.Context, tx pgx.Tx, tenantID string) (tenant.Tenant, error) {
 	var value tenant.Tenant
-	var auditPolicy []byte
+	var auditPolicy, quotaPolicy []byte
 	err := tx.QueryRow(
 		ctx,
-		`SELECT tenant_id, name, status, audit_policy
+		`SELECT tenant_id, name, status, audit_policy, quota_policy
 FROM platform.tenant
 WHERE tenant_id = $1
 FOR UPDATE`,
 		tenantID,
-	).Scan(&value.ID, &value.Name, &value.Status, &auditPolicy)
+	).Scan(&value.ID, &value.Name, &value.Status, &auditPolicy, &quotaPolicy)
 	if err != nil {
 		return tenant.Tenant{}, resolveError("tenant", err)
 	}
 	value.Audit, err = unmarshalAuditPolicy(auditPolicy)
 	if err != nil {
 		return tenant.Tenant{}, err
+	}
+	if err := json.Unmarshal(quotaPolicy, &value.Quota); err != nil {
+		return tenant.Tenant{}, fmt.Errorf("unmarshal tenant quota policy: %w", err)
 	}
 	if err := value.Validate(); err != nil {
 		return tenant.Tenant{}, fmt.Errorf("stored tenant: %w", err)

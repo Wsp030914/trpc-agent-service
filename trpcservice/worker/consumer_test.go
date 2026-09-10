@@ -35,6 +35,40 @@ func TestConsumerAcknowledgesAfterExecutionCompletion(t *testing.T) {
 	}
 }
 
+func TestConsumerReleasesQuotaOnlyAfterDurableTerminalEvent(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		persist bool
+		release bool
+	}{
+		{name: "completion not persisted", persist: false, release: false},
+		{name: "completion persisted", persist: true, release: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			claim := testQueueClaim(t, "request-consumer-quota-"+tt.name)
+			stream := &testStream{delivery: queue.Delivery{
+				ID:       "quota-" + tt.name,
+				Dispatch: queue.Dispatch{OutboxID: 101, TenantID: "tenant-a", AppID: "support", RequestID: claim.Job.RequestID()},
+			}, cancel: cancel}
+			store := &testExecutionStore{claim: claim}
+			consumer, err := worker.NewConsumer(&consumerExecutor{
+				result: worker.RunResult{RunnerCompleted: true, TerminalEventPersisted: tt.persist},
+			}, stream, store, "worker-1")
+			if err != nil {
+				t.Fatalf("new consumer: %v", err)
+			}
+			if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("run = %v", err)
+			}
+			if store.usageCalls != 1 || len(store.usageReleases) != 1 || store.usageReleases[0] != tt.release {
+				t.Fatalf("usage calls=%d releases=%v, want one/%v", store.usageCalls, store.usageReleases, tt.release)
+			}
+		})
+	}
+}
+
 func TestConsumerIgnoresExecutionCleanupErrorForCompletion(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -470,6 +504,8 @@ type testExecutionStore struct {
 	claimCalls    int
 	completed     queue.CompletionStatus
 	retries       int
+	usageCalls    int
+	usageReleases []bool
 }
 
 func (s *testExecutionStore) Claim(_ context.Context, _ queue.Dispatch, _ queue.ClaimRequest) (queue.Claim, bool, error) {
@@ -501,6 +537,11 @@ func (s *testExecutionStore) WaitForApproval(_ context.Context, _ queue.Claim, _
 }
 func (s *testExecutionStore) Retry(_ context.Context, _ queue.Claim, _ error) error {
 	s.retries++
+	return nil
+}
+func (s *testExecutionStore) RecordExecutionUsage(_ context.Context, _ queue.Claim, _ worker.RunResult, release bool) error {
+	s.usageCalls++
+	s.usageReleases = append(s.usageReleases, release)
 	return nil
 }
 func testQueueClaim(t *testing.T, requestID string) queue.Claim {

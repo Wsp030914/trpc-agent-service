@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/guardrail"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
@@ -267,6 +268,10 @@ LIMIT 1`,
 	} else if reply.StreamPhase != channels.StreamPhaseEnd {
 		currentText = appendStreamSnapshot(previousText, currentText)
 	}
+	// Redact after snapshot assembly. A credential split across two model
+	// deltas is invisible to per-delta filtering but must not reach durable
+	// outbox payloads.
+	currentText = sanitizeReplySnapshot(currentText)
 	if reply.ReplyKind() == channels.ReplyKindCard && reply.Card != nil {
 		reply.Card.Body = currentText
 	} else {
@@ -280,6 +285,10 @@ LIMIT 1`,
 		reply.StreamPhase = channels.StreamPhaseStart
 	}
 	return nil
+}
+
+func sanitizeReplySnapshot(text string) string {
+	return guardrail.SanitizeOutput(text).Text
 }
 
 func isLifecycleReply(reply channels.Reply) bool {

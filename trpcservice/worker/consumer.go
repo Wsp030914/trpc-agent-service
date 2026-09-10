@@ -41,6 +41,14 @@ type ExecutionStore interface {
 	Retry(context.Context, queue.Claim, error) error
 }
 
+// ExecutionUsageRecorder durably accounts model usage before a claimed
+// execution is completed. A terminal event may already have accounted and
+// released the reservation in its own transaction; implementations must make
+// repeated calls idempotent.
+type ExecutionUsageRecorder interface {
+	RecordExecutionUsage(context.Context, queue.Claim, RunResult, bool) error
+}
+
 // Consumer reads Redis Stream entries, claims their PostgreSQL execution, and
 // acknowledges Redis only after the persistent transition is complete.
 type Consumer struct {
@@ -436,6 +444,15 @@ func (c *Consumer) executeClaim(ctx context.Context, claim queue.Claim) (bool, e
 		// The execution has not reached a durable terminal transition. Leave the
 		// Redis delivery pending so lease recovery can finish it after shutdown.
 		return false, ctx.Err()
+	}
+	if recorder, ok := c.jobs.(ExecutionUsageRecorder); ok {
+		// Only the transaction that durably closes the execution may release the
+		// reservation. For normal runs that is Complete/Retry below; a terminal
+		// event sink can do both accounting and release before this point.
+		releaseQuota := result.TerminalEventPersisted && !result.ApprovalPending
+		if err := recorder.RecordExecutionUsage(completeCtx, claim, result, releaseQuota); err != nil {
+			return false, fmt.Errorf("record execution usage: %w", err)
+		}
 	}
 	if result.ApprovalPending {
 		if result.ApprovalID == "" {

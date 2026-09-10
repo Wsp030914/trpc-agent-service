@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/guardrail"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	frameworkartifact "trpc.group/trpc-go/trpc-agent-go/artifact"
@@ -70,6 +71,9 @@ func (m *artifactHydratingModel) GenerateContent(
 		}
 		return nil, err
 	}
+	if decision := guardrail.CheckInputRequest(*hydratedRequest); decision.Blocked {
+		return nil, worker.NewPermanentExecutionError(guardrail.InputBlockedError{RuleID: decision.RuleID})
+	}
 	return m.Model.GenerateContent(ctx, hydratedRequest)
 }
 
@@ -82,7 +86,7 @@ func (m *artifactHydratingModel) validateCurrentMessage(ctx context.Context, mes
 		return errors.New("artifact hydrating model is not initialized")
 	}
 	if !messageHasAttachments(message) {
-		return nil
+		return validateInputMessage(message)
 	}
 	validator := *m
 	validator.currentMessageHasAttachments = true
@@ -103,7 +107,18 @@ func (m *artifactHydratingModel) validateCurrentMessage(ctx context.Context, mes
 		}
 		return err
 	}
+	if err := validateInputMessage(request.Messages[0]); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateInputMessage(message model.Message) error {
+	decision := guardrail.CheckInputMessage(message)
+	if !decision.Blocked {
+		return nil
+	}
+	return worker.NewPermanentExecutionError(guardrail.InputBlockedError{RuleID: decision.RuleID})
 }
 
 func messageHasAttachments(message model.Message) bool {
@@ -219,6 +234,11 @@ func cloneRequest(request *model.Request) (*model.Request, error) {
 				audio := *part.Audio
 				audio.Data = bytes.Clone(part.Audio.Data)
 				part.Audio = &audio
+			}
+			if part.Video != nil {
+				video := *part.Video
+				video.Data = bytes.Clone(part.Video.Data)
+				part.Video = &video
 			}
 		}
 	}

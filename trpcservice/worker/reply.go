@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/guardrail"
 	platformlog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	platformmetrics "github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	platformtelemetry "github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
@@ -108,7 +109,9 @@ func BuildReplyEventForMode(
 		return nil, nil
 	}
 	if evt.IsTerminalError() {
-		text := replyErrorText(evt)
+		// Keep the final provider-facing boundary guarded even when callers
+		// invoke the projector directly instead of going through the journal.
+		text := safeReplyText(replyErrorText(evt))
 		if mode == ReplyModeText {
 			return []channels.Reply{newReply(exec, sequence, mode, text, "")}, nil
 		}
@@ -142,6 +145,7 @@ func BuildReplyEventForMode(
 			return nil, nil
 		}
 	}
+	text = safeReplyText(text)
 	if text == "" && !evt.IsRunnerCompletion() {
 		return nil, nil
 	}
@@ -158,6 +162,10 @@ func BuildReplyEventForMode(
 		return []channels.Reply{newCardReplyWithStatusAndPhase(exec, sequence, text, status, phase)}, nil
 	}
 	return []channels.Reply{newReply(exec, sequence, mode, text, phase)}, nil
+}
+
+func safeReplyText(text string) string {
+	return guardrail.SanitizeOutput(text).Text
 }
 
 func newReply(exec Execution, sequence int64, mode ReplyMode, text string, phase channels.StreamPhase) channels.Reply {

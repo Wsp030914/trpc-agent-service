@@ -13,6 +13,8 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -298,6 +300,42 @@ def docker_stats_snapshot(compose: list[str], record_error) -> dict[str, dict[st
     return result
 
 
+PROMETHEUS_QUERIES = {
+    "token_rate": "sum(rate(trpc_agent_service_tenant_model_token_usage_total[1m]))",
+    "cost_rate": "sum(rate(trpc_agent_service_tenant_estimated_cost_total[1m]))",
+    "model_latency_p95_seconds": "histogram_quantile(0.95, sum by (le) (rate(trpc_agent_service_model_latency_bucket[1m])))",
+    "tool_latency_p95_seconds": "histogram_quantile(0.95, sum by (le) (rate(trpc_agent_service_tool_latency_bucket[1m])))",
+    "callback_failure_ratio": "sum(rate(trpc_agent_service_im_callback_count_total{result=\"failure\"}[1m])) / clamp_min(sum(rate(trpc_agent_service_im_callback_count_total[1m])), 1)",
+    "reply_failure_ratio": "sum(rate(trpc_agent_service_im_reply_failure_total[1m])) / clamp_min(sum(rate(trpc_agent_service_im_reply_success_total[1m])) + sum(rate(trpc_agent_service_im_reply_failure_total[1m])), 1)",
+    "queue_lag_p95_seconds": "histogram_quantile(0.95, sum by (le) (rate(trpc_agent_service_queue_lag_bucket[1m])))",
+    "worker_utilization": "max(trpc_agent_service_worker_utilization)",
+}
+
+
+def prometheus_snapshot(base_url: str, record_error) -> dict[str, object]:
+    result: dict[str, object] = {name: UNAVAILABLE for name in PROMETHEUS_QUERIES}
+    if not base_url:
+        record_error("prometheus.url")
+        return result
+    for name, query in PROMETHEUS_QUERIES.items():
+        try:
+            url = f"{base_url.rstrip('/')}/api/v1/query?{urlencode({'query': query})}"
+            request = Request(url, headers={"Accept": "application/json"})
+            with urlopen(request, timeout=3) as response:
+                payload = json.load(response)
+            rows = payload.get("data", {}).get("result", [])
+            if not rows:
+                record_error(f"prometheus.{name}.empty")
+                continue
+            value = float(rows[0]["value"][1])
+            if value != value or value in (float("inf"), float("-inf")):
+                raise ValueError("non-finite value")
+            result[name] = value
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            record_error(f"prometheus.{name}")
+    return result
+
+
 def numeric_values(rows: list[dict[str, object]], key: str) -> list[float]:
     values = []
     for row in rows:
@@ -331,11 +369,12 @@ def rate(value: object, seconds: float) -> float | str:
 
 
 class Collector:
-    def __init__(self, compose: list[str], stream: str, group: str, metrics_dir: Path):
+    def __init__(self, compose: list[str], stream: str, group: str, metrics_dir: Path, prometheus_url: str):
         self.compose = compose
         self.stream = stream
         self.group = group
         self.metrics_dir = metrics_dir
+        self.prometheus_url = prometheus_url
         self.samples: list[dict[str, object]] = []
         self.errors: set[str] = set()
         self.lock = threading.Lock()
@@ -357,6 +396,7 @@ class Collector:
             "lag": redis["lag"],
             "consumers": redis["consumers"],
         }
+        sample["business_metrics"] = prometheus_snapshot(self.prometheus_url, self.error)
         with self.lock:
             self.samples.append(sample)
         with (self.metrics_dir / "runtime-samples.ndjson").open("a", encoding="utf-8") as file:
@@ -461,6 +501,18 @@ def aggregate_postgres(
     }
 
 
+def aggregate_business_metrics(
+    samples: list[dict[str, object]], baseline: dict[str, object], final: dict[str, object]
+) -> dict[str, object]:
+    during = [sample.get("business_metrics", {}) for sample in samples if sample["phase"] != "final"]
+    peak_values: dict[str, object] = {}
+    for name in PROMETHEUS_QUERIES:
+        values = [parse_number(row.get(name)) for row in during]
+        numeric = [float(value) for value in values if value is not None]
+        peak_values[name] = max(numeric) if numeric else UNAVAILABLE
+    return {"baseline": baseline, "final": final, "peak": peak_values}
+
+
 def read_json(path: Path) -> dict[str, object] | None:
     try:
         with path.open(encoding="utf-8") as file:
@@ -496,15 +548,19 @@ def run(args: argparse.Namespace) -> int:
     compose = compose_command(args.compose_files or ["compose.yaml", "compose.deployment-e2e.yaml"])
     stream = os.environ.get("TRPC_AGENT_SERVICE_REDIS_STREAM", "trpc-agent-service:dispatch")
     group = os.environ.get("TRPC_AGENT_SERVICE_REDIS_GROUP", "workers")
-    collector = Collector(compose, stream, group, metrics_dir)
+    prometheus_url = args.prometheus_url or os.environ.get(
+        "TRPC_AGENT_SERVICE_PROMETHEUS_URL", "http://127.0.0.1:19090"
+    )
+    collector = Collector(compose, stream, group, metrics_dir, prometheus_url)
 
     started_at = timestamp()
     started = time.time()
     baseline_redis = redis_snapshot(compose, stream, group, collector.error)
     baseline_postgres = postgres_snapshot(compose, collector.error)
+    baseline_business = prometheus_snapshot(prometheus_url, collector.error)
     write_json(
         metrics_dir / "baseline.json",
-        {"timestamp": started_at, "redis": baseline_redis, "postgres": baseline_postgres},
+        {"timestamp": started_at, "redis": baseline_redis, "postgres": baseline_postgres, "business": baseline_business},
     )
 
     command = list(args.command)
@@ -533,9 +589,10 @@ def run(args: argparse.Namespace) -> int:
     elapsed = max(time.time() - started, 0.001)
     final_redis = redis_snapshot(compose, stream, group, collector.error)
     final_postgres = postgres_snapshot(compose, collector.error)
+    final_business = prometheus_snapshot(prometheus_url, collector.error)
     write_json(
         metrics_dir / "final.json",
-        {"timestamp": finished_at, "redis": final_redis, "postgres": final_postgres},
+        {"timestamp": finished_at, "redis": final_redis, "postgres": final_postgres, "business": final_business},
     )
 
     with collector.lock:
@@ -550,6 +607,7 @@ def run(args: argparse.Namespace) -> int:
         elapsed,
     )
     report["postgres_metrics"] = aggregate_postgres(baseline_postgres, final_postgres, elapsed)
+    report["business_metrics"] = aggregate_business_metrics(samples, baseline_business, final_business)
     report["environment"] = {
         "git_sha": git_sha(),
         "github_run_id": os.environ.get("GITHUB_RUN_ID", "local"),
@@ -578,6 +636,9 @@ def run(args: argparse.Namespace) -> int:
         "redis_group": group,
     }
     report["infrastructure_metrics_status"] = "partial" if collector.errors else "complete"
+    report["business_metrics_status"] = (
+        "complete" if any(parse_number(value) is not None for value in final_business.values()) else UNAVAILABLE
+    )
     if not http_report_valid:
         report["http_metrics_status"] = UNAVAILABLE
         load_status = load_status or 1
@@ -597,6 +658,7 @@ def main() -> int:
     parser.add_argument("--compose-file", action="append", dest="compose_files")
     parser.add_argument("--workload-type", default="http_chat_completions")
     parser.add_argument("--model-type", default="deterministic")
+    parser.add_argument("--prometheus-url", default="")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.sample_interval <= 0:

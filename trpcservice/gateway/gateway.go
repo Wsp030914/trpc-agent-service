@@ -64,6 +64,9 @@ var (
 	// admission slot available. The slot covers only the admission path and
 	// is released after the durable admission call returns.
 	ErrAdmissionConcurrencyLimit = errors.New("admission concurrency limit exceeded")
+	// ErrAdmissionQuotaExceeded means the authoritative tenant/application
+	// period quota rejected a new execution.
+	ErrAdmissionQuotaExceeded = errors.New("admission period quota exceeded")
 )
 
 // AdmissionRateLimitError carries the retry delay returned by the shared

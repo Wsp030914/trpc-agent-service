@@ -54,15 +54,10 @@ spec:
                 secretKeyRef:
                   name: trpc-agent-service-secrets
                   key: TRPC_AGENT_SERVICE_REDIS_URL
-            # envFrom keeps scoped Provider SecretRef keys available to the
-            # worker. Explicit env values take precedence over envFrom, so the
-            # Gateway-only admin token is not exposed to the worker process.
-            - name: TRPC_AGENT_SERVICE_ADMIN_TOKEN
-              value: ""
-            - name: TRPC_AGENT_SERVICE_OPERATOR_TOKEN
-              value: ""
-            - name: TRPC_AGENT_SERVICE_AUDITOR_TOKEN
-              value: ""
+          volumeMounts:
+            - name: platform-secrets
+              mountPath: /var/run/secrets/trpc-agent-service
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /readyz
@@ -84,3 +79,7 @@ spec:
             limits:
               cpu: "2"
               memory: 2Gi
+      volumes:
+        - name: platform-secrets
+          secret:
+            secretName: trpc-agent-service-secrets

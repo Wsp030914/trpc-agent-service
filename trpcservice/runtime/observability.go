@@ -312,12 +312,12 @@ func (i *tracedSessionIngestor) IngestSession(
 		}
 		span.End()
 		if i.metrics != nil {
-			i.metrics.RecordMemory(opCtx, platformmetrics.Labels{
+			i.metrics.RecordMemoryOperation(opCtx, platformmetrics.Labels{
 				TenantID: i.exec.Tenant.TenantID,
 				AppID:    i.exec.Tenant.AppID,
 				Channel:  i.exec.Tenant.Channel,
 				Provider: i.exec.Config.BackendConfig.Memory.Provider,
-			}, time.Since(started), errorType)
+			}, "ingest", time.Since(started), errorType)
 		}
 	}()
 	return i.Ingestor.IngestSession(opCtx, sess, opts...)

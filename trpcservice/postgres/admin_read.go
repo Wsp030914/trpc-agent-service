@@ -40,7 +40,7 @@ func (s *Store) ListTenants(ctx context.Context, options platformadmin.ListOptio
 		where = "WHERE " + strings.Join(clauses, " AND ")
 	}
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
-	SELECT t.tenant_id, t.name, t.status, t.audit_policy, t.updated_at,
+	SELECT t.tenant_id, t.name, t.status, t.audit_policy, t.quota_policy, t.updated_at,
        (SELECT count(*) FROM platform.agent_app AS app
         WHERE app.tenant_id = t.tenant_id),
        CASE WHEN t.status <> 'ACTIVE'
@@ -79,10 +79,10 @@ LIMIT $%d`, where, len(args)), args...)
 	values := make([]platformadmin.TenantView, 0)
 	for rows.Next() {
 		var value platformadmin.TenantView
-		var encoded []byte
+		var encoded, encodedQuota []byte
 		if err := rows.Scan(
 			&value.ID, &value.Name, &value.Status, &encoded,
-			&value.UpdatedAt, &value.AgentAppCount, &value.AnomalyStatus,
+			&encodedQuota, &value.UpdatedAt, &value.AgentAppCount, &value.AnomalyStatus,
 		); err != nil {
 			return nil, fmt.Errorf("scan tenant: %w", err)
 		}
@@ -90,8 +90,11 @@ LIMIT $%d`, where, len(args)), args...)
 		if err != nil {
 			return nil, err
 		}
+		if err := json.Unmarshal(encodedQuota, &value.Quota); err != nil {
+			return nil, fmt.Errorf("unmarshal tenant quota: %w", err)
+		}
 		if err := (tenant.Tenant{
-			ID: value.ID, Name: value.Name, Status: value.Status, Audit: value.Audit,
+			ID: value.ID, Name: value.Name, Status: value.Status, Audit: value.Audit, Quota: value.Quota,
 		}).Validate(); err != nil {
 			return nil, fmt.Errorf("stored tenant: %w", err)
 		}
@@ -113,7 +116,7 @@ func backendSummaries(config tenant.BackendConfig) []platformadmin.BackendSummar
 		}
 		values = append(values, platformadmin.BackendSummary{
 			Kind: ref.Kind, Provider: ref.Provider, Name: ref.Name,
-			Status: "CONFIGURED", SecretRef: ref.SecretRef,
+			Status: "CONFIGURED",
 		})
 	}
 	return values

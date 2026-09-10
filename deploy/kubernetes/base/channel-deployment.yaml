@@ -39,13 +39,10 @@ spec:
               value: channel
             - name: TRPC_AGENT_SERVICE_HTTP_ADDR
               value: :8080
-            # Channel does not need control-plane credentials.
-            - name: TRPC_AGENT_SERVICE_ADMIN_TOKEN
-              value: ""
-            - name: TRPC_AGENT_SERVICE_OPERATOR_TOKEN
-              value: ""
-            - name: TRPC_AGENT_SERVICE_AUDITOR_TOKEN
-              value: ""
+          volumeMounts:
+            - name: platform-secrets
+              mountPath: /var/run/secrets/trpc-agent-service
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /readyz
@@ -67,3 +64,7 @@ spec:
             limits:
               cpu: "2"
               memory: 2Gi
+      volumes:
+        - name: platform-secrets
+          secret:
+            secretName: trpc-agent-service-secrets

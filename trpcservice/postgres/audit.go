@@ -80,9 +80,9 @@ INSERT INTO platform.audit_event (
     tenant_id, app_id, actor_id, actor_role, requested_tenant_id,
     requested_app_id, query_digest, result_count, channel, user_id, session_id,
     agent_name, tool_name,
-    decision, latency, error_type, input_tokens, output_tokens, total_tokens,
+    decision, policy_rule_id, policy_reason, latency, error_type, input_tokens, output_tokens, total_tokens,
     cost, trace_id, request_id, config_version, event_type, created_at
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
 		event.TenantID,
 		event.AppID,
 		event.ActorID,
@@ -97,6 +97,8 @@ INSERT INTO platform.audit_event (
 		event.AgentName,
 		event.ToolName,
 		event.Decision,
+		event.PolicyRuleID,
+		event.PolicyReason,
 		event.Latency.Milliseconds(),
 		event.ErrorType,
 		event.InputTokens,
@@ -190,7 +192,7 @@ func (s *Store) ListAuditEventsQuery(ctx context.Context, query platformaudit.Qu
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
 SELECT tenant_id, app_id, channel, user_id, session_id, agent_name, tool_name,
        actor_id, actor_role, requested_tenant_id, requested_app_id, query_digest,
-       result_count, decision, latency, error_type, input_tokens, output_tokens,
+       result_count, decision, policy_rule_id, policy_reason, latency, error_type, input_tokens, output_tokens,
        total_tokens, cost, trace_id, request_id, config_version, event_type,
        created_at
 FROM platform.audit_event
@@ -220,6 +222,8 @@ LIMIT $%d OFFSET $%d`, strings.Join(clauses, " AND "), limitPosition, offsetPosi
 			&event.QueryDigest,
 			&event.ResultCount,
 			&event.Decision,
+			&event.PolicyRuleID,
+			&event.PolicyReason,
 			&latency,
 			&event.ErrorType,
 			&event.InputTokens,
