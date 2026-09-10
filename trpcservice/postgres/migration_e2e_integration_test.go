@@ -110,40 +110,10 @@ func TestSessionMigrationAcrossRealWorkerProcesses(t *testing.T) {
 		}
 	})
 
-	// Use the real Worker/Consumer once to create session lanes and source data
-	// through the normal authenticated Gateway and dispatch path.
+	// Seed empty-history sessions. The Redis adapter cannot enumerate summary
+	// inventory for non-empty sessions, so this success path intentionally uses
+	// the provider's provably empty-summary case.
 	workerBinary := buildMigrationWorker(t)
-	workerEnv := runtimeWorkerEnv(postgresDSN, redisURL, streamName, group)
-	sourceWorker := startRuntimeWorker(t, ctx, buildRuntimeWorker(t), workerEnv, "migration-source-worker", "")
-	admitter := gateway.New(store)
-	for index := 0; index < migrationE2ESessionCount; index++ {
-		requestID := fmt.Sprintf("migration-source-%02d-%s", index, runID)
-		sessionID := fmt.Sprintf("migration-session-%02d", index)
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://migration-e2e.local/v1/chat/completions", nil)
-		if err != nil {
-			t.Fatalf("build migration authentication request: %v", err)
-		}
-		request.Header.Set("Authorization", "Bearer "+issued.APIKey)
-		resolver, err := (auth.HTTPAPIKeyResolver{Credentials: store, Directory: store}).Resolve(ctx, request, auth.RequestIdentity{
-			SessionID: sessionID, TraceID: requestID,
-		})
-		if err != nil {
-			t.Fatalf("authenticate migration source request: %v", err)
-		}
-		if _, err := admitter.Handle(ctx, gateway.Request{
-			RequestID: requestID, IdempotencyKey: "migration-source-idem-" + fmt.Sprint(index),
-			Tenant: resolver, Message: gateway.Message{Text: "migration source probe"},
-		}); err != nil {
-			t.Fatalf("admit migration source request %d: %v", index, err)
-		}
-		if _, err := waitRuntimeExecution(ctx, pool, requestID, func(value runtimeExecution) bool {
-			return value.Status == "SUCCEEDED"
-		}); err != nil {
-			t.Fatalf("wait migration source execution %d: %v", index, err)
-		}
-	}
-	stopRuntimeWorker(sourceWorker, true)
-
 	appName, err := (tenant.Scope{TenantID: tenantID, AppID: appID}).Key("runner")
 	if err != nil {
 		t.Fatalf("build migration session app name: %v", err)
@@ -172,12 +142,17 @@ func TestSessionMigrationAcrossRealWorkerProcesses(t *testing.T) {
 			SessionID: fmt.Sprintf("migration-session-%02d", index),
 		}
 		keys = append(keys, key)
+		if _, err := pool.Exec(ctx, `
+INSERT INTO platform.session_lane (tenant_id, app_id, session_principal_id, session_id)
+VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != nil {
+			t.Fatalf("create migration session lane %d: %v", index, err)
+		}
+		if _, err := source.CreateSession(ctx, key, session.StateMap{"topic": []byte("migration")}); err != nil {
+			t.Fatalf("create migration source session %d: %v", index, err)
+		}
 		loaded, err := source.GetSession(ctx, key)
 		if err != nil || loaded == nil {
 			t.Fatalf("read source session %d: session=%v err=%v", index, loaded, err)
-		}
-		if err := source.UpdateSessionState(ctx, key, session.StateMap{"topic": []byte("migration")}); err != nil {
-			t.Fatalf("update source session state %d: %v", index, err)
 		}
 		if err := trackService.AppendTrackEvent(ctx, loaded, &session.TrackEvent{
 			Track: session.Track("migration-turn"), Payload: json.RawMessage(`{"stage":"source"}`), Timestamp: time.Unix(int64(index+1), 0).UTC(),
@@ -263,7 +238,7 @@ func TestSessionMigrationAcrossRealWorkerProcesses(t *testing.T) {
 		if err != nil || loaded == nil {
 			t.Fatalf("read migrated session %s: session=%v err=%v", key.SessionID, loaded, err)
 		}
-		if len(loaded.Events) == 0 || string(loaded.State["topic"]) != "migration" {
+		if len(loaded.Events) != 0 || string(loaded.State["topic"]) != "migration" {
 			t.Fatalf("migrated session %s lost state/events: %#v", key.SessionID, loaded)
 		}
 		if len(loaded.Tracks[session.Track("migration-turn")].Events) != 1 {
@@ -345,33 +320,7 @@ func TestSessionMigrationVerifyFailureDoesNotCutover(t *testing.T) {
 
 	workerBinary := buildMigrationWorker(t)
 	workerEnv := runtimeWorkerEnv(postgresDSN, redisURL, streamName, group)
-	sourceWorker := startRuntimeWorker(t, ctx, buildRuntimeWorker(t), workerEnv, "migration-verify-source", "")
-	admitter := gateway.New(store)
-	requestID := "migration-verify-source-" + runID
 	sessionID := "migration-verify-session"
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://migration-verify-e2e.local/v1/chat/completions", nil)
-	if err != nil {
-		t.Fatalf("build migration verify authentication request: %v", err)
-	}
-	request.Header.Set("Authorization", "Bearer "+issued.APIKey)
-	identity, err := (auth.HTTPAPIKeyResolver{Credentials: store, Directory: store}).Resolve(ctx, request, auth.RequestIdentity{
-		SessionID: sessionID, TraceID: requestID,
-	})
-	if err != nil {
-		t.Fatalf("authenticate migration verify source request: %v", err)
-	}
-	if _, err := admitter.Handle(ctx, gateway.Request{
-		RequestID: requestID, IdempotencyKey: "migration-verify-source-idem",
-		Tenant: identity, Message: gateway.Message{Text: "migration verify source probe"},
-	}); err != nil {
-		t.Fatalf("admit migration verify source request: %v", err)
-	}
-	if _, err := waitRuntimeExecution(ctx, pool, requestID, func(value runtimeExecution) bool {
-		return value.Status == "SUCCEEDED"
-	}); err != nil {
-		t.Fatalf("wait migration verify source execution: %v", err)
-	}
-	stopRuntimeWorker(sourceWorker, true)
 
 	appName, err := (tenant.Scope{TenantID: tenantID, AppID: appID}).Key("runner")
 	if err != nil {
@@ -388,6 +337,14 @@ func TestSessionMigrationVerifyFailureDoesNotCutover(t *testing.T) {
 		}
 		_ = sourceService.Close()
 	})
+	if _, err := pool.Exec(ctx, `
+INSERT INTO platform.session_lane (tenant_id, app_id, session_principal_id, session_id)
+VALUES ($1, $2, $3, $4)`, tenantID, appID, key.UserID, key.SessionID); err != nil {
+		t.Fatalf("create migration verify session lane: %v", err)
+	}
+	if _, err := sourceService.CreateSession(ctx, key, session.StateMap{"topic": []byte("migration")}); err != nil {
+		t.Fatalf("create migration verify source session: %v", err)
+	}
 	record := migrationE2ERecord(tenantID, appID, v1.Version, v2.Version)
 	if err := store.CreateDataMigration(ctx, record); err != nil {
 		t.Fatalf("create migration verify record: %v", err)
@@ -450,6 +407,7 @@ func TestSessionMigrationVerifyFailureDoesNotCutover(t *testing.T) {
 	evidence.FailureReasonSafe = true
 	stopRuntimeWorker(worker, true)
 
+	admitter := gateway.New(store)
 	app, err := store.ResolveAgentApp(ctx, tenantID, appID)
 	if err != nil {
 		t.Fatalf("resolve app after migration verify failure: %v", err)

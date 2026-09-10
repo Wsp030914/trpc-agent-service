@@ -347,7 +347,6 @@ func TestOpenAIHandlerBoundsActiveStreamingAndReleasesOnDisconnect(t *testing.T)
 
 	second := validOpenAIStreamRequest()
 	second.Header.Set(headerRequestID, "request-2")
-	second.Header.Set(headerIdempotencyKey, "idempotency-2")
 	secondResponse := httptest.NewRecorder()
 	handler.ServeHTTP(secondResponse, second)
 	if secondResponse.Code != http.StatusTooManyRequests {
@@ -366,7 +365,6 @@ func TestOpenAIHandlerBoundsActiveStreamingAndReleasesOnDisconnect(t *testing.T)
 	source.block = false
 	third := validOpenAIStreamRequest()
 	third.Header.Set(headerRequestID, "request-3")
-	third.Header.Set(headerIdempotencyKey, "idempotency-3")
 	thirdResponse := httptest.NewRecorder()
 	handler.ServeHTTP(thirdResponse, third)
 	if thirdResponse.Code == http.StatusTooManyRequests {

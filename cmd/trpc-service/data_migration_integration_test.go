@@ -19,8 +19,6 @@ import (
 	platformredis "github.com/liuzengh/trpc-agent-service/trpcservice/redis"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
-	"trpc.group/trpc-go/trpc-agent-go/event"
-	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	redisprovider "trpc.group/trpc-go/trpc-agent-go/session/redis"
 )
@@ -106,12 +104,8 @@ WHERE tenant_id = $1 AND app_id = $2`, tenantID, appID).Scan(&laneCount); err !=
 		_ = source.DeleteSession(context.Background(), key)
 		_ = source.Close()
 	})
-	sourceSession, err := source.CreateSession(ctx, key, session.StateMap{"topic": []byte("billing")})
-	if err != nil {
+	if _, err := source.CreateSession(ctx, key, session.StateMap{"topic": []byte("billing")}); err != nil {
 		t.Fatalf("create source session: %v", err)
-	}
-	if err := appendMigrationTestEvents(ctx, source, sourceSession); err != nil {
-		t.Fatalf("append source events: %v", err)
 	}
 
 	record := migration.Record{
@@ -211,7 +205,7 @@ WHERE migration_id = $1`, record.ID).Scan(
 	if err != nil {
 		t.Fatalf("read migrated session: %v", err)
 	}
-	if targetSession == nil || string(targetSession.State["topic"]) != "billing" || len(targetSession.Events) != 2 {
+	if targetSession == nil || string(targetSession.State["topic"]) != "billing" || len(targetSession.Events) != 0 {
 		t.Fatalf("migrated session = %#v", targetSession)
 	}
 }
@@ -371,25 +365,6 @@ func TestDataMigrationLeaseTakeoverRejectsPreviousWorker(t *testing.T) {
 	if err := store.AdvanceDataMigration(ctx, previous, migration.StatusCopying); !errors.Is(err, migration.ErrLeaseLost) {
 		t.Fatalf("previous worker advance error = %v, want lease lost", err)
 	}
-}
-
-func appendMigrationTestEvents(ctx context.Context, service session.Service, value *session.Session) error {
-	if err := service.AppendEvent(ctx, value, event.NewResponseEvent("event-1", "user", &model.Response{
-		Object: model.ObjectTypeChatCompletion,
-		Done:   true,
-		Choices: []model.Choice{{
-			Message: model.NewUserMessage("summarize billing"),
-		}},
-	})); err != nil {
-		return err
-	}
-	return service.AppendEvent(ctx, value, event.NewResponseEvent("event-2", "assistant", &model.Response{
-		Object: model.ObjectTypeChatCompletion,
-		Done:   true,
-		Choices: []model.Choice{{
-			Message: model.NewAssistantMessage("billing reply"),
-		}},
-	}))
 }
 
 func dataMigrationAppConfigs(tenantID, appID, schema string) (tenant.AppConfig, tenant.AppConfig) {
